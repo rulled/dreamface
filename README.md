@@ -15,13 +15,3 @@ Chrome extension for batching DreamFace audio generation tasks from the site UI.
 2. Enable Developer mode
 3. Click `Load unpacked`
 4. Select this repository folder
-
-## Release
-
-Run the packaging script to build a clean zip archive:
-
-```powershell
-.\scripts\build-release.ps1
-```
-
-The archive is created in `dist/` and is ready to attach to a GitHub release.
