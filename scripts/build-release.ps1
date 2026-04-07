@@ -19,9 +19,19 @@ $includeFiles = @(
   "content_script.js",
   "injected.js",
   "manifest.json",
+  "offscreen.html",
+  "offscreen.js",
   "popup.html",
   "popup.js",
-  "README.md"
+  "README.md",
+  "assets/icons/icon16.png",
+  "assets/icons/icon32.png",
+  "assets/icons/icon48.png",
+  "assets/icons/icon128.png",
+  "vendor/ffmpeg/814.ffmpeg.js",
+  "vendor/ffmpeg/ffmpeg-core.js",
+  "vendor/ffmpeg/ffmpeg-core.wasm",
+  "vendor/ffmpeg/ffmpeg.js"
 )
 
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
@@ -44,7 +54,11 @@ foreach ($file in $includeFiles) {
     New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
   }
 
-  Copy-Item $source $destination -Force
+  if ((Get-Item $source) -is [System.IO.DirectoryInfo]) {
+    Copy-Item $source $destination -Recurse -Force
+  } else {
+    Copy-Item $source $destination -Force
+  }
 }
 
 if (Test-Path $archivePath) {
