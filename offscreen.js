@@ -52,7 +52,6 @@ function createIdleRunState() {
     maxDurationSeconds: DEFAULT_MAX_DURATION_SECONDS,
     autoNormalize: true,
     overlapEnabled: false,
-    protocolMode: 'web',
     interrupted: false,
     recoverable: false,
     interruptionReason: '',
@@ -934,7 +933,6 @@ async function processQueue(queue, runToken, startIndex = 0) {
             videoIndex: task.videoIndex,
             taskLabel: `[${index + 1}/${queue.length}]`,
             maxDurationSeconds: runState.maxDurationSeconds,
-            protocolMode: runState.protocolMode || 'web',
           },
         });
       } catch (error) {
@@ -1058,7 +1056,6 @@ async function startRun(payload) {
     : DEFAULT_MAX_DURATION_SECONDS;
   runState.autoNormalize = payload.options.autoNormalize;
   runState.overlapEnabled = payload.options.overlapEnabled;
-  runState.protocolMode = payload.options?.experimentalAppleSubmit ? 'apple_experimental' : 'web';
   runState.normalization.totalCount = countInputFiles(payload.batches);
   runState.queuePlan = [];
   runState.nextTaskIndex = 0;

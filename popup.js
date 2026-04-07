@@ -9,7 +9,6 @@ const DEFAULT_SETTINGS = {
   autoNormalize: true,
   overlapEnabled: false,
   maxDurationSeconds: DEFAULT_MAX_DURATION_SECONDS,
-  experimentalAppleSubmit: false,
 };
 const MAX_AUDIO_PREVIEW_ITEMS = 5;
 const VIDEO_GRID_COLUMNS = 5;
@@ -43,7 +42,6 @@ const durationModeSubtitle = document.getElementById('durationModeSubtitle');
 const autoNormalizeToggle = document.getElementById('autoNormalizeToggle');
 const overlapToggle = document.getElementById('overlapToggle');
 const overlapSubtitle = document.getElementById('overlapSubtitle');
-const experimentalAppleToggle = document.getElementById('experimentalAppleToggle');
 
 const stopBtn = document.getElementById('stopBtn');
 const backBtn = document.getElementById('backBtn');
@@ -468,7 +466,6 @@ async function saveSettings() {
       maxDurationSeconds: getSelectedMaxDurationSeconds(),
       autoNormalize: autoNormalizeToggle.checked,
       overlapEnabled: overlapToggle.checked,
-      experimentalAppleSubmit: Boolean(experimentalAppleToggle?.checked),
     },
   });
 }
@@ -1091,9 +1088,6 @@ async function initialize() {
   durationModeToggle.checked = Number(settings.maxDurationSeconds) === EXTENDED_MAX_DURATION_SECONDS;
   autoNormalizeToggle.checked = settings.autoNormalize;
   overlapToggle.checked = settings.overlapEnabled;
-  if (experimentalAppleToggle) {
-    experimentalAppleToggle.checked = Boolean(settings.experimentalAppleSubmit);
-  }
   updateAudioModeCopy();
   updateScanButtonLabel();
   await refreshActiveTabContext({ rerender: false });
@@ -1118,7 +1112,6 @@ document.addEventListener('visibilitychange', () => {
 durationModeToggle.addEventListener('change', saveSettings);
 autoNormalizeToggle.addEventListener('change', saveSettings);
 overlapToggle.addEventListener('change', saveSettings);
-experimentalAppleToggle?.addEventListener('change', saveSettings);
 addBatchBtn.addEventListener('click', addNewBatch);
 
 scanBtn.addEventListener('click', async () => {

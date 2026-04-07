@@ -6,10 +6,6 @@ let activeTaskCancelled = false;
 let videoUploadJobActive = false;
 const MIN_DURATION_SECONDS = 2;
 const DEFAULT_MAX_DURATION_SECONDS = 180;
-const WEB_PROTOCOL_MODE = 'web';
-const APPLE_EXPERIMENTAL_MODE = 'apple_experimental';
-const SETTINGS_KEY = 'audioProcessingSettings';
-let activeProtocolMode = WEB_PROTOCOL_MODE;
 
 const script = document.createElement('script');
 script.src = chrome.runtime.getURL('injected.js');
@@ -17,33 +13,6 @@ script.onload = function onLoad() {
   this.remove();
 };
 (document.head || document.documentElement).appendChild(script);
-
-function normalizeProtocolMode(mode) {
-  return mode === APPLE_EXPERIMENTAL_MODE ? APPLE_EXPERIMENTAL_MODE : WEB_PROTOCOL_MODE;
-}
-
-function setInjectedProtocolMode(mode) {
-  activeProtocolMode = normalizeProtocolMode(mode);
-  window.dispatchEvent(new CustomEvent('DreamFaceSetSubmitMode', {
-    detail: { mode: activeProtocolMode },
-  }));
-}
-
-try {
-  chrome.storage.local.get(SETTINGS_KEY, (data) => {
-    const enabled = Boolean(data?.[SETTINGS_KEY]?.experimentalAppleSubmit);
-    setInjectedProtocolMode(enabled ? APPLE_EXPERIMENTAL_MODE : WEB_PROTOCOL_MODE);
-  });
-
-  chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName !== 'local' || !changes[SETTINGS_KEY]) {
-      return;
-    }
-
-    const enabled = Boolean(changes[SETTINGS_KEY].newValue?.experimentalAppleSubmit);
-    setInjectedProtocolMode(enabled ? APPLE_EXPERIMENTAL_MODE : WEB_PROTOCOL_MODE);
-  });
-} catch (_) {}
 
 window.addEventListener('DreamFaceLimitHit', () => {
   serverLimitHit = true;
@@ -1543,7 +1512,6 @@ async function executeTaskOnPage(request) {
   newTabDetected = false;
   serverLimitHit = false;
   serverSuccessHit = false;
-  setInjectedProtocolMode(request.protocolMode);
   const maxDurationSeconds = getMaxDurationSeconds(request);
 
   const file = request.audioDataUrl
