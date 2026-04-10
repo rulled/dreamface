@@ -1,15 +1,17 @@
 {
   "manifest_version": 3,
-  "name": "dreamface",
-  "version": "1.1.0",
-  "description": "Batch audio automation for DreamFace video generation.",
+  "name": "DreamFace Batch Assistant",
+  "version": "1.1.1",
+  "description": "Batch-manage DreamFace audio uploads, local normalization, and Creations result downloads.",
+  "minimum_chrome_version": "116",
   "permissions": [
     "offscreen",
     "storage"
   ],
   "host_permissions": [
     "https://dreamfaceapp.com/*",
-    "https://*.dreamfaceapp.com/*"
+    "https://www.dreamfaceapp.com/*",
+    "https://tools.dreamfaceapp.com/*"
   ],
   "action": {
     "default_popup": "popup.html",
@@ -36,7 +38,8 @@
     {
       "matches": [
         "https://dreamfaceapp.com/*",
-        "https://*.dreamfaceapp.com/*"
+        "https://www.dreamfaceapp.com/*",
+        "https://tools.dreamfaceapp.com/*"
       ],
       "js": ["content_script.js"]
     }
@@ -47,7 +50,8 @@
       "resources": ["injected.js"],
       "matches": [
         "https://dreamfaceapp.com/*",
-        "https://*.dreamfaceapp.com/*"
+        "https://www.dreamfaceapp.com/*",
+        "https://tools.dreamfaceapp.com/*"
       ]
     }
   ]

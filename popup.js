@@ -1,6 +1,6 @@
 const SETTINGS_KEY = 'audioProcessingSettings';
 const RUN_DB_NAME = 'dreamface-run-db';
-const RUN_DB_VERSION = 3;
+const RUN_DB_VERSION = 4;
 const RUN_STORE_NAME = 'audioTasks';
 const INPUT_STORE_NAME = 'inputFiles';
 const DEFAULT_MAX_DURATION_SECONDS = 180;

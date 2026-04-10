@@ -1,4 +1,4 @@
-# dreamface
+# DreamFace Batch Assistant
 
 Chrome extension for batching DreamFace audio generation tasks from the site UI.
 

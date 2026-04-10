@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DreamFace Store Preview</title>
+  <style>
+    :root {
+      --bg: #0e1012;
+      --panel: #151a20;
+      --panel-2: #1b2027;
+      --line: #2c333c;
+      --text: #f2f4f7;
+      --muted: #a6adb6;
+      --cyan: #8ddfd4;
+      --blue: #8fb7ff;
+      --orange: #ffb174;
+      --red: #ff8a8a;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: #060708;
+      color: var(--text);
+      display: grid;
+      gap: 32px;
+      padding: 24px;
+    }
+
+    .artboard {
+      width: 1280px;
+      height: 800px;
+      margin: 0 auto;
+      position: relative;
+      overflow: hidden;
+      border-radius: 28px;
+      background:
+        radial-gradient(1000px 500px at 10% 10%, rgba(79, 140, 255, 0.18), transparent 45%),
+        radial-gradient(900px 500px at 90% 0%, rgba(255, 177, 116, 0.14), transparent 40%),
+        linear-gradient(180deg, #0f1317 0%, #090b0d 100%);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      box-shadow: 0 30px 60px rgba(0, 0, 0, 0.45);
+      padding: 28px;
+    }
+
+    .headline {
+      position: absolute;
+      left: 34px;
+      top: 28px;
+      right: 34px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+    }
+
+    .eyebrow {
+      color: var(--cyan);
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 44px;
+      line-height: 1.05;
+      max-width: 680px;
+    }
+
+    #shot-automation h1 {
+      font-size: 44px;
+      max-width: 680px;
+    }
+
+    .subhead { display: none; }
+
+    .badge {
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(141, 223, 212, 0.14);
+      border: 1px solid rgba(141, 223, 212, 0.28);
+      font-size: 16px;
+      color: var(--text);
+      white-space: nowrap;
+    }
+
+    .browser {
+      position: absolute;
+      left: 34px;
+      bottom: 34px;
+      width: 760px;
+      height: 590px;
+      border-radius: 24px;
+      background: rgba(12, 16, 20, 0.96);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      overflow: hidden;
+    }
+
+    .browser-top {
+      height: 56px;
+      padding: 16px 18px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+
+    .dot { width: 12px; height: 12px; border-radius: 50%; background: #39414b; }
+
+    .urlbar {
+      margin-left: 8px;
+      flex: 1;
+      height: 32px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.06);
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      padding: 0 14px;
+      font-size: 14px;
+    }
+
+    .browser-body {
+      padding: 20px;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+
+    .avatar-card, .creation-card {
+      border-radius: 18px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.06);
+      overflow: hidden;
+    }
+
+    .thumb {
+      height: 130px;
+      background:
+        linear-gradient(135deg, rgba(143,183,255,0.6), rgba(141,223,212,0.18)),
+        linear-gradient(180deg, #2a323b, #12161a);
+    }
+
+    .avatar-card.selected { outline: 2px solid rgba(141,223,212,0.9); }
+    .avatar-meta, .creation-meta { padding: 12px; }
+    .name { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+    .meta { font-size: 13px; color: var(--muted); }
+
+    .popup {
+      position: absolute;
+      right: 34px;
+      bottom: 34px;
+      width: 402px;
+      min-height: 600px;
+      background: rgba(20, 24, 29, 0.98);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 24px;
+      padding: 18px;
+      box-shadow: 0 24px 40px rgba(0,0,0,0.4);
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .card {
+      border-radius: 18px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.06);
+      padding: 14px;
+    }
+
+    .btn {
+      border-radius: 14px;
+      padding: 12px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid transparent;
+      font-weight: 700;
+      font-size: 15px;
+    }
+
+    .btn-primary { background: rgba(141,223,212,0.18); border-color: rgba(141,223,212,0.28); }
+    .btn-tonal { background: rgba(143,183,255,0.16); border-color: rgba(143,183,255,0.24); }
+    .btn-danger { background: rgba(255,138,138,0.18); border-color: rgba(255,138,138,0.28); }
+    .btn-outline { background: transparent; border-color: rgba(255,255,255,0.12); color: var(--muted); }
+
+    .section-title { font-size: 13px; color: var(--muted); margin-bottom: 10px; }
+    .group, .summary-block { border-radius: 16px; background: rgba(12,16,20,0.75); border: 1px solid rgba(255,255,255,0.05); padding: 12px; }
+    .group + .group, .summary-block + .summary-block { margin-top: 10px; }
+    .group-title { display: flex; justify-content: space-between; font-weight: 700; margin-bottom: 8px; }
+    .mini-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 10px; }
+    .mini-thumb { height: 52px; border-radius: 10px; background: linear-gradient(135deg, rgba(143,183,255,0.7), rgba(141,223,212,0.22)); }
+    .files { font-size: 13px; color: var(--muted); line-height: 1.55; }
+
+    .metric-row { display: flex; justify-content: space-between; gap: 10px; font-size: 14px; margin: 4px 0; }
+    .metric-row strong { font-weight: 700; color: var(--text); }
+
+    .progress {
+      height: 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.07);
+      overflow: hidden;
+      margin: 10px 0 8px;
+    }
+
+    .fill {
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--cyan), var(--blue));
+    }
+
+    .log {
+      border-radius: 14px;
+      background: rgba(10,12,15,0.88);
+      border: 1px solid rgba(255,255,255,0.05);
+      padding: 12px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .status-ok { color: var(--cyan); }
+    .status-warn { color: var(--orange); }
+    .status-err { color: var(--red); }
+
+    .creations {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+
+    .creation-card.ready { outline: 2px solid rgba(141,223,212,0.7); }
+    .creation-card.pending { opacity: 0.7; }
+    .creation-meta .meta.ready { color: var(--cyan); }
+    .creation-meta .meta.pending { color: var(--orange); }
+  </style>
+</head>
+<body>
+  <section class="artboard" id="shot-builder">
+    <div class="headline">
+      <div>
+        <div class="eyebrow">Screenshot 1</div>
+        <h1>Build DreamFace batches from one compact operator popup</h1>
+        <div class="subhead">Scan avatars on the site, group target videos, attach local audio files, and switch between 180-second and 600-second account modes.</div>
+      </div>
+      <div class="badge">Batch builder</div>
+    </div>
+    <div class="browser">
+      <div class="browser-top">
+        <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+        <div class="urlbar">https://tools.dreamfaceapp.com/ru/user</div>
+      </div>
+      <div class="browser-body">
+        <div class="avatar-card selected"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor A</div><div class="meta">Selected as #1</div></div></div>
+        <div class="avatar-card selected"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor B</div><div class="meta">Selected as #2</div></div></div>
+        <div class="avatar-card"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor C</div><div class="meta">Available</div></div></div>
+        <div class="avatar-card"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor D</div><div class="meta">Available</div></div></div>
+        <div class="avatar-card"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor E</div><div class="meta">Available</div></div></div>
+        <div class="avatar-card"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor F</div><div class="meta">Available</div></div></div>
+        <div class="avatar-card"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor G</div><div class="meta">Available</div></div></div>
+        <div class="avatar-card"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor H</div><div class="meta">Available</div></div></div>
+      </div>
+    </div>
+    <div class="popup">
+      <div class="card"><div class="btn btn-primary">сканировать</div></div>
+      <div class="card">
+        <div class="section-title">обработка аудио</div>
+        <div class="metric-row"><strong>расширенный лимит 600s</strong><span class="status-ok">вкл.</span></div>
+        <div class="metric-row"><strong>автообработка аудио</strong><span class="status-ok">вкл.</span></div>
+        <div class="metric-row"><strong>overlap 5s</strong><span class="status-warn">выкл.</span></div>
+      </div>
+      <div class="card">
+        <div class="section-title">очереди</div>
+        <div class="group">
+          <div class="group-title"><span>группа #1</span><span>12 аудио</span></div>
+          <div class="mini-grid"><div class="mini-thumb"></div><div class="mini-thumb"></div><div class="mini-thumb"></div></div>
+          <div class="files">0001_uspr_doc.mp3<br>0002_uspr_doc.mp3<br>0012_RUS_16.03_ID_Похудение.mp3</div>
+        </div>
+        <div class="group">
+          <div class="group-title"><span>группа #2</span><span>8 аудио</span></div>
+          <div class="mini-grid"><div class="mini-thumb"></div><div class="mini-thumb"></div><div class="mini-thumb"></div></div>
+          <div class="files">FR batch voices<br>ID reporter voices<br>KZ follow-up voices</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="metric-row"><strong>аудио</strong><span>24</span></div>
+        <div class="metric-row"><strong>групп</strong><span>2</span></div>
+        <div class="btn btn-tonal" style="margin-top:10px;">запустить</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="artboard" id="shot-monitor">
+    <div class="headline">
+      <div>
+        <div class="eyebrow">Screenshot 2</div>
+        <h1>Watch live queue progress for large DreamFace runs</h1>
+        <div class="subhead">Track the current phase, active file, summary metrics, and queue issues without keeping the popup open the whole time.</div>
+      </div>
+      <div class="badge">Processing monitor</div>
+    </div>
+    <div class="browser">
+      <div class="browser-top">
+        <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+        <div class="urlbar">https://tools.dreamfaceapp.com/ru/user</div>
+      </div>
+      <div class="browser-body">
+        <div class="avatar-card selected"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor A</div><div class="meta">Current target</div></div></div>
+        <div class="avatar-card"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor B</div><div class="meta">Queued</div></div></div>
+        <div class="avatar-card"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor C</div><div class="meta">Queued</div></div></div>
+        <div class="avatar-card"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor D</div><div class="meta">Queued</div></div></div>
+      </div>
+    </div>
+    <div class="popup">
+      <div class="card">
+        <div class="metric-row"><strong>обработка</strong><span class="status-ok">running</span></div>
+        <div style="font-size:18px; font-weight:700; margin-top:8px;">[34/84] загрузка 0007_DM___ID___Суставы.mp3</div>
+        <div class="progress"><div class="fill" style="width: 40%;"></div></div>
+        <div class="meta">34 / 84</div>
+      </div>
+      <div class="card">
+        <div class="btn btn-danger">остановить</div>
+        <div class="btn btn-outline" style="margin-top:10px;">назад</div>
+      </div>
+      <div class="log">[engine] подготовка очереди завершена<br>[34/84] OK<br>[35/84] загрузка следующего файла</div>
+      <div class="card">
+        <div class="section-title">сводка</div>
+        <div class="metric-row"><strong>вход</strong><span>79</span></div>
+        <div class="metric-row"><strong>лимит</strong><span>600 сек</span></div>
+        <div class="metric-row"><strong>задач</strong><span>84</span></div>
+        <div class="metric-row"><strong>без изменений</strong><span>74</span></div>
+        <div class="metric-row"><strong>нарезано</strong><span>4</span></div>
+        <div class="metric-row"><strong>ошибки очереди</strong><span class="status-err">1</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="artboard" id="shot-results">
+    <div class="headline">
+      <div>
+        <div class="eyebrow">Screenshot 3</div>
+        <h1>Move to Creations and download ready results in bulk</h1>
+        <div class="subhead">After generation, the extension reuses the DreamFace Creations page, checks which files are ready, and helps you download finished items in one pass.</div>
+      </div>
+      <div class="badge">Creations handoff</div>
+    </div>
+    <div class="browser">
+      <div class="browser-top">
+        <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+        <div class="urlbar">https://tools.dreamfaceapp.com/ru/user?type=Avatar+Video</div>
+      </div>
+      <div class="browser-body creations">
+        <div class="creation-card ready"><div class="thumb"></div><div class="creation-meta"><div class="name">0001_uspr_doc__part-001.mp3</div><div class="meta ready">Ready to download</div></div></div>
+        <div class="creation-card ready"><div class="thumb"></div><div class="creation-meta"><div class="name">0001_uspr_doc__part-002.mp3</div><div class="meta ready">Ready to download</div></div></div>
+        <div class="creation-card ready"><div class="thumb"></div><div class="creation-meta"><div class="name">0001_uspr_doc__part-003.mp3</div><div class="meta ready">Ready to download</div></div></div>
+        <div class="creation-card pending"><div class="thumb"></div><div class="creation-meta"><div class="name">0012_RUS_16.03_ID.mp3</div><div class="meta pending">Still processing</div></div></div>
+      </div>
+    </div>
+    <div class="popup">
+      <div class="card">
+        <div class="metric-row"><strong>обработка</strong><span class="status-ok">finished</span></div>
+        <div style="font-size:18px; font-weight:700; margin-top:8px;">очередь завершена. откройте Creations и нажмите "далее"</div>
+      </div>
+      <div class="card">
+        <div class="btn btn-tonal">проверить результаты</div>
+      </div>
+      <div class="log">скачивание запущено: 23; ещё не готовы: 0001_RUS_16.03_ID_Похудение_ - ДОКТОР.mp3</div>
+      <div class="card">
+        <div class="section-title">сводка</div>
+        <div class="metric-row"><strong>вход</strong><span>24</span></div>
+        <div class="metric-row"><strong>лимит</strong><span>600 сек</span></div>
+        <div class="metric-row"><strong>задач</strong><span>24</span></div>
+        <div class="metric-row"><strong>без изменений</strong><span>24</span></div>
+        <div class="metric-row"><strong>предупреждения</strong><span class="status-warn">1</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="artboard" id="shot-automation">
+    <div class="headline">
+      <div>
+        <div class="eyebrow">Screenshot 4</div>
+        <h1>Switch between 180s and 600s<br>audio modes with one flow</h1>
+        <div class="subhead">Switch the active audio limit, let the extension pad short clips, split long tracks, and keep the queue aligned with the account capability you are using.</div>
+      </div>
+      <div class="badge">Audio mode control</div>
+    </div>
+    <div class="browser">
+      <div class="browser-top">
+        <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+        <div class="urlbar">https://tools.dreamfaceapp.com/ru/user</div>
+      </div>
+      <div class="browser-body">
+        <div class="avatar-card selected"><div class="thumb"></div><div class="avatar-meta"><div class="name">Reporter</div><div class="meta">Target 1</div></div></div>
+        <div class="avatar-card selected"><div class="thumb"></div><div class="avatar-meta"><div class="name">Doctor</div><div class="meta">Target 2</div></div></div>
+      </div>
+    </div>
+    <div class="popup">
+      <div class="card">
+        <div class="section-title">обработка аудио</div>
+        <div class="metric-row"><strong>расширенный лимит 600s</strong><span class="status-ok">вкл.</span></div>
+        <div class="metric-row"><strong>автообработка аудио</strong><span class="status-ok">вкл.</span></div>
+        <div class="metric-row"><strong>overlap 5s</strong><span class="status-ok">вкл.</span></div>
+      </div>
+      <div class="card">
+        <div class="summary-block">
+          <div class="metric-row"><strong>файл</strong><span>409.7 сек</span></div>
+          <div class="metric-row"><strong>режим</strong><span>600 сек</span></div>
+          <div class="metric-row"><strong>действие</strong><span class="status-ok">без нарезки</span></div>
+        </div>
+        <div class="summary-block">
+          <div class="metric-row"><strong>файл</strong><span>721.3 сек</span></div>
+          <div class="metric-row"><strong>режим</strong><span>600 сек</span></div>
+          <div class="metric-row"><strong>действие</strong><span class="status-warn">2 части + overlap</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="btn btn-tonal">запустить</div>
+      </div>
+    </div>
+  </section>
+</body>
+</html>

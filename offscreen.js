@@ -1,5 +1,5 @@
 const RUN_DB_NAME = 'dreamface-run-db';
-const RUN_DB_VERSION = 3;
+const RUN_DB_VERSION = 4;
 const RUN_STORE_NAME = 'audioTasks';
 const INPUT_STORE_NAME = 'inputFiles';
 const ENGINE_STATUS_PREFIX = '[engine]';

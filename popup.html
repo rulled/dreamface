@@ -610,6 +610,16 @@
       background: linear-gradient(180deg, rgba(244, 244, 244, 0), rgba(244, 244, 244, 0.92) 32%, var(--bg) 100%);
     }
 
+    .privacy-note {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.035);
+      color: var(--text-secondary);
+      font-size: 11px;
+      line-height: 1.5;
+    }
+
     .queue-meta {
       display: flex;
       align-items: baseline;
@@ -1031,6 +1041,9 @@
               <svg class="solar-icon" viewBox="0 0 24 24"><polygon points="8,5 19,12 8,19"></polygon></svg>
               Старт
             </button>
+            <div class="privacy-note">
+              Аудио обрабатывается локально внутри расширения и отправляется в DreamFace только после запуска очереди.
+            </div>
           </div>
         </div>
       </div>
