@@ -183,10 +183,40 @@ function getElementByTextLoose(selector, variants) {
   return null;
 }
 
+function getControlText(el) {
+  if (!el) {
+    return '';
+  }
+
+  return [
+    el.textContent || '',
+    el.getAttribute('aria-label') || '',
+    el.getAttribute('title') || '',
+    el.getAttribute('value') || '',
+  ]
+    .join(' ')
+    .trim()
+    .toLowerCase();
+}
+
 function findGenerateButton() {
+  const structuralCandidates = [
+    '#step3 button',
+    'div[id="step3"] button',
+    'div[class*="_generate_btn_box_"] button',
+    'button[class*="_generate_btn_"]',
+  ];
+
+  for (const selector of structuralCandidates) {
+    const button = Array.from(document.querySelectorAll(selector)).find((candidate) => isVisibleElement(candidate));
+    if (button) {
+      return button;
+    }
+  }
+
   const buttons = Array.from(document.querySelectorAll('button'));
   return buttons.find((btn) => {
-    const text = btn.textContent.trim().toLowerCase();
+    const text = getControlText(btn);
     return text.includes('генерировать') || text.includes('generate');
   });
 }
