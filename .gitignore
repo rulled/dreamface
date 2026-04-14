@@ -4,12 +4,15 @@ Thumbs.db
 .idea/
 .vscode/
 .codex/
+.codex-plugin/
 .claude/
 .playwright-cli/
 .qwen/
 .cursor/
 .windsurf/
 .roo/
+.mempalace/
+mempalace.yaml
 
 dist/
 release/
