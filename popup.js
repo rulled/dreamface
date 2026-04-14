@@ -973,6 +973,15 @@ function renderSummary(state) {
     parts.push(`<div class="summary-list">${details}</div>`);
   }
 
+  if ((summary.repairedFiles || []).length > 0) {
+    const details = summary.repairedFiles
+      .slice(0, 6)
+      .map((item) => escapeHtml(item))
+      .join('<br>');
+    parts.push(`<div class="summary-line"><strong>восстановлено:</strong> ${summary.repairedFiles.length}</div>`);
+    parts.push(`<div class="summary-list">${details}</div>`);
+  }
+
   if ((summary.failedFiles || []).length > 0) {
     const details = summary.failedFiles
       .slice(0, 6)
@@ -1193,6 +1202,7 @@ startBtn.addEventListener('click', async () => {
       keptFiles: [],
       paddedFiles: [],
       splitFiles: [],
+      repairedFiles: [],
       failedFiles: [],
     },
     skipped: [],

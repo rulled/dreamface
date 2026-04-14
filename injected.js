@@ -10,27 +10,28 @@
   const originalFetch = window.fetch;
 
   function getUrlFromFetchArg(fetchArg) {
-    if (!fetchArg) {
-      return '';
-    }
-
-    if (typeof fetchArg === 'string') {
-      return fetchArg;
-    }
-
-    if (fetchArg.url) {
-      return fetchArg.url;
-    }
-
+    if (!fetchArg) return '';
+    if (typeof fetchArg === 'string') return fetchArg;
+    if (fetchArg.url) return fetchArg.url;
     return String(fetchArg);
   }
 
-  function containsPath(url, pathPart) {
-    return typeof url === 'string' && url.includes(pathPart);
-  }
-
   function looksLikeSubmitSuccess(body) {
-    return Boolean(body && (body.status_msg === 'Success' || body.status_msg === 'success'));
+    if (!body) return false;
+    
+    // Проверяем status_msg (стандартный формат)
+    if (body.status_msg === 'Success' || body.status_msg === 'success') return true;
+    
+    // Проверяем status (альтернативный формат)
+    if (body.status === 'Success' || body.status === 'success' || body.status === 'SUCCESS') return true;
+    
+    // Проверяем код ответа
+    if (body.code === 0 || body.code === '0' || body.code === 200) return true;
+    
+    // Проверяем success флаг
+    if (body.success === true) return true;
+    
+    return false;
   }
 
   function looksLikeSubmitLimit(body) {
@@ -42,7 +43,6 @@
     if (looksLikeSubmitSuccess(body)) {
       window.dispatchEvent(new CustomEvent('DreamFaceTaskSuccess'));
     }
-
     if (looksLikeSubmitLimit(body)) {
       window.dispatchEvent(new CustomEvent('DreamFaceLimitHit'));
     }
@@ -73,15 +73,14 @@
 
   window.fetch = async function(...args) {
     const url = getUrlFromFetchArg(args[0]);
-    const isSubmit = containsPath(url, '/task/v2/submit');
-    const isAvatarAdd = containsPath(url, '/df-server/avatar/add');
+    const isSubmit = url.includes('/task/v2/submit');
+    const isAvatarAdd = url.includes('/df-server/avatar/add');
 
     const response = await originalFetch(...args);
 
     if (isSubmit) {
       processSubmitResponse(response);
     }
-
     if (isAvatarAdd) {
       processAvatarAddResponse(response);
     }

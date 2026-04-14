@@ -6,6 +6,20 @@ let activeTaskCancelled = false;
 let videoUploadJobActive = false;
 const MIN_DURATION_SECONDS = 2;
 const DEFAULT_MAX_DURATION_SECONDS = 180;
+const AVATAR_DISPLAY_LIMIT = 200;
+
+// CSS-ограничение: скрываем карточки аватаров после N-й
+(function injectAvatarLimitCss() {
+  const style = document.createElement('style');
+  style.textContent = `
+    div[class*="_userItem_"]:nth-child(n + ${AVATAR_DISPLAY_LIMIT + 1}),
+    div[class*="userItem"]:nth-child(n + ${AVATAR_DISPLAY_LIMIT + 1}),
+    div[class*="_AvatarCard_"]:nth-child(n + ${AVATAR_DISPLAY_LIMIT + 1}) {
+      display: none !important;
+    }
+  `;
+  (document.head || document.documentElement).appendChild(style);
+})();
 
 const script = document.createElement('script');
 script.src = chrome.runtime.getURL('injected.js');
@@ -1030,8 +1044,9 @@ function forceLoadThumbnails() {
   return { total: validElements.length, loaded: loadedCount, failed: failedCount };
 }
 
-async function smartLoadThumbnails() {
-  const validElements = getValidVideoElements();
+async function smartLoadThumbnails(maxElements = 200) {
+  const allElements = getValidVideoElements();
+  const validElements = allElements.slice(0, maxElements);
   const loadedImages = new Set();
 
   const observer = new IntersectionObserver((entries) => {
@@ -1058,10 +1073,37 @@ async function smartLoadThumbnails() {
   validElements.forEach((el) => observer.observe(el));
   await sleep(300);
   observer.disconnect();
-  return forceLoadThumbnails();
+  return forceLoadThumbnailsForElements(validElements);
+}
+
+function forceLoadThumbnailsForElements(elements) {
+  let loadedCount = 0;
+  let failedCount = 0;
+
+  elements.forEach((el) => {
+    const img = el.querySelector('img');
+    if (!img) {
+      return;
+    }
+
+    const dataSrc = img.getAttribute('data-src');
+    if (dataSrc && !img.src.includes('material')) {
+      img.src = dataSrc;
+    }
+
+    if (img.complete && img.naturalHeight !== 0) {
+      loadedCount += 1;
+    } else if (!img.complete) {
+      img.onload = () => { loadedCount += 1; };
+      img.onerror = () => { failedCount += 1; };
+    }
+  });
+
+  return { total: elements.length, loaded: loadedCount, failed: failedCount };
 }
 
 async function dynamicScanVideos(sendResponse) {
+  const MAX_SCAN_VIDEOS = 200;
   const MAX_ITERATIONS = 50;
   const SCROLL_DELAY = 800;
   const STABLE_COUNT = 3;
@@ -1074,14 +1116,20 @@ async function dynamicScanVideos(sendResponse) {
 
   while (iteration < MAX_ITERATIONS) {
     const validElements = getValidVideoElements();
-    const currentCount = validElements.length;
+    const currentCount = Math.min(validElements.length, MAX_SCAN_VIDEOS);
+
+    // Остановить скролл если набрали достаточно
+    if (validElements.length >= MAX_SCAN_VIDEOS) {
+      sendScanProgress(iteration + 1, MAX_SCAN_VIDEOS, MAX_ITERATIONS);
+      break;
+    }
 
     window.scrollTo({
       top: document.body.scrollHeight,
       behavior: 'smooth',
     });
 
-    await smartLoadThumbnails();
+    await smartLoadThumbnails(MAX_SCAN_VIDEOS);
 
     if (iteration % 2 === 0) {
       sendScanProgress(iteration + 1, currentCount, MAX_ITERATIONS);
@@ -1101,13 +1149,14 @@ async function dynamicScanVideos(sendResponse) {
     await sleep(SCROLL_DELAY);
   }
 
-  forceLoadThumbnails();
+  forceLoadThumbnailsForElements(getValidVideoElements().slice(0, MAX_SCAN_VIDEOS));
   await sleep(500);
 
   const videos = [];
   let skippedWithoutCover = 0;
 
-  getValidVideoElements().forEach((el, index) => {
+  const allElements = getValidVideoElements().slice(0, MAX_SCAN_VIDEOS);
+  allElements.forEach((el, index) => {
     const img = el.querySelector('img');
     if (!img) {
       return;
@@ -1431,6 +1480,7 @@ function waitForWindowEvent(eventName, timeout = 12000) {
 async function waitForSubmissionOutcome(maxDurationSeconds = DEFAULT_MAX_DURATION_SECONDS) {
   const startedAt = Date.now();
   const timeoutMs = getSubmissionTimeoutMs(maxDurationSeconds);
+  
   return new Promise((resolve, reject) => {
     let finished = false;
     let intervalId = null;
@@ -1586,6 +1636,7 @@ async function executeTaskOnPage(request) {
     generateButton.click();
 
     const submissionOutcome = await waitForSubmissionOutcome(maxDurationSeconds);
+    
     if (submissionOutcome.status === 'success') {
       return { status: 'success' };
     }

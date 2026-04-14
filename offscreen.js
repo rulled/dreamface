@@ -39,6 +39,7 @@ function createIdleRunState() {
       keptFiles: [],
       paddedFiles: [],
       splitFiles: [],
+      repairedFiles: [],
       failedFiles: [],
     },
     normalization: {
@@ -287,7 +288,13 @@ async function ensureFfmpegLoaded() {
         return;
       }
 
+      // Показываем только критические ошибки, игнорируя предупреждения о конкатенации
       if (message.includes('Error') || message.includes('Invalid')) {
+        // Не показываем стандартные предупреждения о конкатенированных файлах
+        if (message.includes('invalid concatenated file') || message.includes('Estimating duration')) {
+          return;
+        }
+
         setStatusText(`${ENGINE_STATUS_PREFIX} ${message}`);
         pushState().catch(() => {});
       }
@@ -399,6 +406,47 @@ async function transcodeFileToMp3(file, fileName, timeoutMs = 180000) {
   }
 }
 
+async function repairConcatenatedMp3(file, timeoutMs = 180000) {
+  await ensureFfmpegLoaded();
+
+  const inputPath = `repair-in-${Date.now()}-${Math.random().toString(16).slice(2)}.mp3`;
+  const outputPath = `repair-out-${Date.now()}-${Math.random().toString(16).slice(2)}.mp3`;
+
+  try {
+    await ffmpeg.writeFile(inputPath, await readUint8Array(file));
+
+    // Используем -err_detect ignore_err для игнорирования ошибок конкатенации
+    // и перекодируем в чистый MP3 с корректной структурой
+    const args = [
+      '-err_detect', 'ignore_err',
+      '-i', inputPath,
+      '-c:a', 'libmp3lame',
+      '-b:a', '192k',
+      '-write_xing', '1',
+      outputPath,
+    ];
+
+    const code = await ffmpeg.exec(args, timeoutMs);
+
+    if (code !== 0) {
+      throw new Error(`FFmpeg repair failed with code ${code}`);
+    }
+
+    const result = await ffmpeg.readFile(outputPath);
+    return new Blob([result.buffer.slice(0)], { type: MP3_MIME });
+  } finally {
+    await safeDeleteFsFile(inputPath);
+    await safeDeleteFsFile(outputPath);
+  }
+}
+
+function blobToRuntimeFile(blob, name, lastModified = Date.now()) {
+  return new File([blob], name, {
+    type: blob.type || MP3_MIME,
+    lastModified,
+  });
+}
+
 async function padShortFile(file) {
   await ensureFfmpegLoaded();
 
@@ -482,10 +530,68 @@ function isMp3Like(file) {
 async function normalizeFile(file, options, runToken) {
   throwIfStopped(runToken);
 
+  const originalFileName = file.name;
+  const originalLastModified = file.lastModified || Date.now();
   const maxDurationSeconds = Number(options?.maxDurationSeconds) > DEFAULT_MAX_DURATION_SECONDS
     ? Number(options.maxDurationSeconds)
     : DEFAULT_MAX_DURATION_SECONDS;
-  const duration = await getAudioDuration(file);
+  let duration = await getAudioDuration(file);
+
+  // Если MP3 файл не читается (конкатенированный или повреждённый), пробуем восстановить через FFmpeg
+  if ((!Number.isFinite(duration) || duration <= 0) && isMp3Like(file)) {
+    setStatusText(`${ENGINE_STATUS_PREFIX} восстановление ${file.name}`);
+    await pushState();
+
+    try {
+      const repairedBlob = await repairConcatenatedMp3(file);
+      file = blobToRuntimeFile(repairedBlob, toMp3Name(originalFileName), originalLastModified);
+      duration = await getAudioDuration(file);
+
+      // Если восстановление успешно, продолжаем с восстановленным файлом
+      if (Number.isFinite(duration) && duration > 0) {
+        // Файл был восстановлен, возвращаем соответствующий kind
+        if (duration < MIN_DURATION_SECONDS) {
+          const paddedBlob = await padShortFile(file);
+          return {
+            ok: true,
+            kind: 'repaired',
+            outputs: [{
+              name: toMp3Name(file.name),
+              blob: paddedBlob,
+              type: MP3_MIME,
+            }],
+          };
+        }
+
+        // Файл восстановлен, но теперь нужно проверить другие условия
+        if (duration > maxDurationSeconds) {
+          const outputs = await splitLongFile(file, maxDurationSeconds, options.overlapEnabled);
+          return {
+            ok: true,
+            kind: 'repaired',
+            outputs,
+          };
+        }
+
+        // Файл в норме после восстановления
+        return {
+          ok: true,
+          kind: 'repaired',
+          outputs: [{
+            name: toMp3Name(file.name),
+            blob: file,
+            type: MP3_MIME,
+          }],
+        };
+      }
+    } catch (repairError) {
+      return {
+        ok: false,
+        reason: `decode error: repair failed (${repairError.message})`,
+      };
+    }
+  }
+
   if (!Number.isFinite(duration) || duration <= 0) {
     return {
       ok: false,
@@ -583,6 +689,7 @@ async function prepareTasks(payload, runToken) {
     keptFiles: [],
     paddedFiles: [],
     splitFiles: [],
+    repairedFiles: [],
     failedFiles: [],
   };
 
@@ -635,6 +742,8 @@ async function prepareTasks(payload, runToken) {
             fileName: file.name,
             parts: result.outputs.length,
           });
+        } else if (result.kind === 'repaired') {
+          summary.repairedFiles.push(file.name);
         }
       }
 

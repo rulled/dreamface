@@ -1,5 +1,6 @@
 const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
 const RUN_STATE_KEY = 'dreamfaceRunState';
+const DEFAULT_MAX_DURATION_SECONDS = 180;
 const CREATIONS_URL = 'https://www.dreamfaceapp.com/ru/creation?type=Avatar+Video';
 const CREATIONS_URL_PATTERNS = [
   'https://tools.dreamfaceapp.com/user*',
@@ -41,6 +42,7 @@ function createIdleRunState() {
       keptFiles: [],
       paddedFiles: [],
       splitFiles: [],
+      repairedFiles: [],
       failedFiles: [],
     },
     normalization: {
@@ -51,7 +53,7 @@ function createIdleRunState() {
     },
     startedAt: null,
     finishedAt: null,
-    maxDurationSeconds: 180,
+    maxDurationSeconds: DEFAULT_MAX_DURATION_SECONDS,
     autoNormalize: true,
     overlapEnabled: false,
     interrupted: false,
