@@ -6,6 +6,10 @@ Thumbs.db
 .codex/
 .claude/
 .playwright-cli/
+.qwen/
+.cursor/
+.windsurf/
+.roo/
 
 dist/
 release/
