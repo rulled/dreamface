@@ -812,19 +812,22 @@ function getApiMatchingCreationItems(items, expectedFileNames, startedAt, expect
   expectedRefs.forEach((ref) => {
     if (ref.workId) {
       const item = itemsById.get(ref.workId);
-      if (item && isRecentCreationItemReady(item)) {
+      if (item && item.work_name === ref.name && isRecentCreationItemReady(item)) {
         readyItems.push(item);
         readyFiles.push(ref.name);
         usedIds.add(ref.workId);
         return;
       }
 
-      pending.push(ref.name);
-      if (item) {
+      if (item && item.work_name === ref.name) {
+        pending.push(ref.name);
         pendingItems.push(item);
+        pendingWorkIds.push(ref.workId);
+        return;
       }
-      pendingWorkIds.push(ref.workId);
-      return;
+
+      // If the tracked work id resolves to a different file name,
+      // treat that mapping as stale and fall back to name-based matching.
     }
 
     const match = (itemsByName.get(ref.name) || []).find((item) => !usedIds.has(String(item.id || '')));
@@ -854,6 +857,24 @@ function getApiMatchingCreationItems(items, expectedFileNames, startedAt, expect
     pendingItems,
     pendingWorkIds: Array.from(new Set(pendingWorkIds.filter(Boolean))),
   };
+}
+
+function haveAllTrackedWorkIds(aggregatedItems, expectedWorkIds) {
+  const trackedIds = Array.isArray(expectedWorkIds)
+    ? expectedWorkIds.map((id) => String(id || '').trim()).filter(Boolean)
+    : [];
+
+  if (trackedIds.length === 0) {
+    return false;
+  }
+
+  const itemIds = new Set(
+    (Array.isArray(aggregatedItems) ? aggregatedItems : [])
+      .map((item) => String(item?.id || '').trim())
+      .filter(Boolean)
+  );
+
+  return trackedIds.every((id) => itemIds.has(id));
 }
 
 async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = {}) {
@@ -908,6 +929,10 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
         startedAt: request.startedAt,
         source: 'api',
       };
+    }
+
+    if (haveAllTrackedWorkIds(aggregatedItems, expectedWorkIds)) {
+      break;
     }
 
     if (page * pageSize >= totalCount || list.length === 0) {
