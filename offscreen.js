@@ -879,6 +879,7 @@ async function runCreationsDownload(expectedFileNames) {
         lastMessage: `скачивание запущено: ${result.downloadedCount}`,
         pendingFiles: [],
         downloadedCount: result.downloadedCount || 0,
+        matchedCount: Number(result.matchedCount || result.downloadedCount || expectedFileNames.length || 0),
       };
       setStatusText(`скачивание запущено: ${result.downloadedCount}`);
       await pushState();
@@ -898,6 +899,7 @@ async function runCreationsDownload(expectedFileNames) {
         lastMessage: message,
         pendingFiles,
         downloadedCount: result.downloadedCount || 0,
+        matchedCount: Number(result.matchedCount || result.downloadedCount || 0),
       };
       runState.warnings = [...runState.warnings, message];
       setStatusText(message);
@@ -918,6 +920,7 @@ async function runCreationsDownload(expectedFileNames) {
         lastMessage: message,
         pendingFiles,
         downloadedCount: 0,
+        matchedCount: Number(result.matchedCount || 0),
       };
       setStatusText(message);
       await pushState();

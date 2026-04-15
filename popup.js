@@ -1305,6 +1305,7 @@ creationsBtn.addEventListener('click', async () => {
   }
 
   const totalExpected = getExpectedCreationsTotal(latestRunState);
+  const knownMatchedCount = Number(latestRunState.downloadPlan?.matchedCount || 0);
   const shouldDownloadReadyOnly = latestRunState.downloadPlan?.lastStatus === 'partial'
     && Number(latestRunState.downloadPlan?.matchedCount || 0) > 0;
 
@@ -1325,7 +1326,11 @@ creationsBtn.addEventListener('click', async () => {
           lastMessage: nextMessage,
           pendingFiles: Array.isArray(downloadResult?.pending) ? [...downloadResult.pending] : [],
           downloadedCount: Number(downloadResult?.downloadedCount || 0),
-          matchedCount: Number(downloadResult?.downloadedCount || 0),
+          matchedCount: Math.max(
+            knownMatchedCount,
+            Number(downloadResult?.matchedCount || 0),
+            Number(downloadResult?.downloadedCount || 0),
+          ),
           totalExpected,
           checkedAt: new Date().toISOString(),
           checkedOnUrl: tabContext.url,
@@ -1358,7 +1363,7 @@ creationsBtn.addEventListener('click', async () => {
           lastMessage: nextMessage,
           pendingFiles: Array.isArray(downloadResult?.pending) ? [...downloadResult.pending] : [],
           downloadedCount: Number(downloadResult?.downloadedCount || 0),
-          matchedCount: Number(downloadResult?.downloadedCount || checkResult.matchedCount || totalExpected),
+          matchedCount: Number(checkResult?.matchedCount || totalExpected),
           totalExpected,
           checkedAt: new Date().toISOString(),
           checkedOnUrl: tabContext.url,
