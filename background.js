@@ -63,6 +63,7 @@ function createIdleRunState() {
     nextTaskIndex: 0,
     downloadPlan: {
       expectedFileNames: [],
+      expectedWorkIds: [],
       lastStatus: 'idle',
       lastMessage: '',
       pendingFiles: [],

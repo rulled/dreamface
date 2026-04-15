@@ -8,10 +8,13 @@
   ];
   const RECENT_CREATIONS_PATH = '/dw-server/work/v2/get_recent_creation_list';
   const BATCH_WORK_STATUS_PATH = '/dw-server/work/batch_get_work_status';
+  const RUNNING_WORKS_PATH = '/dw-server/work/get_user_running_works/';
 
   const originalFetch = window.fetch;
   let recentCreationsTemplate = null;
   let batchWorkStatusTemplate = null;
+  let runningWorksTemplate = null;
+  let submitContext = null;
 
   function getUrlFromFetchArg(fetchArg) {
     if (!fetchArg) return '';
@@ -98,6 +101,66 @@
       credentials: snapshot.credentials || 'include',
       mode: snapshot.mode || 'cors',
       url: snapshot.url,
+    };
+  }
+
+  function rememberSubmitContext(args) {
+    const snapshot = getFetchInitSnapshot(args);
+    const body = tryParseJson(snapshot.body);
+    const accountId = body?.user?.account_id;
+    if (!accountId) {
+      return;
+    }
+
+    submitContext = {
+      headers: snapshot.headers,
+      referrer: snapshot.referrer || location.href,
+      credentials: snapshot.credentials || 'include',
+      mode: snapshot.mode || 'cors',
+      accountId,
+      url: `${location.origin}${RUNNING_WORKS_PATH}${accountId}`,
+    };
+  }
+
+  function rememberRunningWorksTemplate(args) {
+    const snapshot = getFetchInitSnapshot(args);
+    const accountId = String(snapshot.url || '').split(RUNNING_WORKS_PATH)[1] || '';
+    if (!accountId) {
+      return;
+    }
+
+    runningWorksTemplate = {
+      headers: snapshot.headers,
+      referrer: snapshot.referrer || location.href,
+      credentials: snapshot.credentials || 'include',
+      mode: snapshot.mode || 'cors',
+      accountId,
+      url: snapshot.url,
+    };
+  }
+
+  function getRunningWorksContext() {
+    const accountId = runningWorksTemplate?.accountId
+      || recentCreationsTemplate?.body?.account_id
+      || batchWorkStatusTemplate?.body?.account_id
+      || submitContext?.accountId;
+
+    if (!accountId) {
+      return null;
+    }
+
+    const template = runningWorksTemplate
+      || submitContext
+      || recentCreationsTemplate
+      || batchWorkStatusTemplate;
+
+    return {
+      headers: template?.headers || {},
+      referrer: template?.referrer || location.href,
+      credentials: template?.credentials || 'include',
+      mode: template?.mode || 'cors',
+      accountId,
+      url: runningWorksTemplate?.url || `${location.origin}${RUNNING_WORKS_PATH}${accountId}`,
     };
   }
 
@@ -207,6 +270,40 @@
     return body;
   }
 
+  async function fetchRunningWorks() {
+    const context = getRunningWorksContext();
+    if (!context) {
+      throw new Error('running works request template unavailable');
+    }
+
+    const headers = new Headers(context.headers || {});
+    if (!headers.has('accept')) {
+      headers.set('accept', 'application/json');
+    }
+    if (!headers.has('dream-face-web')) {
+      headers.set('dream-face-web', 'dream-face-web');
+    }
+
+    const response = await originalFetch(context.url, {
+      method: 'GET',
+      headers,
+      referrer: context.referrer || location.href,
+      mode: context.mode || 'cors',
+      credentials: context.credentials || 'include',
+    });
+    const body = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      throw new Error(body?.status_msg || `running works request failed: ${response.status}`);
+    }
+
+    if (!body || body.status_msg !== 'Success') {
+      throw new Error(body?.status_msg || 'running works response is not successful');
+    }
+
+    return body;
+  }
+
   function looksLikeSubmitSuccess(body) {
     if (!body) return false;
     
@@ -232,7 +329,11 @@
 
   function emitSubmitSignals(body) {
     if (looksLikeSubmitSuccess(body)) {
-      window.dispatchEvent(new CustomEvent('DreamFaceTaskSuccess'));
+      window.dispatchEvent(new CustomEvent('DreamFaceTaskSuccess', {
+        detail: {
+          animateImageId: body?.data?.animate_image_id || '',
+        },
+      }));
     }
     if (looksLikeSubmitLimit(body)) {
       window.dispatchEvent(new CustomEvent('DreamFaceLimitHit'));
@@ -318,18 +419,53 @@
     }
   });
 
+  window.addEventListener('DreamFaceRunningWorksRequest', async (event) => {
+    const detail = event?.detail || {};
+    const requestId = detail.requestId;
+
+    if (!requestId) {
+      return;
+    }
+
+    try {
+      const body = await fetchRunningWorks();
+      window.dispatchEvent(new CustomEvent('DreamFaceRunningWorksResponse', {
+        detail: {
+          requestId,
+          ok: true,
+          body,
+        },
+      }));
+    } catch (error) {
+      window.dispatchEvent(new CustomEvent('DreamFaceRunningWorksResponse', {
+        detail: {
+          requestId,
+          ok: false,
+          error: error?.message || String(error),
+        },
+      }));
+    }
+  });
+
   window.fetch = async function(...args) {
     const url = getUrlFromFetchArg(args[0]);
     const isSubmit = url.includes('/task/v2/submit');
     const isAvatarAdd = url.includes('/df-server/avatar/add');
     const isRecentCreations = url.includes(RECENT_CREATIONS_PATH);
     const isBatchWorkStatus = url.includes(BATCH_WORK_STATUS_PATH);
+    const isRunningWorks = url.includes(RUNNING_WORKS_PATH);
 
+    if (isSubmit) {
+      rememberSubmitContext(args);
+    }
     if (isRecentCreations) {
       rememberRecentCreationsTemplate(args);
     }
     if (isBatchWorkStatus) {
       rememberBatchWorkStatusTemplate(args);
+    }
+    if (isRunningWorks) {
+      rememberRunningWorksTemplate(args);
     }
 
     const response = await originalFetch(...args);

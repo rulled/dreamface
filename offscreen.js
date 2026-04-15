@@ -60,6 +60,7 @@ function createIdleRunState() {
     nextTaskIndex: 0,
     downloadPlan: {
       expectedFileNames: [],
+      expectedWorkIds: [],
       lastStatus: 'idle',
       lastMessage: '',
       pendingFiles: [],
@@ -784,6 +785,8 @@ async function prepareTasks(payload, runToken) {
         fileName: output.name,
         mimeType: output.type || MP3_MIME,
         videoIndex: batch.selectedIndices[videoPointer],
+        workId: '',
+        animateImageId: '',
       });
 
       queueIndex += 1;
@@ -866,6 +869,9 @@ async function runCreationsDownload(expectedFileNames) {
       pageAction: 'downloadCreationsIfReady',
       payload: {
         expectedFileNames,
+        expectedWorkIds: Array.isArray(runState.downloadPlan?.expectedWorkIds)
+          ? [...runState.downloadPlan.expectedWorkIds]
+          : [],
         startedAt: runState.startedAt,
       },
     });
@@ -875,6 +881,9 @@ async function runCreationsDownload(expectedFileNames) {
       runState.downloadPlan = {
         ...runState.downloadPlan,
         expectedFileNames: [...expectedFileNames],
+        expectedWorkIds: Array.isArray(runState.downloadPlan?.expectedWorkIds)
+          ? [...runState.downloadPlan.expectedWorkIds]
+          : [],
         lastStatus: 'success',
         lastMessage: `скачивание запущено: ${result.downloadedCount}`,
         pendingFiles: [],
@@ -895,6 +904,9 @@ async function runCreationsDownload(expectedFileNames) {
       runState.downloadPlan = {
         ...runState.downloadPlan,
         expectedFileNames: [...expectedFileNames],
+        expectedWorkIds: Array.isArray(runState.downloadPlan?.expectedWorkIds)
+          ? [...runState.downloadPlan.expectedWorkIds]
+          : [],
         lastStatus: 'partial',
         lastMessage: message,
         pendingFiles,
@@ -916,6 +928,9 @@ async function runCreationsDownload(expectedFileNames) {
       runState.downloadPlan = {
         ...runState.downloadPlan,
         expectedFileNames: [...expectedFileNames],
+        expectedWorkIds: Array.isArray(runState.downloadPlan?.expectedWorkIds)
+          ? [...runState.downloadPlan.expectedWorkIds]
+          : [],
         lastStatus: 'pending',
         lastMessage: message,
         pendingFiles,
@@ -932,6 +947,9 @@ async function runCreationsDownload(expectedFileNames) {
     runState.downloadPlan = {
       ...runState.downloadPlan,
       expectedFileNames: [...expectedFileNames],
+      expectedWorkIds: Array.isArray(runState.downloadPlan?.expectedWorkIds)
+        ? [...runState.downloadPlan.expectedWorkIds]
+        : [],
       lastStatus: 'error',
       lastMessage: message,
       pendingFiles: [],
@@ -946,6 +964,9 @@ async function runCreationsDownload(expectedFileNames) {
     runState.downloadPlan = {
       ...runState.downloadPlan,
       expectedFileNames: [...expectedFileNames],
+      expectedWorkIds: Array.isArray(runState.downloadPlan?.expectedWorkIds)
+        ? [...runState.downloadPlan.expectedWorkIds]
+        : [],
       lastStatus: 'error',
       lastMessage: message,
       pendingFiles: [],
@@ -987,6 +1008,7 @@ async function processQueue(queue, runToken, startIndex = 0) {
   runState.downloadPlan = {
     ...runState.downloadPlan,
     expectedFileNames: queue.map((task) => task.fileName).filter(Boolean),
+    expectedWorkIds: queue.map((task) => task.workId || ''),
     lastStatus: 'ready',
     lastMessage: '',
     pendingFiles: [],
@@ -1058,6 +1080,30 @@ async function processQueue(queue, runToken, startIndex = 0) {
       const result = pageResponse.response || {};
 
       if (result.status === 'success') {
+        task.workId = result.workId || task.workId || '';
+        task.animateImageId = result.animateImageId || task.animateImageId || '';
+        if (result.workIdAmbiguous) {
+          runState.warnings = [
+            ...runState.warnings,
+            `${task.fileName}: найдено несколько кандидатов work id, использован первый`,
+          ];
+        } else if (!task.workId) {
+          runState.warnings = [
+            ...runState.warnings,
+            `${task.fileName}: work id не определился, останется fallback через Creations`,
+          ];
+        }
+        if (Array.isArray(runState.queuePlan) && runState.queuePlan[index]) {
+          runState.queuePlan[index] = {
+            ...runState.queuePlan[index],
+            workId: task.workId,
+            animateImageId: task.animateImageId,
+          };
+        }
+        runState.downloadPlan = {
+          ...runState.downloadPlan,
+          expectedWorkIds: queue.map((queueTask) => queueTask.workId || ''),
+        };
         await deleteTaskBlob(task.id);
         runState.nextTaskIndex = index + 1;
         setStatusText(`[${index + 1}/${queue.length}] OK`);

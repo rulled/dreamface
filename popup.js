@@ -1297,6 +1297,9 @@ creationsBtn.addEventListener('click', async () => {
   const expectedFileNames = Array.isArray(latestRunState.downloadPlan?.expectedFileNames)
     ? latestRunState.downloadPlan.expectedFileNames.filter(Boolean)
     : [];
+  const expectedWorkIds = Array.isArray(latestRunState.downloadPlan?.expectedWorkIds)
+    ? [...latestRunState.downloadPlan.expectedWorkIds]
+    : [];
 
   if (expectedFileNames.length === 0) {
     monitorLog.textContent = 'нет результатов для проверки в Creations';
@@ -1315,6 +1318,7 @@ creationsBtn.addEventListener('click', async () => {
       const downloadResult = await sendMessageToTab(tabContext.id, {
         action: 'downloadCreationsIfReady',
         expectedFileNames,
+        expectedWorkIds,
         startedAt: latestRunState.startedAt,
       });
 
@@ -1344,6 +1348,7 @@ creationsBtn.addEventListener('click', async () => {
     const checkResult = await sendMessageToTab(tabContext.id, {
       action: 'checkCreationsStatus',
       expectedFileNames,
+      expectedWorkIds,
       startedAt: latestRunState.startedAt,
     });
 
@@ -1352,6 +1357,7 @@ creationsBtn.addEventListener('click', async () => {
       const downloadResult = await sendMessageToTab(tabContext.id, {
         action: 'downloadCreationsIfReady',
         expectedFileNames,
+        expectedWorkIds,
         startedAt: latestRunState.startedAt,
       });
 

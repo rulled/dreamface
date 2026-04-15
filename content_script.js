@@ -4,6 +4,8 @@ let serverSuccessHit = false;
 let avatarAddSuccessHit = false;
 let activeTaskCancelled = false;
 let videoUploadJobActive = false;
+let lastSubmitDetail = null;
+let lastKnownRunningWorkIds = [];
 const MIN_DURATION_SECONDS = 2;
 const DEFAULT_MAX_DURATION_SECONDS = 180;
 const AVATAR_DISPLAY_LIMIT = 200;
@@ -32,8 +34,9 @@ window.addEventListener('DreamFaceLimitHit', () => {
   serverLimitHit = true;
 });
 
-window.addEventListener('DreamFaceTaskSuccess', () => {
+window.addEventListener('DreamFaceTaskSuccess', (event) => {
   serverSuccessHit = true;
+  lastSubmitDetail = event?.detail || null;
 });
 
 window.addEventListener('DreamFaceAvatarAdded', () => {
@@ -651,16 +654,124 @@ function requestBatchWorkStatus(ids) {
   });
 }
 
+function requestRunningWorks() {
+  return new Promise((resolve, reject) => {
+    const requestId = `running-works-${Date.now()}-${recentCreationsRequestCounter += 1}`;
+    let timeoutId = null;
+
+    const cleanup = () => {
+      window.removeEventListener('DreamFaceRunningWorksResponse', handleResponse);
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+    };
+
+    const handleResponse = (event) => {
+      const detail = event?.detail || {};
+      if (detail.requestId !== requestId) {
+        return;
+      }
+
+      cleanup();
+      if (detail.ok) {
+        resolve(detail.body || {});
+        return;
+      }
+
+      reject(new Error(detail.error || 'running works request failed'));
+    };
+
+    window.addEventListener('DreamFaceRunningWorksResponse', handleResponse);
+    timeoutId = setTimeout(() => {
+      cleanup();
+      reject(new Error('running works request timeout'));
+    }, 6000);
+
+    window.dispatchEvent(new CustomEvent('DreamFaceRunningWorksRequest', {
+      detail: { requestId },
+    }));
+  });
+}
+
+function extractRunningWorkIds(body) {
+  const ids = Array.isArray(body?.data) ? body.data : [];
+  return ids.map((id) => String(id || '').trim()).filter(Boolean);
+}
+
+async function captureRunningWorksSnapshot() {
+  try {
+    const body = await requestRunningWorks();
+    const ids = extractRunningWorkIds(body);
+    lastKnownRunningWorkIds = [...ids];
+    return { ok: true, ids };
+  } catch (error) {
+    return {
+      ok: false,
+      ids: [],
+      error: error?.message || String(error),
+    };
+  }
+}
+
+async function resolveSubmittedWorkId(beforeIds, {
+  timeoutMs = 10000,
+  pollIntervalMs = 1200,
+} = {}) {
+  const baseline = new Set((Array.isArray(beforeIds) ? beforeIds : []).map((id) => String(id || '').trim()).filter(Boolean));
+  const deadline = Date.now() + timeoutMs;
+  let lastIds = Array.isArray(beforeIds) ? [...beforeIds] : [];
+
+  while (Date.now() < deadline) {
+    ensureNotCancelled();
+
+    try {
+      const body = await requestRunningWorks();
+      const ids = extractRunningWorkIds(body);
+      lastIds = ids;
+      lastKnownRunningWorkIds = [...ids];
+
+      const diff = ids.filter((id) => !baseline.has(id));
+      if (diff.length >= 1) {
+        return {
+          workId: diff[0],
+          ambiguous: diff.length > 1,
+          candidateIds: [...diff],
+          allIds: ids,
+        };
+      }
+
+      if (baseline.size === 0 && ids.length === 1) {
+        return {
+          workId: ids[0],
+          inferred: true,
+          ambiguous: false,
+          candidateIds: [...ids],
+          allIds: ids,
+        };
+      }
+    } catch (_) {}
+
+    await waitWithCancellation(Math.min(pollIntervalMs, Math.max(250, deadline - Date.now())));
+  }
+
+  return {
+    workId: '',
+    ambiguous: false,
+    candidateIds: [],
+    allIds: lastIds,
+  };
+}
+
 function isRecentCreationItemReady(item) {
   const status = Number(item?.web_work_status);
   return status === 200;
 }
 
-function getApiMatchingCreationItems(items, expectedFileNames, startedAt) {
+function getApiMatchingCreationItems(items, expectedFileNames, startedAt, expectedWorkIds = []) {
   const minDateMs = startedAt
     ? Math.max(0, new Date(startedAt).getTime() - (5 * 60 * 1000))
     : 0;
-  const expectedCounts = new Map();
   const filteredItems = Array.isArray(items)
     ? items.filter((item) => (
       item
@@ -669,42 +780,87 @@ function getApiMatchingCreationItems(items, expectedFileNames, startedAt) {
       && (!minDateMs || Number(item.create_time) >= minDateMs)
     ))
     : [];
+  const expectedRefs = expectedFileNames.map((name, index) => ({
+    name,
+    workId: String(expectedWorkIds[index] || '').trim(),
+  }));
+  const itemsById = new Map(
+    filteredItems
+      .filter((item) => item?.id)
+      .map((item) => [String(item.id), item])
+  );
+  const itemsByName = new Map();
   const readyItems = [];
+  const readyFiles = [];
   const pending = [];
   const pendingItems = [];
+  const pendingWorkIds = [];
+  const usedIds = new Set();
 
-  expectedFileNames.forEach((name) => {
-    expectedCounts.set(name, (expectedCounts.get(name) || 0) + 1);
-  });
+  filteredItems
+    .slice()
+    .sort((a, b) => Number(b.create_time || 0) - Number(a.create_time || 0))
+    .forEach((item) => {
+      const name = item.work_name;
+      if (!itemsByName.has(name)) {
+        itemsByName.set(name, []);
+      }
+      itemsByName.get(name).push(item);
+    });
 
-  expectedCounts.forEach((count, name) => {
-    const matches = filteredItems
-      .filter((item) => item.work_name === name)
-      .sort((a, b) => Number(b.create_time || 0) - Number(a.create_time || 0));
-    const currentRunMatches = matches.slice(0, count);
-    const pendingMatches = currentRunMatches.filter((item) => !isRecentCreationItemReady(item));
+  expectedRefs.forEach((ref) => {
+    if (ref.workId) {
+      const item = itemsById.get(ref.workId);
+      if (item && isRecentCreationItemReady(item)) {
+        readyItems.push(item);
+        readyFiles.push(ref.name);
+        usedIds.add(ref.workId);
+        return;
+      }
 
-    if (currentRunMatches.length < count || pendingMatches.length > 0) {
-      pending.push(name);
-      pendingItems.push(...pendingMatches);
+      pending.push(ref.name);
+      if (item) {
+        pendingItems.push(item);
+      }
+      pendingWorkIds.push(ref.workId);
       return;
     }
 
-    readyItems.push(...currentRunMatches);
+    const match = (itemsByName.get(ref.name) || []).find((item) => !usedIds.has(String(item.id || '')));
+    if (match && isRecentCreationItemReady(match)) {
+      readyItems.push(match);
+      readyFiles.push(ref.name);
+      if (match.id) {
+        usedIds.add(String(match.id));
+      }
+      return;
+    }
+
+    pending.push(ref.name);
+    if (match) {
+      pendingItems.push(match);
+      if (match.id) {
+        pendingWorkIds.push(String(match.id));
+      }
+    }
   });
 
   return {
     ready: pending.length === 0,
     items: readyItems,
-    readyFiles: readyItems.map((item) => item.work_name),
+    readyFiles,
     pending,
     pendingItems,
+    pendingWorkIds: Array.from(new Set(pendingWorkIds.filter(Boolean))),
   };
 }
 
 async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = {}) {
   const expectedFileNames = Array.isArray(request?.expectedFileNames)
     ? request.expectedFileNames.filter(Boolean)
+    : [];
+  const expectedWorkIds = Array.isArray(request?.expectedWorkIds)
+    ? request.expectedWorkIds.map((id) => String(id || '').trim())
     : [];
 
   if (expectedFileNames.length === 0) {
@@ -713,6 +869,7 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
       message: 'нет ожидаемых файлов для Creations',
       items: [],
       pendingItems: [],
+      pendingWorkIds: [],
     };
   }
 
@@ -724,6 +881,7 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
     readyFiles: [],
     pending: [...expectedFileNames],
     pendingItems: [],
+    pendingWorkIds: [],
   };
 
   for (let page = 1; page <= maxPages; page += 1) {
@@ -732,7 +890,7 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
     const list = Array.isArray(data.list) ? data.list : [];
     totalCount = Number(data.count) || totalCount;
     aggregatedItems = aggregatedItems.concat(list);
-    selection = getApiMatchingCreationItems(aggregatedItems, expectedFileNames, request.startedAt);
+    selection = getApiMatchingCreationItems(aggregatedItems, expectedFileNames, request.startedAt, expectedWorkIds);
 
     if (selection.ready) {
       return {
@@ -744,6 +902,8 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
         items: aggregatedItems,
         pendingItems: [],
         expectedFileNames: [...expectedFileNames],
+        expectedWorkIds: [...expectedWorkIds],
+        pendingWorkIds: [],
         startedAt: request.startedAt,
         source: 'api',
       };
@@ -764,6 +924,8 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
       items: aggregatedItems,
       pendingItems: [...selection.pendingItems],
       expectedFileNames: [...expectedFileNames],
+      expectedWorkIds: [...expectedWorkIds],
+      pendingWorkIds: [...selection.pendingWorkIds],
       startedAt: request.startedAt,
       source: 'api',
     };
@@ -779,6 +941,8 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
       items: aggregatedItems,
       pendingItems: [...selection.pendingItems],
       expectedFileNames: [...expectedFileNames],
+      expectedWorkIds: [...expectedWorkIds],
+      pendingWorkIds: [...selection.pendingWorkIds],
       startedAt: request.startedAt,
       source: 'api',
     };
@@ -789,6 +953,7 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
     message: 'recent creations API returned no usable matches',
     items: aggregatedItems,
     pendingItems: [],
+    pendingWorkIds: [],
     source: 'api',
   };
 }
@@ -821,32 +986,49 @@ async function waitForCreationsApiReady(request, {
       return snapshot;
     }
 
-    const pendingIds = Array.from(new Set(
-      (snapshot.pendingItems || []).map((item) => item?.id).filter(Boolean)
-    ));
+    const pendingIds = Array.from(new Set([
+      ...((snapshot.pendingWorkIds || []).map((id) => String(id || '').trim()).filter(Boolean)),
+      ...((snapshot.pendingItems || []).map((item) => item?.id).filter(Boolean)),
+    ]));
     const pendingNames = Array.isArray(snapshot.pending) ? [...snapshot.pending] : [];
-    const knownPendingNames = new Set((snapshot.pendingItems || []).map((item) => item.work_name).filter(Boolean));
-    const allPendingNamesKnown = pendingNames.length > 0 && pendingNames.every((name) => knownPendingNames.has(name));
 
-    if (pendingIds.length === 0 || !allPendingNamesKnown) {
+    if (pendingIds.length === 0 || pendingNames.length === 0) {
       break;
     }
 
     const body = await requestBatchWorkStatus(pendingIds);
-    const mergedItems = mergeBatchStatusesIntoCreationsItems(snapshot.items, body?.data || []);
-    const selection = getApiMatchingCreationItems(mergedItems, snapshot.expectedFileNames || request.expectedFileNames, snapshot.startedAt || request.startedAt);
+    const statusRows = Array.isArray(body?.data) ? body.data : [];
+    let baseSnapshot = snapshot;
+    let mergedItems = mergeBatchStatusesIntoCreationsItems(snapshot.items, statusRows);
+    const hasMissingTrackedRows = statusRows.some((row) => row?.id && !(snapshot.items || []).some((item) => item?.id === row.id));
+
+    if (hasMissingTrackedRows) {
+      try {
+        const refreshedSnapshot = await getCreationsApiStatus(request, { maxPages, pageSize });
+        baseSnapshot = refreshedSnapshot;
+        mergedItems = mergeBatchStatusesIntoCreationsItems(refreshedSnapshot.items, statusRows);
+      } catch {}
+    }
+
+    const selection = getApiMatchingCreationItems(
+      mergedItems,
+      baseSnapshot.expectedFileNames || request.expectedFileNames,
+      baseSnapshot.startedAt || request.startedAt,
+      baseSnapshot.expectedWorkIds || request.expectedWorkIds,
+    );
 
     snapshot = {
-      ...snapshot,
+      ...baseSnapshot,
       status: selection.ready ? 'ready' : (selection.readyFiles.length > 0 ? 'partial' : 'pending'),
       matchedCount: selection.readyFiles.length,
-      totalExpected: Array.isArray(snapshot.expectedFileNames || request.expectedFileNames)
-        ? (snapshot.expectedFileNames || request.expectedFileNames).length
+      totalExpected: Array.isArray(baseSnapshot.expectedFileNames || request.expectedFileNames)
+        ? (baseSnapshot.expectedFileNames || request.expectedFileNames).length
         : 0,
       readyFiles: [...selection.readyFiles],
       pending: [...selection.pending],
       items: mergedItems,
       pendingItems: [...selection.pendingItems],
+      pendingWorkIds: [...selection.pendingWorkIds],
     };
 
     if (snapshot.status === 'ready') {
@@ -1943,7 +2125,10 @@ async function waitForSubmissionOutcome(maxDurationSeconds = DEFAULT_MAX_DURATIO
       reject(error);
     };
 
-    const onSuccess = () => resolveOnce({ status: 'success' });
+    const onSuccess = (event) => resolveOnce({
+      status: 'success',
+      animateImageId: event?.detail?.animateImageId || '',
+    });
     const onLimit = () => resolveOnce({ status: 'limit' });
 
     window.addEventListener('DreamFaceTaskSuccess', onSuccess, { once: true });
@@ -2059,13 +2244,25 @@ async function executeTaskOnPage(request) {
     newTabDetected = false;
     serverLimitHit = false;
     serverSuccessHit = false;
+    lastSubmitDetail = null;
+    const runningWorksBefore = await captureRunningWorksSnapshot();
 
     generateButton.click();
 
     const submissionOutcome = await waitForSubmissionOutcome(maxDurationSeconds);
     
     if (submissionOutcome.status === 'success') {
-      return { status: 'success' };
+      const workResolution = await resolveSubmittedWorkId(runningWorksBefore.ids, {
+        timeoutMs: 10000,
+        pollIntervalMs: 1200,
+      });
+
+      return {
+        status: 'success',
+        animateImageId: submissionOutcome.animateImageId || lastSubmitDetail?.animateImageId || '',
+        workId: workResolution.workId || '',
+        workIdAmbiguous: Boolean(workResolution.ambiguous),
+      };
     }
 
     if (submissionOutcome.status === 'limit') {
