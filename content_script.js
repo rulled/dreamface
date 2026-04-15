@@ -562,6 +562,173 @@ function getCreationsCardsSignature(cards) {
   return cards.map((item) => `${item.name}__${item.dateText}`).join('||');
 }
 
+let recentCreationsRequestCounter = 0;
+
+function requestRecentCreationsPage({ page = 1, size = 30 } = {}) {
+  return new Promise((resolve, reject) => {
+    const requestId = `recent-creations-${Date.now()}-${recentCreationsRequestCounter += 1}`;
+    let timeoutId = null;
+
+    const cleanup = () => {
+      window.removeEventListener('DreamFaceRecentCreationsResponse', handleResponse);
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+    };
+
+    const handleResponse = (event) => {
+      const detail = event?.detail || {};
+      if (detail.requestId !== requestId) {
+        return;
+      }
+
+      cleanup();
+      if (detail.ok) {
+        resolve(detail.body || {});
+        return;
+      }
+
+      reject(new Error(detail.error || 'recent creations request failed'));
+    };
+
+    window.addEventListener('DreamFaceRecentCreationsResponse', handleResponse);
+    timeoutId = setTimeout(() => {
+      cleanup();
+      reject(new Error('recent creations request timeout'));
+    }, 6000);
+
+    window.dispatchEvent(new CustomEvent('DreamFaceRecentCreationsRequest', {
+      detail: {
+        requestId,
+        page,
+        size,
+      },
+    }));
+  });
+}
+
+function isRecentCreationItemReady(item) {
+  const status = Number(item?.web_work_status);
+  return status === 200;
+}
+
+function getApiMatchingCreationItems(items, expectedFileNames, startedAt) {
+  const minDateMs = startedAt
+    ? Math.max(0, new Date(startedAt).getTime() - (5 * 60 * 1000))
+    : 0;
+  const expectedCounts = new Map();
+  const filteredItems = Array.isArray(items)
+    ? items.filter((item) => (
+      item
+      && item.work_name
+      && item.work_type === 'AVATAR_VIDEO'
+      && (!minDateMs || Number(item.create_time) >= minDateMs)
+    ))
+    : [];
+  const readyItems = [];
+  const pending = [];
+
+  expectedFileNames.forEach((name) => {
+    expectedCounts.set(name, (expectedCounts.get(name) || 0) + 1);
+  });
+
+  expectedCounts.forEach((count, name) => {
+    const matches = filteredItems
+      .filter((item) => item.work_name === name)
+      .sort((a, b) => Number(b.create_time || 0) - Number(a.create_time || 0));
+    const currentRunMatches = matches.slice(0, count);
+
+    if (currentRunMatches.length < count || currentRunMatches.some((item) => !isRecentCreationItemReady(item))) {
+      pending.push(name);
+      return;
+    }
+
+    readyItems.push(...currentRunMatches);
+  });
+
+  return {
+    ready: pending.length === 0,
+    items: readyItems,
+    readyFiles: readyItems.map((item) => item.work_name),
+    pending,
+  };
+}
+
+async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = {}) {
+  const expectedFileNames = Array.isArray(request?.expectedFileNames)
+    ? request.expectedFileNames.filter(Boolean)
+    : [];
+
+  if (expectedFileNames.length === 0) {
+    return {
+      status: 'error',
+      message: 'нет ожидаемых файлов для Creations',
+    };
+  }
+
+  let aggregatedItems = [];
+  let totalCount = 0;
+  let selection = {
+    ready: false,
+    items: [],
+    readyFiles: [],
+    pending: [...expectedFileNames],
+  };
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    const body = await requestRecentCreationsPage({ page, size: pageSize });
+    const data = body?.data || {};
+    const list = Array.isArray(data.list) ? data.list : [];
+    totalCount = Number(data.count) || totalCount;
+    aggregatedItems = aggregatedItems.concat(list);
+    selection = getApiMatchingCreationItems(aggregatedItems, expectedFileNames, request.startedAt);
+
+    if (selection.ready) {
+      return {
+        status: 'ready',
+        matchedCount: selection.readyFiles.length,
+        totalExpected: expectedFileNames.length,
+        readyFiles: [...selection.readyFiles],
+        pending: [],
+        source: 'api',
+      };
+    }
+
+    if (page * pageSize >= totalCount || list.length === 0) {
+      break;
+    }
+  }
+
+  if (selection.readyFiles.length === 0 && selection.pending.length > 0) {
+    return {
+      status: 'pending',
+      pending: [...selection.pending],
+      matchedCount: 0,
+      totalExpected: expectedFileNames.length,
+      readyFiles: [],
+      source: 'api',
+    };
+  }
+
+  if (selection.readyFiles.length > 0) {
+    return {
+      status: 'partial',
+      pending: [...selection.pending],
+      matchedCount: selection.readyFiles.length,
+      totalExpected: expectedFileNames.length,
+      readyFiles: [...selection.readyFiles],
+      source: 'api',
+    };
+  }
+
+  return {
+    status: 'error',
+    message: 'recent creations API returned no usable matches',
+    source: 'api',
+  };
+}
+
 function getScrollContainerForElement(el) {
   let current = el;
 
@@ -617,7 +784,7 @@ async function advanceCreationsList(cardsBefore = null) {
     || scrollContainer.scrollHeight !== beforeHeight;
 }
 
-async function ensureCreationsCardsLoaded(request, { timeoutMs = 6000 } = {}) {
+async function ensureCreationsCardsLoaded(request, { timeoutMs = 6000, maxScrollPasses = 3 } = {}) {
   const expectedFileNames = Array.isArray(request?.expectedFileNames)
     ? request.expectedFileNames.filter(Boolean)
     : [];
@@ -626,6 +793,7 @@ async function ensureCreationsCardsLoaded(request, { timeoutMs = 6000 } = {}) {
   let selection = getLatestMatchingCreationCards(expectedFileNames, request?.startedAt);
   let lastSignature = getCreationsCardsSignature(cards);
   let stableIterations = 0;
+  let scrollPasses = 0;
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
@@ -633,7 +801,12 @@ async function ensureCreationsCardsLoaded(request, { timeoutMs = 6000 } = {}) {
       return selection;
     }
 
+    if (scrollPasses >= Math.max(0, Number(maxScrollPasses) || 0)) {
+      break;
+    }
+
     const advanced = await advanceCreationsList(cards);
+    scrollPasses += 1;
     cards = getCreationCards();
     selection = getLatestMatchingCreationCards(expectedFileNames, request?.startedAt);
 
@@ -721,7 +894,11 @@ function getLatestMatchingCreationCards(expectedFileNames, startedAt) {
   };
 }
 
-async function getCreationsSelectionSnapshot(request, { loadMore = false, timeoutMs = 6000 } = {}) {
+async function getCreationsSelectionSnapshot(request, {
+  loadMore = false,
+  timeoutMs = 6000,
+  maxScrollPasses = 3,
+} = {}) {
   const expectedFileNames = Array.isArray(request.expectedFileNames)
     ? request.expectedFileNames.filter(Boolean)
     : [];
@@ -742,7 +919,7 @@ async function getCreationsSelectionSnapshot(request, { loadMore = false, timeou
   }
 
   const selection = loadMore
-    ? await ensureCreationsCardsLoaded(request, { timeoutMs })
+    ? await ensureCreationsCardsLoaded(request, { timeoutMs, maxScrollPasses })
     : getLatestMatchingCreationCards(expectedFileNames, request.startedAt);
   if (selection.cards.length === 0 && selection.pending.length > 0) {
     return {
@@ -772,10 +949,24 @@ async function getCreationsSelectionSnapshot(request, { loadMore = false, timeou
 }
 
 async function checkCreationsStatus(request) {
-  const snapshot = await getCreationsSelectionSnapshot(request, {
-    loadMore: true,
-    timeoutMs: 5000,
+  try {
+    const apiSnapshot = await getCreationsApiStatus(request, { maxPages: 3, pageSize: 30 });
+    if (apiSnapshot.status !== 'error') {
+      return apiSnapshot;
+    }
+  } catch {}
+
+  let snapshot = await getCreationsSelectionSnapshot(request, {
+    loadMore: false,
   });
+
+  if (snapshot.status !== 'ready') {
+    snapshot = await getCreationsSelectionSnapshot(request, {
+      loadMore: true,
+      timeoutMs: 5000,
+      maxScrollPasses: 3,
+    });
+  }
 
   if (snapshot.status === 'error' || snapshot.status === 'pending') {
     return snapshot;
@@ -936,26 +1127,64 @@ async function waitForCreationsDownload(request) {
 
   const deadline = Date.now() + timeoutMs;
   let readySelection = null;
+  let apiReadyFiles = null;
+  let lastPending = [...expectedFileNames];
 
   while (Date.now() < deadline) {
     const remainingMs = Math.max(1000, deadline - Date.now());
-    const selection = await ensureCreationsCardsLoaded(request, {
-      timeoutMs: Math.min(12000, remainingMs),
-    });
+    try {
+      const apiSnapshot = await getCreationsApiStatus(request, { maxPages: 3, pageSize: 30 });
+      if (apiSnapshot.status === 'ready' && Array.isArray(apiSnapshot.readyFiles) && apiSnapshot.readyFiles.length > 0) {
+        apiReadyFiles = [...apiSnapshot.readyFiles];
+        lastPending = [];
+        break;
+      }
 
-    if (selection.ready && selection.cards.length > 0) {
-      readySelection = selection;
-      break;
+      if (Array.isArray(apiSnapshot.pending) && apiSnapshot.pending.length > 0) {
+        lastPending = [...apiSnapshot.pending];
+      }
+    } catch {
+      const selection = await ensureCreationsCardsLoaded(request, {
+        timeoutMs: Math.min(4000, remainingMs),
+        maxScrollPasses: 3,
+      });
+
+      if (selection.ready && selection.cards.length > 0) {
+        readySelection = selection;
+        break;
+      }
+
+      lastPending = [...selection.pending];
     }
 
     await waitWithCancellation(Math.min(1500, remainingMs));
   }
 
+  const selectionRequest = apiReadyFiles
+    ? { ...request, expectedFileNames: apiReadyFiles }
+    : request;
+
+  if (!readySelection && apiReadyFiles) {
+    const finalSelection = await getCreationsSelectionSnapshot(selectionRequest, {
+      loadMore: false,
+    });
+    if (finalSelection.status === 'ready') {
+      readySelection = finalSelection.selection;
+    } else {
+      const loadedSelection = await ensureCreationsCardsLoaded(selectionRequest, {
+        timeoutMs: 4000,
+        maxScrollPasses: 3,
+      });
+      if (loadedSelection.ready && loadedSelection.cards.length > 0) {
+        readySelection = loadedSelection;
+      }
+    }
+  }
+
   if (!readySelection) {
-    const finalPending = getLatestMatchingCreationCards(expectedFileNames, request.startedAt);
     return {
       status: 'error',
-      message: `не удалось дождаться карточек: ${finalPending.pending.join(', ') || 'timeout'}`,
+      message: `не удалось дождаться карточек: ${lastPending.join(', ') || 'timeout'}`,
     };
   }
 
@@ -963,7 +1192,10 @@ async function waitForCreationsDownload(request) {
   await ensureCreationsSelectMode();
   await waitWithCancellation(300);
 
-  const finalSelection = await ensureCreationsCardsLoaded(request, { timeoutMs: 12000 });
+  const finalSelection = await ensureCreationsCardsLoaded(selectionRequest, {
+    timeoutMs: 4000,
+    maxScrollPasses: 3,
+  });
   if (!finalSelection.ready || finalSelection.cards.length === 0) {
     return {
       status: 'error',
@@ -993,10 +1225,29 @@ async function waitForCreationsDownload(request) {
 }
 
 async function downloadCreationsIfReady(request) {
-  const snapshot = await getCreationsSelectionSnapshot(request, {
-    loadMore: true,
-    timeoutMs: 12000,
+  let apiSnapshot = null;
+
+  try {
+    apiSnapshot = await getCreationsApiStatus(request, { maxPages: 3, pageSize: 30 });
+    if (apiSnapshot.status === 'pending') {
+      return apiSnapshot;
+    }
+  } catch {}
+
+  const selectionRequest = apiSnapshot && Array.isArray(apiSnapshot.readyFiles) && apiSnapshot.readyFiles.length > 0
+    ? { ...request, expectedFileNames: apiSnapshot.readyFiles }
+    : request;
+  let snapshot = await getCreationsSelectionSnapshot(selectionRequest, {
+    loadMore: false,
   });
+
+  if (snapshot.status !== 'ready') {
+    snapshot = await getCreationsSelectionSnapshot(selectionRequest, {
+      loadMore: true,
+      timeoutMs: 4000,
+      maxScrollPasses: 3,
+    });
+  }
   if (snapshot.status === 'error') {
     return snapshot;
   }
@@ -1022,12 +1273,17 @@ async function downloadCreationsIfReady(request) {
   downloadControl.click();
   await waitWithCancellation(1000);
 
-  if (snapshot.status === 'partial') {
+  const effectivePending = apiSnapshot && Array.isArray(apiSnapshot.pending)
+    ? [...apiSnapshot.pending]
+    : [...(snapshot.pending || [])];
+  const shouldReturnPartial = snapshot.status === 'partial' || effectivePending.length > 0;
+
+  if (shouldReturnPartial) {
     return {
       status: 'partial',
       downloadedCount: snapshot.selection.cards.length,
       files: snapshot.selection.cards.map((item) => item.name),
-      pending: [...snapshot.pending],
+      pending: effectivePending,
     };
   }
 
