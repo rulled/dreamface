@@ -715,6 +715,7 @@ async function captureRunningWorksSnapshot() {
 }
 
 async function resolveSubmittedWorkId(beforeIds, {
+  baselineTrusted = true,
   timeoutMs = 10000,
   pollIntervalMs = 1200,
 } = {}) {
@@ -732,7 +733,7 @@ async function resolveSubmittedWorkId(beforeIds, {
       lastKnownRunningWorkIds = [...ids];
 
       const diff = ids.filter((id) => !baseline.has(id));
-      if (diff.length >= 1) {
+      if (baselineTrusted && diff.length >= 1) {
         return {
           workId: diff[0],
           ambiguous: diff.length > 1,
@@ -741,7 +742,7 @@ async function resolveSubmittedWorkId(beforeIds, {
         };
       }
 
-      if (baseline.size === 0 && ids.length === 1) {
+      if (!baselineTrusted && ids.length === 1) {
         return {
           workId: ids[0],
           inferred: true,
@@ -2253,6 +2254,7 @@ async function executeTaskOnPage(request) {
     
     if (submissionOutcome.status === 'success') {
       const workResolution = await resolveSubmittedWorkId(runningWorksBefore.ids, {
+        baselineTrusted: Boolean(runningWorksBefore.ok),
         timeoutMs: 10000,
         pollIntervalMs: 1200,
       });
