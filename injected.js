@@ -7,9 +7,11 @@
     'limit reached',
   ];
   const RECENT_CREATIONS_PATH = '/dw-server/work/v2/get_recent_creation_list';
+  const BATCH_WORK_STATUS_PATH = '/dw-server/work/batch_get_work_status';
 
   const originalFetch = window.fetch;
   let recentCreationsTemplate = null;
+  let batchWorkStatusTemplate = null;
 
   function getUrlFromFetchArg(fetchArg) {
     if (!fetchArg) return '';
@@ -82,6 +84,23 @@
     };
   }
 
+  function rememberBatchWorkStatusTemplate(args) {
+    const snapshot = getFetchInitSnapshot(args);
+    const body = tryParseJson(snapshot.body);
+    if (!body || !body.account_id || !Array.isArray(body.ids)) {
+      return;
+    }
+
+    batchWorkStatusTemplate = {
+      headers: snapshot.headers,
+      body,
+      referrer: snapshot.referrer || location.href,
+      credentials: snapshot.credentials || 'include',
+      mode: snapshot.mode || 'cors',
+      url: snapshot.url,
+    };
+  }
+
   async function fetchRecentCreationsPage(page = 1, size = 30) {
     if (!recentCreationsTemplate) {
       throw new Error('recent creations request template unavailable');
@@ -125,6 +144,64 @@
 
     if (!body || body.status_msg !== 'Success') {
       throw new Error(body?.status_msg || 'recent creations response is not successful');
+    }
+
+    return body;
+  }
+
+  async function fetchBatchWorkStatus(ids) {
+    const safeIds = Array.isArray(ids) ? ids.filter(Boolean) : [];
+    if (safeIds.length === 0) {
+      return {
+        status_code: 'THS12140000000',
+        status_msg: 'Success',
+        data: [],
+      };
+    }
+
+    const template = batchWorkStatusTemplate || recentCreationsTemplate;
+    if (!template) {
+      throw new Error('batch work status request template unavailable');
+    }
+
+    const headers = new Headers(template.headers || {});
+    if (!headers.has('accept')) {
+      headers.set('accept', 'application/json');
+    }
+    headers.set('content-type', 'application/json');
+    if (!headers.has('dream-face-web')) {
+      headers.set('dream-face-web', 'dream-face-web');
+    }
+
+    const payload = {
+      account_id: template.body?.account_id,
+      ids: safeIds,
+    };
+
+    if (!payload.account_id) {
+      throw new Error('account_id is missing for batch work status');
+    }
+
+    const endpointUrl = batchWorkStatusTemplate?.url && batchWorkStatusTemplate.url.includes(BATCH_WORK_STATUS_PATH)
+      ? batchWorkStatusTemplate.url
+      : `${location.origin}${BATCH_WORK_STATUS_PATH}`;
+
+    const response = await originalFetch(endpointUrl, {
+      method: 'POST',
+      headers,
+      referrer: template.referrer || location.href,
+      body: JSON.stringify(payload),
+      mode: template.mode || 'cors',
+      credentials: template.credentials || 'include',
+    });
+    const body = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      throw new Error(body?.status_msg || `batch work status request failed: ${response.status}`);
+    }
+
+    if (!body || body.status_msg !== 'Success') {
+      throw new Error(body?.status_msg || 'batch work status response is not successful');
     }
 
     return body;
@@ -213,14 +290,46 @@
     }
   });
 
+  window.addEventListener('DreamFaceBatchWorkStatusRequest', async (event) => {
+    const detail = event?.detail || {};
+    const requestId = detail.requestId;
+
+    if (!requestId) {
+      return;
+    }
+
+    try {
+      const body = await fetchBatchWorkStatus(detail.ids);
+      window.dispatchEvent(new CustomEvent('DreamFaceBatchWorkStatusResponse', {
+        detail: {
+          requestId,
+          ok: true,
+          body,
+        },
+      }));
+    } catch (error) {
+      window.dispatchEvent(new CustomEvent('DreamFaceBatchWorkStatusResponse', {
+        detail: {
+          requestId,
+          ok: false,
+          error: error?.message || String(error),
+        },
+      }));
+    }
+  });
+
   window.fetch = async function(...args) {
     const url = getUrlFromFetchArg(args[0]);
     const isSubmit = url.includes('/task/v2/submit');
     const isAvatarAdd = url.includes('/df-server/avatar/add');
     const isRecentCreations = url.includes(RECENT_CREATIONS_PATH);
+    const isBatchWorkStatus = url.includes(BATCH_WORK_STATUS_PATH);
 
     if (isRecentCreations) {
       rememberRecentCreationsTemplate(args);
+    }
+    if (isBatchWorkStatus) {
+      rememberBatchWorkStatusTemplate(args);
     }
 
     const response = await originalFetch(...args);

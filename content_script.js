@@ -608,6 +608,49 @@ function requestRecentCreationsPage({ page = 1, size = 30 } = {}) {
   });
 }
 
+function requestBatchWorkStatus(ids) {
+  return new Promise((resolve, reject) => {
+    const requestId = `batch-work-status-${Date.now()}-${recentCreationsRequestCounter += 1}`;
+    let timeoutId = null;
+
+    const cleanup = () => {
+      window.removeEventListener('DreamFaceBatchWorkStatusResponse', handleResponse);
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+    };
+
+    const handleResponse = (event) => {
+      const detail = event?.detail || {};
+      if (detail.requestId !== requestId) {
+        return;
+      }
+
+      cleanup();
+      if (detail.ok) {
+        resolve(detail.body || {});
+        return;
+      }
+
+      reject(new Error(detail.error || 'batch work status request failed'));
+    };
+
+    window.addEventListener('DreamFaceBatchWorkStatusResponse', handleResponse);
+    timeoutId = setTimeout(() => {
+      cleanup();
+      reject(new Error('batch work status request timeout'));
+    }, 6000);
+
+    window.dispatchEvent(new CustomEvent('DreamFaceBatchWorkStatusRequest', {
+      detail: {
+        requestId,
+        ids: Array.isArray(ids) ? ids.filter(Boolean) : [],
+      },
+    }));
+  });
+}
+
 function isRecentCreationItemReady(item) {
   const status = Number(item?.web_work_status);
   return status === 200;
@@ -628,6 +671,7 @@ function getApiMatchingCreationItems(items, expectedFileNames, startedAt) {
     : [];
   const readyItems = [];
   const pending = [];
+  const pendingItems = [];
 
   expectedFileNames.forEach((name) => {
     expectedCounts.set(name, (expectedCounts.get(name) || 0) + 1);
@@ -638,9 +682,11 @@ function getApiMatchingCreationItems(items, expectedFileNames, startedAt) {
       .filter((item) => item.work_name === name)
       .sort((a, b) => Number(b.create_time || 0) - Number(a.create_time || 0));
     const currentRunMatches = matches.slice(0, count);
+    const pendingMatches = currentRunMatches.filter((item) => !isRecentCreationItemReady(item));
 
-    if (currentRunMatches.length < count || currentRunMatches.some((item) => !isRecentCreationItemReady(item))) {
+    if (currentRunMatches.length < count || pendingMatches.length > 0) {
       pending.push(name);
+      pendingItems.push(...pendingMatches);
       return;
     }
 
@@ -652,6 +698,7 @@ function getApiMatchingCreationItems(items, expectedFileNames, startedAt) {
     items: readyItems,
     readyFiles: readyItems.map((item) => item.work_name),
     pending,
+    pendingItems,
   };
 }
 
@@ -664,6 +711,8 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
     return {
       status: 'error',
       message: 'нет ожидаемых файлов для Creations',
+      items: [],
+      pendingItems: [],
     };
   }
 
@@ -674,6 +723,7 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
     items: [],
     readyFiles: [],
     pending: [...expectedFileNames],
+    pendingItems: [],
   };
 
   for (let page = 1; page <= maxPages; page += 1) {
@@ -691,6 +741,10 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
         totalExpected: expectedFileNames.length,
         readyFiles: [...selection.readyFiles],
         pending: [],
+        items: aggregatedItems,
+        pendingItems: [],
+        expectedFileNames: [...expectedFileNames],
+        startedAt: request.startedAt,
         source: 'api',
       };
     }
@@ -707,6 +761,10 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
       matchedCount: 0,
       totalExpected: expectedFileNames.length,
       readyFiles: [],
+      items: aggregatedItems,
+      pendingItems: [...selection.pendingItems],
+      expectedFileNames: [...expectedFileNames],
+      startedAt: request.startedAt,
       source: 'api',
     };
   }
@@ -718,6 +776,10 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
       matchedCount: selection.readyFiles.length,
       totalExpected: expectedFileNames.length,
       readyFiles: [...selection.readyFiles],
+      items: aggregatedItems,
+      pendingItems: [...selection.pendingItems],
+      expectedFileNames: [...expectedFileNames],
+      startedAt: request.startedAt,
       source: 'api',
     };
   }
@@ -725,8 +787,76 @@ async function getCreationsApiStatus(request, { maxPages = 3, pageSize = 30 } = 
   return {
     status: 'error',
     message: 'recent creations API returned no usable matches',
+    items: aggregatedItems,
+    pendingItems: [],
     source: 'api',
   };
+}
+
+function mergeBatchStatusesIntoCreationsItems(items, statusRows) {
+  const statusMap = new Map(
+    (Array.isArray(statusRows) ? statusRows : [])
+      .filter((row) => row && row.id)
+      .map((row) => [row.id, Number(row.web_work_status)])
+  );
+
+  return (Array.isArray(items) ? items : []).map((item) => (
+    statusMap.has(item.id)
+      ? { ...item, web_work_status: statusMap.get(item.id) }
+      : item
+  ));
+}
+
+async function waitForCreationsApiReady(request, {
+  timeoutMs = 12000,
+  maxPages = 3,
+  pageSize = 30,
+  pollIntervalMs = 1800,
+} = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let snapshot = await getCreationsApiStatus(request, { maxPages, pageSize });
+
+  while (Date.now() < deadline) {
+    if (snapshot.status === 'ready') {
+      return snapshot;
+    }
+
+    const pendingIds = Array.from(new Set(
+      (snapshot.pendingItems || []).map((item) => item?.id).filter(Boolean)
+    ));
+    const pendingNames = Array.isArray(snapshot.pending) ? [...snapshot.pending] : [];
+    const knownPendingNames = new Set((snapshot.pendingItems || []).map((item) => item.work_name).filter(Boolean));
+    const allPendingNamesKnown = pendingNames.length > 0 && pendingNames.every((name) => knownPendingNames.has(name));
+
+    if (pendingIds.length === 0 || !allPendingNamesKnown) {
+      break;
+    }
+
+    const body = await requestBatchWorkStatus(pendingIds);
+    const mergedItems = mergeBatchStatusesIntoCreationsItems(snapshot.items, body?.data || []);
+    const selection = getApiMatchingCreationItems(mergedItems, snapshot.expectedFileNames || request.expectedFileNames, snapshot.startedAt || request.startedAt);
+
+    snapshot = {
+      ...snapshot,
+      status: selection.ready ? 'ready' : (selection.readyFiles.length > 0 ? 'partial' : 'pending'),
+      matchedCount: selection.readyFiles.length,
+      totalExpected: Array.isArray(snapshot.expectedFileNames || request.expectedFileNames)
+        ? (snapshot.expectedFileNames || request.expectedFileNames).length
+        : 0,
+      readyFiles: [...selection.readyFiles],
+      pending: [...selection.pending],
+      items: mergedItems,
+      pendingItems: [...selection.pendingItems],
+    };
+
+    if (snapshot.status === 'ready') {
+      return snapshot;
+    }
+
+    await waitWithCancellation(Math.min(pollIntervalMs, Math.max(250, deadline - Date.now())));
+  }
+
+  return snapshot;
 }
 
 function getScrollContainerForElement(el) {
@@ -952,7 +1082,14 @@ async function checkCreationsStatus(request) {
   try {
     const apiSnapshot = await getCreationsApiStatus(request, { maxPages: 3, pageSize: 30 });
     if (apiSnapshot.status !== 'error') {
-      return apiSnapshot;
+      return {
+        status: apiSnapshot.status,
+        matchedCount: apiSnapshot.matchedCount,
+        totalExpected: apiSnapshot.totalExpected,
+        readyFiles: [...(apiSnapshot.readyFiles || [])],
+        pending: [...(apiSnapshot.pending || [])],
+        source: 'api',
+      };
     }
   } catch {}
 
@@ -1133,7 +1270,11 @@ async function waitForCreationsDownload(request) {
   while (Date.now() < deadline) {
     const remainingMs = Math.max(1000, deadline - Date.now());
     try {
-      const apiSnapshot = await getCreationsApiStatus(request, { maxPages: 3, pageSize: 30 });
+      const apiSnapshot = await waitForCreationsApiReady(request, {
+        timeoutMs: Math.min(12000, remainingMs),
+        maxPages: 3,
+        pageSize: 30,
+      });
       if (apiSnapshot.status === 'ready' && Array.isArray(apiSnapshot.readyFiles) && apiSnapshot.readyFiles.length > 0) {
         apiReadyFiles = [...apiSnapshot.readyFiles];
         lastPending = [];
