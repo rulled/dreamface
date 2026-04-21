@@ -23,7 +23,6 @@ $includeFiles = @(
   "offscreen.js",
   "popup.html",
   "popup.js",
-  "README.md",
   "assets/icons/icon16.png",
   "assets/icons/icon32.png",
   "assets/icons/icon48.png",

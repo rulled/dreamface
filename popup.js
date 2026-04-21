@@ -309,6 +309,40 @@ async function sendMessageToTab(tabId, message) {
   });
 }
 
+function resetSetupState() {
+  foundVideos = [];
+  batches = [];
+  latestRunState = null;
+  batchesList.innerHTML = '';
+  monitorLog.textContent = 'ожидание...';
+  monitorSummary.innerHTML = '';
+  monitorPhase.textContent = 'фаза: idle';
+  monitorFileName.textContent = 'ожидание...';
+  monitorProgressFill.style.width = '0%';
+  monitorProgressText.textContent = '0 / 0';
+  postScanContainer.style.display = 'none';
+  loadingContainer.classList.remove('active');
+  updateResumeButton(null);
+  updateCreationsButton(null);
+  updateScanButtonLabel();
+  updateTotalStats();
+  showSetup();
+}
+
+async function resetExtensionState(statusMessage = 'ожидание...') {
+  const response = await chrome.runtime.sendMessage({ action: 'engine.resetRunState' }).catch((error) => ({
+    ok: false,
+    error: error.message,
+  }));
+
+  if (!response?.ok) {
+    throw new Error(response?.error || 'не удалось сбросить состояние расширения');
+  }
+
+  resetSetupState();
+  statusText.textContent = statusMessage;
+}
+
 async function updateStoredRunState(mutator) {
   if (!latestRunState) {
     return null;
@@ -347,7 +381,7 @@ function getCreationsLogText(state) {
   }
 
   if (status === 'partial') {
-    return lastMessage || 'готова часть результатов. можно скачать готовые или проверить позже.';
+    return lastMessage || 'ещё не все результаты готовы. дождитесь завершения генерации.';
   }
 
   if (status === 'success') {
@@ -376,8 +410,8 @@ function buildCreationsCheckMessage(result) {
   if (result?.status === 'partial') {
     const pendingText = formatPendingFilesList(pending);
     return pendingText
-      ? `готово ${matchedCount} из ${totalExpected}. ещё обрабатываются: ${pendingText}`
-      : `готово ${matchedCount} из ${totalExpected}`;
+      ? `ещё не готовы: ${pendingText}`
+      : `ещё готовы не все результаты: ${matchedCount} / ${totalExpected}`;
   }
 
   if (result?.status === 'ready') {
@@ -398,8 +432,8 @@ function buildCreationsDownloadMessage(result) {
   if (result?.status === 'partial') {
     const pendingText = formatPendingFilesList(pending);
     return pendingText
-      ? `скачивание запущено: ${downloadedCount}. ещё не готовы: ${pendingText}`
-      : `скачивание запущено: ${downloadedCount}`;
+      ? `скачивание отменено: ещё не готовы ${pendingText}`
+      : 'скачивание отменено: готовы не все результаты';
   }
 
   return result?.message || 'не удалось запустить скачивание';
@@ -905,7 +939,7 @@ function updateCreationsButton(state) {
   creationsBtn.disabled = false;
 
   if (status === 'partial' && matchedCount > 0) {
-    creationsBtn.textContent = `скачать готовые (${matchedCount})`;
+    creationsBtn.textContent = 'проверить снова';
   } else if (status === 'success') {
     creationsBtn.textContent = totalExpected > 0
       ? `скачать снова (${Math.min(totalExpected, Number(state.downloadPlan?.downloadedCount || totalExpected))})`
@@ -1276,8 +1310,18 @@ backBtn.addEventListener('click', () => {
   if (latestRunState && isActiveRunPhase(latestRunState.phase)) {
     return;
   }
-  showSetup();
-  startBtn.disabled = false;
+
+  backBtn.disabled = true;
+  resetExtensionState('состояние очищено. можно запускать новую очередь.')
+    .catch((error) => {
+      statusText.textContent = error.message || 'не удалось очистить состояние';
+      renderRunState(latestRunState);
+    })
+    .finally(() => {
+      if (!latestRunState || !isActiveRunPhase(latestRunState.phase)) {
+        backBtn.disabled = false;
+      }
+    });
 });
 
 creationsBtn.addEventListener('click', async () => {
@@ -1308,42 +1352,8 @@ creationsBtn.addEventListener('click', async () => {
   }
 
   const totalExpected = getExpectedCreationsTotal(latestRunState);
-  const knownMatchedCount = Number(latestRunState.downloadPlan?.matchedCount || 0);
-  const shouldDownloadReadyOnly = latestRunState.downloadPlan?.lastStatus === 'partial'
-    && Number(latestRunState.downloadPlan?.matchedCount || 0) > 0;
 
   try {
-    if (shouldDownloadReadyOnly) {
-      monitorLog.textContent = 'запуск скачивания готовых результатов...';
-      const downloadResult = await sendMessageToTab(tabContext.id, {
-        action: 'downloadCreationsIfReady',
-        expectedFileNames,
-        expectedWorkIds,
-        startedAt: latestRunState.startedAt,
-      });
-
-      const nextMessage = buildCreationsDownloadMessage(downloadResult);
-      await updateStoredRunState((state) => {
-        state.downloadPlan = {
-          ...state.downloadPlan,
-          lastStatus: downloadResult?.status === 'success' ? 'success' : (downloadResult?.status || 'error'),
-          lastMessage: nextMessage,
-          pendingFiles: Array.isArray(downloadResult?.pending) ? [...downloadResult.pending] : [],
-          downloadedCount: Number(downloadResult?.downloadedCount || 0),
-          matchedCount: Math.max(
-            knownMatchedCount,
-            Number(downloadResult?.matchedCount || 0),
-            Number(downloadResult?.downloadedCount || 0),
-          ),
-          totalExpected,
-          checkedAt: new Date().toISOString(),
-          checkedOnUrl: tabContext.url,
-        };
-        state.statusText = nextMessage;
-      });
-      return;
-    }
-
     monitorLog.textContent = 'проверка результатов в Creations...';
     const checkResult = await sendMessageToTab(tabContext.id, {
       action: 'checkCreationsStatus',
@@ -1362,10 +1372,13 @@ creationsBtn.addEventListener('click', async () => {
       });
 
       const nextMessage = buildCreationsDownloadMessage(downloadResult);
+      const nextStatus = downloadResult?.status === 'success'
+        ? 'success'
+        : (downloadResult?.status === 'partial' ? 'pending' : (downloadResult?.status || 'error'));
       await updateStoredRunState((state) => {
         state.downloadPlan = {
           ...state.downloadPlan,
-          lastStatus: downloadResult?.status === 'success' ? 'success' : (downloadResult?.status || 'error'),
+          lastStatus: nextStatus,
           lastMessage: nextMessage,
           pendingFiles: Array.isArray(downloadResult?.pending) ? [...downloadResult.pending] : [],
           downloadedCount: Number(downloadResult?.downloadedCount || 0),
@@ -1376,6 +1389,10 @@ creationsBtn.addEventListener('click', async () => {
         };
         state.statusText = nextMessage;
       });
+
+      if (downloadResult?.status === 'success') {
+        await resetExtensionState('все файлы отправлены на скачивание. можно запускать новую очередь.');
+      }
       return;
     }
 
@@ -1383,7 +1400,7 @@ creationsBtn.addEventListener('click', async () => {
     await updateStoredRunState((state) => {
       state.downloadPlan = {
         ...state.downloadPlan,
-        lastStatus: checkResult?.status || 'error',
+        lastStatus: checkResult?.status === 'partial' ? 'pending' : (checkResult?.status || 'error'),
         lastMessage: nextMessage,
         pendingFiles: Array.isArray(checkResult?.pending) ? [...checkResult.pending] : [],
         matchedCount: Number(checkResult?.matchedCount || 0),

@@ -289,8 +289,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return;
 
       case 'engine.resetRunState':
-        await persistRunState(createIdleRunState());
-        sendResponse({ ok: true });
+        sendResponse(await forwardToOffscreen({ action: 'resetRunState' }));
         return;
 
       case 'engine.pageAction': {

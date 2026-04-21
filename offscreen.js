@@ -261,6 +261,15 @@ async function clearInputFiles() {
   });
 }
 
+async function resetRunStateInternal() {
+  stopRequested = false;
+  currentRunToken += 1;
+  await clearTaskBlobs().catch(() => {});
+  await clearInputFiles().catch(() => {});
+  runState = createIdleRunState();
+  await pushState();
+}
+
 function toRuntimeFile(record) {
   if (!record?.blob) {
     return null;
@@ -1190,10 +1199,23 @@ async function triggerCreationsDownload() {
     return { ok: false, error: 'нет результатов для Creations' };
   }
 
-  await runCreationsDownload(expectedFileNames);
-  runState.phase = 'finished';
-  await pushState();
+  const downloadResult = await runCreationsDownload(expectedFileNames);
+  if (!downloadResult.ok || downloadResult.result?.status !== 'success') {
+    runState.phase = 'finished';
+    await pushState();
+    return { ok: downloadResult.ok, state: cloneState(), error: downloadResult.error || '' };
+  }
 
+  await resetRunStateInternal();
+  return { ok: true, state: cloneState() };
+}
+
+async function resetRunState() {
+  if (isBusyPhase(runState.phase)) {
+    return { ok: false, error: 'engine is busy' };
+  }
+
+  await resetRunStateInternal();
   return { ok: true, state: cloneState() };
 }
 
@@ -1344,6 +1366,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
       case 'downloadCreations':
         sendResponse(await triggerCreationsDownload());
+        return;
+
+      case 'resetRunState':
+        sendResponse(await resetRunState());
         return;
 
       case 'tabLifecycle':
