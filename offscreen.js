@@ -1091,6 +1091,17 @@ async function processQueue(queue, runToken, startIndex = 0) {
       if (result.status === 'success') {
         task.workId = result.workId || task.workId || '';
         task.animateImageId = result.animateImageId || task.animateImageId || '';
+        if (result.recoveredAfter === 'limit') {
+          runState.warnings = [
+            ...runState.warnings,
+            `${task.fileName}: submit подтвердился через running works после сигнала limit`,
+          ];
+        } else if (result.recoveredAfter === 'timeout') {
+          runState.warnings = [
+            ...runState.warnings,
+            `${task.fileName}: submit подтвердился через running works после timeout`,
+          ];
+        }
         if (result.workIdAmbiguous) {
           runState.warnings = [
             ...runState.warnings,

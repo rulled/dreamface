@@ -239,18 +239,6 @@ async function ensureCreationsTab() {
   };
 }
 
-function notifyDreamFaceTabs(message) {
-  chrome.tabs.query({ url: DREAMFACE_URL_PATTERNS }, (tabs) => {
-    tabs.forEach((tab) => {
-      if (!tab.id) {
-        return;
-      }
-
-      chrome.tabs.sendMessage(tab.id, message).catch(() => {});
-    });
-  });
-}
-
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request?.target === 'offscreen') {
     return false;
@@ -326,10 +314,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   });
 
   return true;
-});
-
-chrome.tabs.onCreated.addListener(() => {
-  notifyDreamFaceTabs({ action: 'newTabOpened' });
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {

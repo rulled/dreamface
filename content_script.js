@@ -1,4 +1,3 @@
-let newTabDetected = false;
 let serverLimitHit = false;
 let serverSuccessHit = false;
 let avatarAddSuccessHit = false;
@@ -381,17 +380,94 @@ async function waitForAudioReadyCleared(timeout = 10000) {
   }
 }
 
-function isLimitErrorVisible() {
-  const toasts = Array.from(document.querySelectorAll(SEL.toastError));
+async function clearExistingAudioSelection() {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const deleteButton = document.querySelector('div[class*="_del_"]');
+    if (!deleteButton) {
+      return;
+    }
 
-  return toasts.some((toast) => {
-    const desc = toast.getAttribute('description') || '';
-    const text = toast.textContent || '';
-    return desc.includes('10 tasks')
-      || desc.includes('Processing your existing')
-      || text.includes('10 tasks')
-      || text.includes('Processing your existing');
+    deleteButton.click();
+    const cleared = await waitForAudioReadyCleared(attempt === 0 ? 10000 : 5000);
+    if (cleared) {
+      return;
+    }
+
+    await waitWithCancellation(600);
+  }
+
+  throw new Error('не удалось очистить предыдущее аудио');
+}
+
+function matchesLimitToastText(value = '') {
+  const text = String(value || '').toLowerCase();
+  return text.includes('10 tasks')
+    || text.includes('processing your existing');
+}
+
+function getVisibleLimitToastEntries() {
+  return Array.from(document.querySelectorAll(SEL.toastError))
+    .filter((node) => isVisibleElement(node))
+    .map((node) => {
+      const description = (node.getAttribute('description') || '').trim();
+      const text = (node.textContent || '').trim();
+      return {
+        node,
+        description,
+        text,
+        fingerprint: normalizeUiText(`${description} ${text}`),
+      };
+    })
+    .filter((entry) => matchesLimitToastText(entry.description) || matchesLimitToastText(entry.text));
+}
+
+function createLimitToastTracker() {
+  const baselineEntries = getVisibleLimitToastEntries();
+  const baselineNodes = new WeakSet(baselineEntries.map((entry) => entry.node));
+  const baselineFingerprints = new Set(
+    baselineEntries.map((entry) => entry.fingerprint).filter(Boolean)
+  );
+  let freshLimitDetected = false;
+
+  const hasFreshLimitToast = () => {
+    if (freshLimitDetected) {
+      return true;
+    }
+
+    const currentEntries = getVisibleLimitToastEntries();
+    for (const entry of currentEntries) {
+      if (!baselineNodes.has(entry.node)) {
+        freshLimitDetected = true;
+        return true;
+      }
+
+      if (entry.fingerprint && !baselineFingerprints.has(entry.fingerprint)) {
+        freshLimitDetected = true;
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  const observer = typeof MutationObserver === 'function' && document.body
+    ? new MutationObserver(() => {
+      hasFreshLimitToast();
+    })
+    : null;
+
+  observer?.observe(document.body, {
+    childList: true,
+    subtree: true,
+    characterData: true,
   });
+
+  return {
+    hasFreshLimitToast,
+    disconnect() {
+      observer?.disconnect();
+    },
+  };
 }
 
 function getMaxDurationSeconds(request) {
@@ -2112,10 +2188,11 @@ function waitForWindowEvent(eventName, timeout = 12000) {
   });
 }
 
-async function waitForSubmissionOutcome(maxDurationSeconds = DEFAULT_MAX_DURATION_SECONDS) {
-  const startedAt = Date.now();
-  const timeoutMs = getSubmissionTimeoutMs(maxDurationSeconds);
-  
+async function waitForSubmissionOutcomeWithTracker(
+  maxDurationSeconds = DEFAULT_MAX_DURATION_SECONDS,
+  timeoutMs = getSubmissionTimeoutMs(maxDurationSeconds),
+  limitToastTracker = null,
+) {
   return new Promise((resolve, reject) => {
     let finished = false;
     let intervalId = null;
@@ -2164,25 +2241,14 @@ async function waitForSubmissionOutcome(maxDurationSeconds = DEFAULT_MAX_DURATIO
       try {
         ensureNotCancelled();
 
-        if (serverSuccessHit || newTabDetected) {
+        if (serverSuccessHit) {
           resolveOnce({ status: 'success' });
           return;
         }
 
-        if (serverLimitHit || isLimitErrorVisible()) {
+        if (serverLimitHit || limitToastTracker?.hasFreshLimitToast()) {
           resolveOnce({ status: 'limit' });
           return;
-        }
-
-        const generateButton = findGenerateButton();
-        if (
-          generateButton
-          && generateButton.disabled
-          && Date.now() - startedAt > 3500
-          && !serverLimitHit
-          && !isLimitErrorVisible()
-        ) {
-          resolveOnce({ status: 'success' });
         }
       } catch (error) {
         rejectOnce(error);
@@ -2195,9 +2261,24 @@ async function waitForSubmissionOutcome(maxDurationSeconds = DEFAULT_MAX_DURATIO
   });
 }
 
+async function verifySubmittedWorkAfterOutcome(runningWorksBefore, {
+  timeoutMs = 10000,
+  pollIntervalMs = 1200,
+} = {}) {
+  const workResolution = await resolveSubmittedWorkId(runningWorksBefore.ids, {
+    baselineTrusted: Boolean(runningWorksBefore.ok),
+    timeoutMs,
+    pollIntervalMs,
+  });
+
+  return {
+    submitted: Boolean(workResolution.workId),
+    ...workResolution,
+  };
+}
+
 async function executeTaskOnPage(request) {
   activeTaskCancelled = false;
-  newTabDetected = false;
   serverLimitHit = false;
   serverSuccessHit = false;
   const maxDurationSeconds = getMaxDurationSeconds(request);
@@ -2225,14 +2306,7 @@ async function executeTaskOnPage(request) {
 
   await selectVideoSafe(request.videoIndex);
 
-  const delBtn = document.querySelector('div[class*="_del_"]');
-  if (delBtn) {
-    delBtn.click();
-    const cleared = await waitForAudioReadyCleared();
-    if (!cleared) {
-      await waitWithCancellation(1200);
-    }
-  }
+  await clearExistingAudioSelection();
 
   const fileInput = await waitForAudioInputReady();
   if (!fileInput) {
@@ -2267,16 +2341,25 @@ async function executeTaskOnPage(request) {
   while (true) {
     ensureNotCancelled();
 
-    newTabDetected = false;
     serverLimitHit = false;
     serverSuccessHit = false;
     lastSubmitDetail = null;
     const runningWorksBefore = await captureRunningWorksSnapshot();
+    const limitToastTracker = createLimitToastTracker();
 
     generateButton.click();
 
-    const submissionOutcome = await waitForSubmissionOutcome(maxDurationSeconds);
-    
+    let submissionOutcome;
+    try {
+      submissionOutcome = await waitForSubmissionOutcomeWithTracker(
+        maxDurationSeconds,
+        getSubmissionTimeoutMs(maxDurationSeconds),
+        limitToastTracker,
+      );
+    } finally {
+      limitToastTracker.disconnect();
+    }
+
     if (submissionOutcome.status === 'success') {
       const workResolution = await resolveSubmittedWorkId(runningWorksBefore.ids, {
         baselineTrusted: Boolean(runningWorksBefore.ok),
@@ -2290,6 +2373,23 @@ async function executeTaskOnPage(request) {
         workId: workResolution.workId || '',
         workIdAmbiguous: Boolean(workResolution.ambiguous),
       };
+    }
+
+    if (submissionOutcome.status === 'limit' || submissionOutcome.status === 'timeout') {
+      const recoveredSubmission = await verifySubmittedWorkAfterOutcome(runningWorksBefore, {
+        timeoutMs: submissionOutcome.status === 'timeout' ? 15000 : 10000,
+        pollIntervalMs: 1200,
+      });
+
+      if (recoveredSubmission.submitted) {
+        return {
+          status: 'success',
+          animateImageId: submissionOutcome.animateImageId || lastSubmitDetail?.animateImageId || '',
+          workId: recoveredSubmission.workId || '',
+          workIdAmbiguous: Boolean(recoveredSubmission.ambiguous),
+          recoveredAfter: submissionOutcome.status,
+        };
+      }
     }
 
     if (submissionOutcome.status === 'limit') {
@@ -2308,12 +2408,6 @@ async function executeTaskOnPage(request) {
 }
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.action === 'newTabOpened') {
-    newTabDetected = true;
-    sendResponse({ ok: true });
-    return true;
-  }
-
   if (request.action === 'scanPageVideos') {
     dynamicScanVideos(sendResponse);
     return true;

@@ -306,20 +306,20 @@
 
   function looksLikeSubmitSuccess(body) {
     if (!body) return false;
-    
-    // Проверяем status_msg (стандартный формат)
+
+    if (looksLikeSubmitLimit(body)) return false;
+
     if (body.status_msg === 'Success' || body.status_msg === 'success') return true;
-    
-    // Проверяем status (альтернативный формат)
     if (body.status === 'Success' || body.status === 'success' || body.status === 'SUCCESS') return true;
-    
-    // Проверяем код ответа
-    if (body.code === 0 || body.code === '0' || body.code === 200) return true;
-    
-    // Проверяем success флаг
     if (body.success === true) return true;
-    
-    return false;
+    if (body.code === 0 || body.code === '0') return true;
+
+    return Boolean(
+      body?.data?.animate_image_id
+      || body?.data?.work_id
+      || body?.data?.workId
+      || body?.data?.id
+    );
   }
 
   function looksLikeSubmitLimit(body) {
@@ -328,15 +328,17 @@
   }
 
   function emitSubmitSignals(body) {
+    if (looksLikeSubmitLimit(body)) {
+      window.dispatchEvent(new CustomEvent('DreamFaceLimitHit'));
+      return;
+    }
+
     if (looksLikeSubmitSuccess(body)) {
       window.dispatchEvent(new CustomEvent('DreamFaceTaskSuccess', {
         detail: {
           animateImageId: body?.data?.animate_image_id || '',
         },
       }));
-    }
-    if (looksLikeSubmitLimit(body)) {
-      window.dispatchEvent(new CustomEvent('DreamFaceLimitHit'));
     }
   }
 
