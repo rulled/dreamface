@@ -1362,24 +1362,74 @@ async function getCreationsSelectionSnapshot(request, {
   };
 }
 
+function getCreationsStatusRank(status) {
+  switch (status) {
+    case 'ready':
+      return 3;
+    case 'partial':
+      return 2;
+    case 'pending':
+      return 1;
+    case 'error':
+    default:
+      return 0;
+  }
+}
+
+function shouldPreferCreationsSnapshot(candidate, baseline) {
+  if (!candidate) {
+    return false;
+  }
+
+  if (!baseline) {
+    return true;
+  }
+
+  const candidateRank = getCreationsStatusRank(candidate.status);
+  const baselineRank = getCreationsStatusRank(baseline.status);
+  if (candidateRank !== baselineRank) {
+    return candidateRank > baselineRank;
+  }
+
+  return Number(candidate.matchedCount || 0) > Number(baseline.matchedCount || 0);
+}
+
+function toComparableCreationsSnapshot(result, source) {
+  if (!result) {
+    return null;
+  }
+
+  return {
+    ...result,
+    source: result.source || source,
+    matchedCount: Number(result.matchedCount || 0),
+    totalExpected: Number(result.totalExpected || 0),
+    readyFiles: Array.isArray(result.readyFiles) ? [...result.readyFiles] : [],
+    pending: Array.isArray(result.pending) ? [...result.pending] : [],
+  };
+}
+
 async function checkCreationsStatus(request) {
+  let bestSnapshot = null;
+
   try {
     const apiSnapshot = await getCreationsApiStatus(request, { maxPages: 3, pageSize: 30 });
-    if (apiSnapshot.status !== 'error') {
-      return {
-        status: apiSnapshot.status,
-        matchedCount: apiSnapshot.matchedCount,
-        totalExpected: apiSnapshot.totalExpected,
-        readyFiles: [...(apiSnapshot.readyFiles || [])],
-        pending: [...(apiSnapshot.pending || [])],
-        source: 'api',
-      };
+    bestSnapshot = toComparableCreationsSnapshot(apiSnapshot, 'api');
+    if (bestSnapshot?.status === 'ready') {
+      return bestSnapshot;
     }
   } catch {}
 
   let snapshot = await getCreationsSelectionSnapshot(request, {
     loadMore: false,
   });
+  let comparableSnapshot = toComparableCreationsSnapshot({
+    ...snapshot,
+    readyFiles: snapshot.selection?.cards?.map((item) => item.name) || [],
+  }, 'ui');
+  if (shouldPreferCreationsSnapshot(comparableSnapshot, bestSnapshot)) {
+    bestSnapshot = comparableSnapshot;
+  }
 
   if (snapshot.status !== 'ready') {
     snapshot = await getCreationsSelectionSnapshot(request, {
@@ -1387,28 +1437,30 @@ async function checkCreationsStatus(request) {
       timeoutMs: 5000,
       maxScrollPasses: 3,
     });
+    comparableSnapshot = toComparableCreationsSnapshot({
+      ...snapshot,
+      readyFiles: snapshot.selection?.cards?.map((item) => item.name) || [],
+    }, 'ui');
+    if (shouldPreferCreationsSnapshot(comparableSnapshot, bestSnapshot)) {
+      bestSnapshot = comparableSnapshot;
+    }
   }
 
-  if (snapshot.status === 'error' || snapshot.status === 'pending') {
-    return snapshot;
+  if (bestSnapshot) {
+    return bestSnapshot;
   }
 
-  if (snapshot.status === 'partial') {
-    return {
-      status: 'partial',
-      matchedCount: snapshot.selection.cards.length,
-      totalExpected: snapshot.totalExpected,
-      readyFiles: snapshot.selection.cards.map((item) => item.name),
-      pending: [...snapshot.pending],
-    };
-  }
-
-  return {
-    status: 'ready',
-    matchedCount: snapshot.selection.cards.length,
-    totalExpected: snapshot.totalExpected,
-    readyFiles: snapshot.selection.cards.map((item) => item.name),
-    pending: [],
+  return toComparableCreationsSnapshot({
+    ...snapshot,
+    readyFiles: snapshot.selection?.cards?.map((item) => item.name) || [],
+  }, 'ui') || {
+    status: 'error',
+    message: 'не удалось определить статус Creations',
+    matchedCount: 0,
+    totalExpected: Array.isArray(request?.expectedFileNames) ? request.expectedFileNames.length : 0,
+    readyFiles: [],
+    pending: Array.isArray(request?.expectedFileNames) ? [...request.expectedFileNames] : [],
+    source: 'ui',
   };
 }
 
@@ -1654,9 +1706,6 @@ async function downloadCreationsIfReady(request) {
 
   try {
     apiSnapshot = await getCreationsApiStatus(request, { maxPages: 3, pageSize: 30 });
-    if (apiSnapshot.status === 'pending') {
-      return apiSnapshot;
-    }
   } catch {}
 
   const selectionRequest = apiSnapshot && Array.isArray(apiSnapshot.readyFiles) && apiSnapshot.readyFiles.length > 0
@@ -1678,6 +1727,9 @@ async function downloadCreationsIfReady(request) {
   }
 
   if (snapshot.status === 'pending') {
+    if (apiSnapshot?.status === 'partial' || apiSnapshot?.status === 'ready') {
+      return apiSnapshot;
+    }
     return snapshot;
   }
 
