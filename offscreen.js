@@ -1141,6 +1141,19 @@ async function processQueue(queue, runToken, startIndex = 0) {
         break;
       }
 
+      if (result.status === 'submission_unconfirmed') {
+        runState.warnings = [
+          ...runState.warnings,
+          `${task.fileName}: ${result.message || 'submit не подтвержден'}`,
+        ];
+        await pushState();
+        await failRun(
+          `отправка ${task.fileName} не подтверждена. очередь приостановлена, чтобы не пропустить аудио. проверьте сайт и нажмите "возобновить".`,
+          'submission_unconfirmed',
+        );
+        return;
+      }
+
       if (result.status === 'skipped_short' || result.status === 'skipped_long') {
         await deleteTaskBlob(task.id);
         runState.nextTaskIndex = index + 1;

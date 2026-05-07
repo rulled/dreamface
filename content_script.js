@@ -2324,7 +2324,7 @@ async function verifySubmittedWorkAfterOutcome(runningWorksBefore, {
   });
 
   return {
-    submitted: Boolean(workResolution.workId),
+    submitted: Boolean(workResolution.workId) && !workResolution.ambiguous,
     ...workResolution,
   };
 }
@@ -2442,6 +2442,13 @@ async function executeTaskOnPage(request) {
           recoveredAfter: submissionOutcome.status,
         };
       }
+
+      if (recoveredSubmission.workId && recoveredSubmission.ambiguous) {
+        return {
+          status: 'submission_unconfirmed',
+          message: 'после клика появилось несколько новых running works; нельзя надежно сопоставить задачу',
+        };
+      }
     }
 
     if (submissionOutcome.status === 'limit') {
@@ -2452,7 +2459,7 @@ async function executeTaskOnPage(request) {
 
     if (submissionOutcome.status === 'timeout') {
       return {
-        status: 'submitted_unknown',
+        status: 'submission_unconfirmed',
         message: 'подтверждение отправки не получено вовремя',
       };
     }

@@ -770,8 +770,257 @@
       flex-direction: column;
     }
 
+    .monitor-visual {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid rgba(0, 0, 0, 0.06);
+    }
+
+    .monitor-stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .monitor-stat {
+      min-width: 0;
+      padding: 10px;
+      border-radius: 12px;
+      background: var(--soft);
+    }
+
+    .monitor-stat-value {
+      font-size: 16px;
+      line-height: 1.1;
+      font-weight: 650;
+      letter-spacing: -0.02em;
+    }
+
+    .monitor-stat-label {
+      margin-top: 3px;
+      font-size: 10.5px;
+      line-height: 1.35;
+      color: var(--text-tertiary);
+    }
+
+    .route-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .route-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .route-title {
+      font-size: 12px;
+      line-height: 1.35;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .route-note {
+      font-size: 10.5px;
+      line-height: 1.35;
+      color: var(--text-tertiary);
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .audio-route-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .audio-route {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 12px;
+      border-radius: 14px;
+      background: rgba(0, 0, 0, 0.025);
+      border: 1px solid rgba(0, 0, 0, 0.055);
+    }
+
+    .audio-route-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .audio-route-name {
+      min-width: 0;
+      font-size: 12.5px;
+      line-height: 1.35;
+      font-weight: 600;
+      color: var(--text-primary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .audio-route-meta {
+      flex: 0 0 auto;
+      font-size: 10.5px;
+      line-height: 1.35;
+      color: var(--text-tertiary);
+      white-space: nowrap;
+    }
+
+    .part-strip {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }
+
+    .part-chip {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      padding: 5px 8px 5px 5px;
+      border-radius: 999px;
+      background: var(--surface-soft);
+      border: 1px solid rgba(0, 0, 0, 0.055);
+      color: var(--text-secondary);
+      font-size: 10.5px;
+      line-height: 1;
+    }
+
+    .part-chip.done {
+      opacity: 0.52;
+    }
+
+    .part-chip.current {
+      background: rgba(0, 0, 0, 0.9);
+      color: rgba(255, 255, 255, 0.95);
+      border-color: transparent;
+    }
+
+    .route-avatar {
+      width: 20px;
+      height: 20px;
+      border-radius: 999px;
+      overflow: hidden;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.08);
+      color: inherit;
+      font-size: 9px;
+      font-weight: 650;
+      flex: 0 0 auto;
+    }
+
+    .route-avatar img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: center 28%;
+      transform: scale(1.1);
+      display: block;
+    }
+
+    .queue-lane {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .queue-lane-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      color: var(--text-secondary);
+      font-size: 11.5px;
+      line-height: 1.35;
+    }
+
+    .queue-lane-index {
+      width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--soft);
+      color: var(--text-tertiary);
+      font-size: 10px;
+      font-weight: 650;
+      flex: 0 0 auto;
+    }
+
+    .queue-lane-name {
+      min-width: 0;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
     .secondary-surface {
       padding: 14px 16px;
+    }
+
+    .debug-panel {
+      padding: 0;
+      overflow: hidden;
+    }
+
+    .debug-toggle {
+      list-style: none;
+      padding: 12px 14px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--text-tertiary);
+      font-size: 11px;
+      line-height: 1.4;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+    }
+
+    .debug-toggle::-webkit-details-marker {
+      display: none;
+    }
+
+    .debug-toggle::after {
+      content: "+";
+      width: 20px;
+      height: 20px;
+      border-radius: 999px;
+      background: var(--soft);
+      color: var(--text-tertiary);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      font-weight: 500;
+      flex: 0 0 auto;
+    }
+
+    .debug-panel[open] .debug-toggle::after {
+      content: "−";
+    }
+
+    .debug-content {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 0 14px 14px;
     }
 
     .log-area,
@@ -787,7 +1036,7 @@
     }
 
     .log-area {
-      min-height: 78px;
+      min-height: 44px;
       white-space: pre-wrap;
     }
 
@@ -1080,17 +1329,23 @@
                 проверить результаты
               </button>
             </div>
+
+            <div id="monitorVisual" class="monitor-visual"></div>
           </section>
 
-          <section class="surface secondary-surface">
-            <div class="section-title">Журнал</div>
-            <div class="log-area" id="monitorLog">ожидание...</div>
-          </section>
-
-          <section class="surface secondary-surface">
-            <div class="section-title">Сводка</div>
-            <div class="summary-card" id="monitorSummary"></div>
-          </section>
+          <details class="surface debug-panel">
+            <summary class="debug-toggle">debug: статус и детали</summary>
+            <div class="debug-content">
+              <div>
+                <div class="section-title">Статус</div>
+                <div class="log-area" id="monitorLog">ожидание...</div>
+              </div>
+              <div>
+                <div class="section-title">Детали</div>
+                <div class="summary-card" id="monitorSummary"></div>
+              </div>
+            </div>
+          </details>
         </div>
       </div>
     </main>

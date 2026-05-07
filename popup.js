@@ -52,6 +52,7 @@ const monitorFileName = document.getElementById('monitorFileName');
 const monitorProgressFill = document.getElementById('monitorProgressFill');
 const monitorProgressText = document.getElementById('monitorProgressText');
 const monitorLog = document.getElementById('monitorLog');
+const monitorVisual = document.getElementById('monitorVisual');
 const monitorSummary = document.getElementById('monitorSummary');
 
 function isActiveRunPhase(phase) {
@@ -316,6 +317,7 @@ function resetSetupState() {
   batchesList.innerHTML = '';
   monitorLog.textContent = 'ожидание...';
   monitorSummary.innerHTML = '';
+  monitorVisual.innerHTML = '';
   monitorPhase.textContent = 'фаза: idle';
   monitorFileName.textContent = 'ожидание...';
   monitorProgressFill.style.width = '0%';
@@ -437,6 +439,174 @@ function buildCreationsDownloadMessage(result) {
   }
 
   return result?.message || 'не удалось запустить скачивание';
+}
+
+function parseQueueAudioName(fileName = '') {
+  const name = String(fileName || '').trim();
+  const match = name.match(/^(.*)__part-(\d+)\.mp3$/i);
+  if (match) {
+    return {
+      baseName: `${match[1]}.mp3`,
+      partLabel: Number(match[2]),
+      isPart: true,
+    };
+  }
+
+  return {
+    baseName: name,
+    partLabel: null,
+    isPart: false,
+  };
+}
+
+function getVideoAvatarHtml(videoIndex) {
+  const video = foundVideos[videoIndex];
+  if (video?.src) {
+    return `<span class="route-avatar"><img src="${escapeHtml(video.src)}" alt=""></span>`;
+  }
+
+  return `<span class="route-avatar">#${Number(videoIndex) + 1}</span>`;
+}
+
+function buildQueueGroups(state) {
+  const queue = Array.isArray(state?.queuePlan) ? state.queuePlan : [];
+  const groups = new Map();
+
+  queue.forEach((task, index) => {
+    const parsed = parseQueueAudioName(task.fileName);
+    if (!groups.has(parsed.baseName)) {
+      groups.set(parsed.baseName, []);
+    }
+
+    groups.get(parsed.baseName).push({
+      ...task,
+      queueIndex: index,
+      partLabel: parsed.partLabel,
+      isPart: parsed.isPart,
+    });
+  });
+
+  return Array.from(groups.entries()).map(([baseName, tasks]) => ({ baseName, tasks }));
+}
+
+function getFocusedQueueGroups(groups, focusIndex, limit = 4) {
+  if (!Array.isArray(groups) || groups.length <= limit) {
+    return Array.isArray(groups) ? groups : [];
+  }
+
+  const safeFocusIndex = Math.max(0, Number(focusIndex || 0));
+  const activeGroupIndex = groups.findIndex((group) => (
+    group.tasks.some((task) => task.queueIndex >= safeFocusIndex)
+  ));
+  const anchor = activeGroupIndex === -1 ? groups.length - 1 : activeGroupIndex;
+  const start = Math.min(
+    Math.max(0, anchor - 1),
+    Math.max(0, groups.length - limit),
+  );
+
+  return groups.slice(start, start + limit);
+}
+
+function renderMonitorVisual(state) {
+  if (!monitorVisual) {
+    return;
+  }
+
+  if (!state || state.phase === 'idle') {
+    monitorVisual.innerHTML = '';
+    return;
+  }
+
+  const queue = Array.isArray(state.queuePlan) ? state.queuePlan : [];
+  const totalTasks = Number(state.total || queue.length || state.summary?.totalGeneratedTasks || 0);
+  const completedTasks = Math.min(totalTasks, Number(state.nextTaskIndex || 0));
+  const displayProgress = Math.min(totalTasks, Math.max(completedTasks, Number(state.current || 0)));
+  const splitCount = Array.isArray(state.summary?.splitFiles) ? state.summary.splitFiles.length : 0;
+  const generatedTasks = Number(state.summary?.totalGeneratedTasks || totalTasks || 0);
+  const progressLabel = totalTasks > 0 ? `${displayProgress}/${totalTasks}` : '0/0';
+  const creationReady = getExpectedCreationsTotal(state) > 0
+    ? `${Number(state.downloadPlan?.matchedCount || 0)}/${getExpectedCreationsTotal(state)}`
+    : '—';
+  const allGroups = buildQueueGroups(state);
+  const focusedGroups = getFocusedQueueGroups(allGroups, Number(state.nextTaskIndex || 0), 4);
+  const nextTasks = queue
+    .slice(Math.max(0, Number(state.nextTaskIndex || 0)), Math.max(0, Number(state.nextTaskIndex || 0)) + 4);
+
+  const routeItems = focusedGroups.map((group) => {
+    const visibleTasks = group.tasks.slice(0, 10);
+    const chips = visibleTasks.map((task) => {
+      const chipState = task.queueIndex < completedTasks
+        ? 'done'
+        : (task.queueIndex === Number(state.current || 0) - 1 ? 'current' : '');
+      const partLabel = task.partLabel ? `p${task.partLabel}` : `#${task.queueIndex + 1}`;
+      return `
+        <span class="part-chip ${chipState}">
+          ${getVideoAvatarHtml(task.videoIndex)}
+          <span>${escapeHtml(partLabel)}</span>
+        </span>
+      `;
+    }).join('');
+    const hiddenCount = Math.max(0, group.tasks.length - visibleTasks.length);
+    const tail = hiddenCount > 0 ? `<span class="part-chip">+${hiddenCount}</span>` : '';
+
+    return `
+      <div class="audio-route">
+        <div class="audio-route-top">
+          <div class="audio-route-name" title="${escapeHtml(group.baseName)}">${escapeHtml(group.baseName)}</div>
+          <div class="audio-route-meta">${group.tasks.length} ${group.tasks.length === 1 ? 'задача' : 'частей'}</div>
+        </div>
+        <div class="part-strip scroll-muted">${chips}${tail}</div>
+      </div>
+    `;
+  }).join('');
+
+  const nextItems = nextTasks.map((task, offset) => {
+    const parsed = parseQueueAudioName(task.fileName);
+    return `
+      <div class="queue-lane-item">
+        <span class="queue-lane-index">${Number(state.nextTaskIndex || 0) + offset + 1}</span>
+        ${getVideoAvatarHtml(task.videoIndex)}
+        <span class="queue-lane-name">${escapeHtml(parsed.isPart ? `${parsed.baseName} · part ${parsed.partLabel}` : parsed.baseName)}</span>
+      </div>
+    `;
+  }).join('');
+
+  monitorVisual.innerHTML = `
+    <div class="monitor-stats">
+      <div class="monitor-stat">
+        <div class="monitor-stat-value">${escapeHtml(progressLabel)}</div>
+        <div class="monitor-stat-label">очередь</div>
+      </div>
+      <div class="monitor-stat">
+        <div class="monitor-stat-value">${generatedTasks}</div>
+        <div class="monitor-stat-label">задач после аудио</div>
+      </div>
+      <div class="monitor-stat">
+        <div class="monitor-stat-value">${escapeHtml(creationReady)}</div>
+        <div class="monitor-stat-label">Creations</div>
+      </div>
+    </div>
+
+    <div class="route-panel">
+      <div class="route-head">
+        <div class="route-title">Карта аудио и аватаров</div>
+        <div class="route-note">нарезано: ${splitCount} · ${focusedGroups.length}/${allGroups.length || 0}</div>
+      </div>
+      <div class="audio-route-list">
+        ${routeItems || '<div class="empty-state">карта появится после подготовки очереди</div>'}
+      </div>
+    </div>
+
+    <div class="route-panel">
+      <div class="route-head">
+        <div class="route-title">Следующие задачи</div>
+        <div class="route-note">ближайшие 4</div>
+      </div>
+      <div class="queue-lane">
+        ${nextItems || '<div class="empty-state">очередь завершена или ещё готовится</div>'}
+      </div>
+    </div>
+  `;
 }
 
 async function performScan() {
@@ -1093,6 +1263,7 @@ function renderRunState(state) {
     showSetup();
     monitorLog.textContent = 'ожидание...';
     monitorSummary.innerHTML = '';
+    renderMonitorVisual(null);
     updateResumeButton(null);
     updateCreationsButton(null);
     return;
@@ -1123,6 +1294,7 @@ function renderRunState(state) {
   updateResumeButton(state);
   updateCreationsButton(state);
 
+  renderMonitorVisual(state);
   renderSummary(state);
 }
 
