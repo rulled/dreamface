@@ -2444,10 +2444,10 @@ async function downloadCreationsIfReady(request) {
         pending,
       };
     }
-    return { status: 'error', message: result.reason || 'не удалось поставить API downloads в очередь' };
+    apiError = new Error(result.reason || 'не удалось поставить API downloads в очередь');
   }
 
-  if (apiSnapshot?.status === 'ready') {
+  if (apiSnapshot?.status === 'ready' && apiReadyItems.length === 0) {
     return { status: 'error', message: 'готовые API items не удалось сопоставить для скачивания' };
   }
 

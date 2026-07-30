@@ -129,6 +129,21 @@
     };
   }
 
+  function addAvatarNoWatermarkFlag(args) {
+    const [input, init] = args;
+    if (!getUrlFromFetchArg(input).includes('/task/v2/submit')) return;
+    if (!init || typeof init.body !== 'string') return;
+
+    const body = tryParseJson(init.body);
+    if (!body || body.work_type !== 'AVATAR_VIDEO') return;
+    if (Object.prototype.hasOwnProperty.call(body, 'no_water_mark')) return;
+
+    args[1] = {
+      ...init,
+      body: JSON.stringify({ ...body, no_water_mark: 1 }),
+    };
+  }
+
   // вытащить поля submit-payload, которые нужны для chapter markers
   function extractSubmitMeta(body) {
     if (!body || typeof body !== 'object') return null;
@@ -572,6 +587,9 @@
     const isBatchWorkStatus = url.includes(BATCH_WORK_STATUS_PATH);
     const isRunningWorks = url.includes(RUNNING_WORKS_PATH);
 
+    if (isSubmit) {
+      addAvatarNoWatermarkFlag(args);
+    }
     if (isSubmit) {
       rememberSubmitContext(args);
     }
