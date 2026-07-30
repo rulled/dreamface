@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DreamFace Batch Assistant Privacy Policy</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --card: #ffffff;
+      --text: #132033;
+      --muted: #50627a;
+      --border: #d9e2ef;
+      --accent: #165dff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: linear-gradient(180deg, #eef4ff 0%, var(--bg) 100%);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    main {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 48px 20px 64px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 32px;
+      box-shadow: 0 18px 45px rgba(19, 32, 51, 0.08);
+    }
+
+    h1, h2 {
+      line-height: 1.2;
+      margin: 0 0 16px;
+    }
+
+    h1 {
+      font-size: 34px;
+      margin-bottom: 10px;
+    }
+
+    h2 {
+      font-size: 22px;
+      margin-top: 28px;
+    }
+
+    p, li {
+      font-size: 16px;
+      color: var(--text);
+    }
+
+    .lede {
+      color: var(--muted);
+      margin: 0 0 24px;
+    }
+
+    ul {
+      margin: 12px 0 0;
+      padding-left: 22px;
+    }
+
+    .note {
+      margin-top: 24px;
+      padding: 16px 18px;
+      border-radius: 14px;
+      background: #f3f8ff;
+      border: 1px solid #cfe0ff;
+      color: var(--muted);
+    }
+
+    a {
+      color: var(--accent);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <h1>DreamFace Batch Assistant Privacy Policy</h1>
+      <p class="lede">Last updated: April 8, 2026</p>
+
+      <p>DreamFace Batch Assistant is a browser extension for batch preparation and submission of audio-driven video generation tasks on DreamFace.</p>
+
+      <h2>What the extension does</h2>
+      <p>The extension helps a user select DreamFace items on the page, attach local audio files, optionally normalize or split those files in the browser, submit jobs to DreamFace, monitor progress, and help with downloading generated results.</p>
+
+      <h2>What data is processed</h2>
+      <ul>
+        <li>DreamFace page content required to identify user-selected videos, queue state, creation cards, and status messages.</li>
+        <li>Local audio files that the user explicitly selects.</li>
+        <li>Temporary run state, queue metadata, and temporary processed audio blobs stored locally inside the browser extension.</li>
+      </ul>
+
+      <h2>How data is used</h2>
+      <ul>
+        <li>Selected audio files are processed locally in the browser to validate duration, pad short clips, or split long clips when required.</li>
+        <li>Processed files are uploaded only to DreamFace as part of the user-requested automation flow.</li>
+        <li>Temporary queue state is stored locally to support long-running jobs and popup reopening.</li>
+      </ul>
+
+      <h2>Data sharing</h2>
+      <p>The extension does not send data to any extension-controlled backend or analytics service. Data is sent only to DreamFace when the user explicitly runs a generation task.</p>
+
+      <h2>Data retention</h2>
+      <p>Temporary run data and processed audio blobs are kept locally inside the extension only for the duration needed to execute the batch and monitor results. They are not intended for long-term storage.</p>
+
+      <h2>Permissions</h2>
+      <ul>
+        <li><strong>storage</strong> is used to keep settings and run state locally.</li>
+        <li><strong>offscreen</strong> is used to run audio preparation outside the popup so long tasks can continue more reliably.</li>
+        <li><strong>DreamFace host access</strong> is used only to automate user-requested actions on DreamFace pages.</li>
+      </ul>
+
+      <h2>No sale of data</h2>
+      <p>The extension does not sell user data and does not use user data for advertising.</p>
+
+      <h2>Contact</h2>
+      <p>Support: <a href="https://github.com/rulled/dreamface/issues">https://github.com/rulled/dreamface/issues</a></p>
+
+      <div class="note">
+        This extension does not use Google APIs. It operates only on DreamFace pages and keeps temporary processing data inside the browser extension.
+      </div>
+    </section>
+  </main>
+</body>
+</html>
