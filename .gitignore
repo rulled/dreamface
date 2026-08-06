@@ -1,0 +1,6 @@
+# reverse-engineering bundle dumps (not part of extension)
+Users_*.js
+# os / editor noise
+.DS_Store
+Thumbs.db
+*.log
