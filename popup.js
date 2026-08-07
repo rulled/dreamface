@@ -9,8 +9,7 @@ const DEFAULT_SETTINGS = {
   autoNormalize: true,
   overlapEnabled: false,
   preLoopEnabled: false,
-  addBorderEnabled: true,
-  removeBorderEnabled: true,
+  addBorderEnabled: false,
   maxDurationSeconds: DEFAULT_MAX_DURATION_SECONDS,
 };
 const MAX_AUDIO_PREVIEW_ITEMS = 5;
@@ -21,6 +20,10 @@ const VIDEO_PAGE_SIZE = VIDEO_GRID_COLUMNS * VIDEO_GRID_ROWS;
 let foundVideos = [];
 let batches = [];
 let latestRunState = null;
+let latestWatchUnits = [];
+let downloadsState = [];
+let savedAccounts = [];
+let monitorRefreshTimer = null;
 let settingsSavePromise = Promise.resolve();
 let latestActiveTabContext = {
   id: null,
@@ -49,13 +52,20 @@ const overlapSubtitle = document.getElementById('overlapSubtitle');
 const preLoopToggle = document.getElementById('preLoopToggle');
 const addBorderToggle = document.getElementById('addBorderToggle');
 const addBorderSubtitle = document.getElementById('addBorderSubtitle');
-const removeBorderToggle = document.getElementById('removeBorderToggle');
-const removeBorderSubtitle = document.getElementById('removeBorderSubtitle');
+const captureAccountBtn = document.getElementById('captureAccountBtn');
+const diagnoseAccountsBtn = document.getElementById('diagnoseAccountsBtn');
+const accountsList = document.getElementById('accountsList');
 
 const stopBtn = document.getElementById('stopBtn');
 const backBtn = document.getElementById('backBtn');
 const resumeBtn = document.getElementById('resumeBtn');
-const creationsBtn = document.getElementById('creationsBtn');
+const retryDownloadsBtn = document.getElementById('retryDownloadsBtn');
+const monitorTitle = document.getElementById('monitorTitle');
+const monitorPreparation = document.getElementById('monitorPreparation');
+const monitorProgressLabel = document.getElementById('monitorProgressLabel');
+const monitorStages = document.getElementById('monitorStages');
+const monitorAccounts = document.getElementById('monitorAccounts');
+const monitorError = document.getElementById('monitorError');
 const monitorKicker = document.getElementById('monitorKicker');
 const monitorPhase = document.getElementById('monitorPhase');
 const monitorFileName = document.getElementById('monitorFileName');
@@ -72,7 +82,6 @@ const monitorLog = document.getElementById('monitorLog');
 const monitorVisual = document.getElementById('monitorVisual');
 const monitorSummary = document.getElementById('monitorSummary');
 const monitorAlert = document.getElementById('monitorAlert');
-const monitorDetails = document.querySelector('.debug-panel');
 
 function isActiveRunPhase(phase) {
   return ['preparing', 'normalizing', 'ready', 'running', 'downloading', 'stopping'].includes(phase);
@@ -83,10 +92,10 @@ const PHASE_LABEL = {
   preparing: 'готовим очередь',
   normalizing: 'обрабатываем аудио',
   ready: 'очередь готова',
-  running: 'генерируем на dreamface',
+  running: 'отправляем в DreamFace',
   downloading: 'скачиваем результаты',
   stopping: 'останавливаем очередь',
-  finished: 'все задачи завершены',
+  finished: 'отправка завершена',
   failed: 'обработка прервалась',
 };
 
@@ -229,8 +238,7 @@ async function saveSelectedFilesToDb(validBatches) {
 
     batchesWithRefs.push({
       id: batch.id,
-      selectedIndices: [...batch.selectedIndices],
-      selectedBorderCropPx: [...(batch.selectedBorderCropPx || [])],
+      selectedAvatars: batch.selectedAvatars.map((avatar) => ({ ...avatar })),
       audioFiles,
     });
   }
@@ -273,10 +281,68 @@ function updateBorderModeCopy() {
       ? 'вкл. загружает в DreamFace видео с полосой слева'
       : 'выкл. загружает исходное видео без дополнительной полосы';
   }
-  if (removeBorderSubtitle && removeBorderToggle) {
-    removeBorderSubtitle.textContent = removeBorderToggle.checked
-      ? 'вкл. обрезает только видео с добавленной полосой при скачивании'
-      : 'выкл. сохраняет полосу с водяным знаком для ручного монтажа';
+}
+
+function renderAccounts(accounts) {
+  savedAccounts = Array.isArray(accounts) ? accounts : [];
+  if (!accountsList) return;
+  accountsList.innerHTML = '';
+  if (!Array.isArray(accounts) || accounts.length === 0) {
+    accountsList.innerHTML = '<div class="empty-state">сохранённых аккаунтов нет — используется текущий вход</div>';
+    return;
+  }
+  for (const account of accounts) {
+    const row = document.createElement('div');
+    row.className = 'audio-item';
+    const name = document.createElement('div');
+    name.className = 'audio-item-name';
+    const duration = Number(account.maxDurationSeconds || 180);
+    const rawIdentity = account.thirdId || account.userId || account.accountId;
+    const identityLabel = String(rawIdentity).includes('@')
+      ? String(rawIdentity).replace(/^(.{3}).*(@.*)$/, '$1***$2')
+      : rawIdentity;
+    name.textContent = `${identityLabel} · ${account.planName || 'Unknown'} · ${duration}s`;
+    name.title = identityLabel;
+    const durationSelect = document.createElement('select');
+    durationSelect.className = 'mini-btn';
+    durationSelect.setAttribute('aria-label', `лимит аккаунта ${identityLabel}`);
+    durationSelect.innerHTML = '<option value="30">30s</option><option value="180">180s</option><option value="600">600s</option>';
+    durationSelect.value = String([30, 180, 600].includes(duration) ? duration : 180);
+    durationSelect.disabled = account.durationSource === 'dreamface-api';
+    durationSelect.onchange = async () => {
+      const response = await chrome.runtime.sendMessage({
+        action: 'dfUpdateAccount',
+        accountId: account.accountId,
+        principalKey: account.principalKey,
+        maxDurationSeconds: Number(durationSelect.value),
+      });
+      if (response?.ok) renderAccounts(response.accounts);
+    };
+    const remove = document.createElement('button');
+    remove.className = 'audio-remove';
+    remove.type = 'button';
+    remove.innerHTML = '<span aria-hidden="true">×</span>';
+    remove.setAttribute('aria-label', `удалить аккаунт ${identityLabel}`);
+    remove.onclick = async () => {
+      const response = await chrome.runtime.sendMessage({
+        action: 'dfRemoveAccount',
+        accountId: account.accountId,
+        principalKey: account.principalKey,
+      });
+      if (response?.ok) renderAccounts(response.accounts);
+    };
+    row.appendChild(name);
+    row.appendChild(durationSelect);
+    row.appendChild(remove);
+    accountsList.appendChild(row);
+  }
+}
+
+async function loadAccounts() {
+  const response = await chrome.runtime.sendMessage({ action: 'dfListAccounts' }).catch(() => null);
+  if (response?.ok) {
+    renderAccounts(response.accounts);
+    renderCurrentRunMonitor();
   }
 }
 
@@ -298,7 +364,7 @@ function getVideoIdentity(source) {
 }
 
 function getBatchSelectedVideoPreviews(batch, limit = 3) {
-  return batch.selectedIndices
+  return (batch.selectedIndices || [])
     .map((index) => ({ index, video: foundVideos[index] }))
     .filter((item) => item.video)
     .slice(0, limit);
@@ -416,7 +482,6 @@ function resetSetupState() {
   batches = [];
   latestRunState = null;
   batchesList.innerHTML = '';
-  if (monitorLog) monitorLog.textContent = 'ничего не запущено';
   if (monitorSummary) monitorSummary.innerHTML = '';
   if (monitorVisual) monitorVisual.innerHTML = '';
   if (monitorAdvancedVisual) monitorAdvancedVisual.innerHTML = '';
@@ -441,7 +506,6 @@ function resetSetupState() {
   postScanContainer.style.display = 'none';
   loadingContainer.classList.remove('active');
   updateResumeButton(null);
-  updateCreationsButton(null);
   updateScanButtonLabel();
   updateTotalStats();
   showSetup();
@@ -866,7 +930,7 @@ async function performScan() {
   statusText.textContent = '';
 
   const response = await new Promise((resolve) => {
-    chrome.tabs.sendMessage(tab.id, { action: 'scanPageVideos' }, (scanResponse) => {
+    chrome.tabs.sendMessage(tab.id, { action: 'scanBulkAvatars' }, (scanResponse) => {
       if (chrome.runtime.lastError) {
         resolve({ ok: false, error: chrome.runtime.lastError.message });
         return;
@@ -882,18 +946,19 @@ async function performScan() {
     uploadVideosBtn.disabled = false;
   }
 
-  if (!response.ok || !response.data || !response.data.videos) {
-    statusText.textContent = 'видео не найдены. обновите страницу';
+  if (!response.ok || !response.data?.ok || !Array.isArray(response.data.videos)) {
+    statusText.textContent = response.data?.error || 'видео не найдены. откройте Avatar или Creation в DreamFace';
     return false;
   }
 
   const nextVideos = response.data.videos;
   const nextIndexByIdentity = new Map(nextVideos.map((video, index) => [getVideoIdentity(video.src), index]));
   batches.forEach((batch) => {
-    batch.selectedIndices = batch.selectedIndices
+    batch.selectedIndices = (batch.selectedIndices || [])
       .map((index) => nextIndexByIdentity.get(getVideoIdentity(foundVideos[index]?.src)))
       .filter((index) => Number.isInteger(index));
     clampBatchVideoPage(batch);
+    batch.selectedAvatars = batch.selectedIndices.map((index) => nextVideos[index]).filter(Boolean);
   });
   foundVideos = nextVideos;
   statusText.textContent = `найдено видео: ${foundVideos.length}`;
@@ -917,8 +982,7 @@ function saveSettings() {
     autoNormalize: autoNormalizeToggle.checked,
     overlapEnabled: overlapToggle.checked,
     preLoopEnabled: preLoopToggle ? preLoopToggle.checked : false,
-    addBorderEnabled: addBorderToggle ? addBorderToggle.checked : true,
-    removeBorderEnabled: removeBorderToggle ? removeBorderToggle.checked : true,
+    addBorderEnabled: addBorderToggle ? addBorderToggle.checked : false,
   };
   settingsSavePromise = settingsSavePromise.catch(() => {}).then(() => chrome.storage.local.set({
     [SETTINGS_KEY]: nextSettings,
@@ -930,6 +994,7 @@ function addNewBatch() {
   const batch = {
     id: Date.now() + Math.floor(Math.random() * 1000),
     selectedIndices: [],
+    selectedAvatars: [],
     audioFiles: [],
     sortOrder: 'asc',
     audioExpanded: false,
@@ -965,7 +1030,12 @@ function renderVideoGridForBatch(container, batch) {
     item.className = 'video-item';
     item.type = 'button';
     item.dataset.index = index;
-    item.innerHTML = `<img src="${vid.src}" loading="lazy" decoding="async" alt="">`;
+    const image = document.createElement('img');
+    image.src = vid.src;
+    image.loading = 'lazy';
+    image.decoding = 'async';
+    image.alt = '';
+    item.appendChild(image);
 
     const queuePos = batch.selectedIndices.indexOf(index);
     const isSelected = queuePos !== -1;
@@ -992,6 +1062,7 @@ function renderVideoGridForBatch(container, batch) {
       } else {
         batch.selectedIndices.splice(existingIndex, 1);
       }
+      batch.selectedAvatars = batch.selectedIndices.map((selectedIndex) => foundVideos[selectedIndex]).filter(Boolean);
       rerenderBatches();
       updateTotalStats();
       // Restore focus after re-render so keyboard users keep their place.
@@ -1035,7 +1106,10 @@ function renderBatchUI(batch) {
     previewVideos.forEach(({ video }) => {
       const avatar = document.createElement('div');
       avatar.className = 'batch-avatar';
-      avatar.innerHTML = `<img src="${video.src}" alt="">`;
+      const image = document.createElement('img');
+      image.src = video.src;
+      image.alt = '';
+      avatar.appendChild(image);
       avatars.appendChild(avatar);
     });
 
@@ -1078,53 +1152,28 @@ function renderBatchUI(batch) {
   vidLabel.textContent = 'Видео для группы';
   videoHead.appendChild(vidLabel);
 
-  if (foundVideos.length > 0) {
+  if (foundVideos.length > VIDEO_PAGE_SIZE) {
     clampBatchVideoPage(batch);
-    const { start, end } = getBatchVideoPageRange(batch);
     const totalPages = getVideoPageCount();
-    if (totalPages > 1) {
-      const videoPager = document.createElement('div');
-      videoPager.className = 'video-pager';
-
-      const prevBtn = document.createElement('button');
-      prevBtn.className = 'mini-btn mini-btn-icon';
-      prevBtn.type = 'button';
-      prevBtn.innerHTML = '<span aria-hidden="true">‹</span>';
-      prevBtn.setAttribute('aria-label', 'предыдущая страница видео');
-      prevBtn.title = 'предыдущая страница видео';
-      prevBtn.disabled = batch.videoPage === 0;
-      prevBtn.onclick = () => {
-        if (batch.videoPage === 0) {
-          return;
-        }
-        batch.videoPage -= 1;
-        rerenderBatches();
-      };
-      videoPager.appendChild(prevBtn);
-
-      const pageInfo = document.createElement('div');
-      pageInfo.className = 'video-page-info';
-      pageInfo.textContent = `${start + 1}-${end} из ${foundVideos.length} · стр. ${batch.videoPage + 1}/${totalPages}`;
-      videoPager.appendChild(pageInfo);
-
-      const nextBtn = document.createElement('button');
-      nextBtn.className = 'mini-btn mini-btn-icon';
-      nextBtn.type = 'button';
-      nextBtn.innerHTML = '<span aria-hidden="true">›</span>';
-      nextBtn.setAttribute('aria-label', 'следующая страница видео');
-      nextBtn.title = 'следующая страница видео';
-      nextBtn.disabled = batch.videoPage >= totalPages - 1;
-      nextBtn.onclick = () => {
-        if (batch.videoPage >= totalPages - 1) {
-          return;
-        }
-        batch.videoPage += 1;
-        rerenderBatches();
-      };
-      videoPager.appendChild(nextBtn);
-
-      videoHead.appendChild(videoPager);
-    }
+    const pager = document.createElement('div');
+    pager.className = 'video-pager';
+    const previous = document.createElement('button');
+    previous.className = 'mini-btn mini-btn-icon';
+    previous.type = 'button';
+    previous.textContent = '‹';
+    previous.disabled = batch.videoPage === 0;
+    previous.onclick = () => { batch.videoPage -= 1; rerenderBatches(); };
+    const info = document.createElement('div');
+    info.className = 'video-page-info';
+    info.textContent = `${batch.videoPage + 1}/${totalPages}`;
+    const next = document.createElement('button');
+    next.className = 'mini-btn mini-btn-icon';
+    next.type = 'button';
+    next.textContent = '›';
+    next.disabled = batch.videoPage >= totalPages - 1;
+    next.onclick = () => { batch.videoPage += 1; rerenderBatches(); };
+    pager.append(previous, info, next);
+    videoHead.appendChild(pager);
   }
 
   videoSection.appendChild(videoHead);
@@ -1132,12 +1181,8 @@ function renderBatchUI(batch) {
   const vidGrid = document.createElement('div');
   vidGrid.className = 'video-grid';
   vidGrid.id = `vid-grid-${batch.id}`;
-
-  if (foundVideos.length === 0) {
-    vidGrid.innerHTML = '<div class="empty-state">ошибка: видео не найдены</div>';
-  } else {
-    renderVideoGridForBatch(vidGrid, batch);
-  }
+  if (foundVideos.length === 0) vidGrid.innerHTML = '<div class="empty-state">нажмите «сканировать», чтобы загрузить библиотеку DreamFace</div>';
+  else renderVideoGridForBatch(vidGrid, batch);
   videoSection.appendChild(vidGrid);
   div.appendChild(videoSection);
 
@@ -1359,57 +1404,6 @@ function canResumeRun(state) {
 
 const CREATIONS_URL = 'https://dreamfaceapp.com/creations';
 
-function updateCreationsButton(state) {
-  if (!canUseCreations(state)) {
-    creationsBtn.style.display = 'none';
-    creationsBtn.disabled = true;
-    creationsBtn.textContent = 'проверить результаты';
-    creationsBtn.dataset.intent = 'check';
-    return;
-  }
-
-  creationsBtn.style.display = 'block';
-
-  // 1. Wrong tab → button opens Creations.
-  if (!latestActiveTabContext.isCreations) {
-    creationsBtn.disabled = false;
-    creationsBtn.textContent = 'открыть creations';
-    creationsBtn.dataset.intent = 'open-creations';
-    return;
-  }
-
-  const status = state.downloadPlan?.lastStatus || 'idle';
-  const totalExpected = getExpectedCreationsTotal(state);
-  const matchedCount = Number(state.downloadPlan?.matchedCount || 0);
-
-  creationsBtn.disabled = false;
-
-  // 2. Files are downloading or downloaded → re-download.
-  if (status === 'success') {
-    const count = Math.min(totalExpected || matchedCount, Number(state.downloadPlan?.downloadedCount || totalExpected || matchedCount));
-    creationsBtn.textContent = count > 0 ? `скачать снова (${count})` : 'скачать снова';
-    creationsBtn.dataset.intent = 'redownload';
-    return;
-  }
-
-  // 3. All ready, not yet downloaded → primary download action.
-  if (status === 'ready' && totalExpected > 0) {
-    creationsBtn.textContent = `скачать (${totalExpected})`;
-    creationsBtn.dataset.intent = 'download';
-    return;
-  }
-
-  // 4. Anything else (idle / pending / partial / error) → unified "check again".
-  if (matchedCount > 0 && totalExpected > 0) {
-    creationsBtn.textContent = `проверить снова (${matchedCount} / ${totalExpected})`;
-  } else if (status === 'idle') {
-    creationsBtn.textContent = 'проверить результаты';
-  } else {
-    creationsBtn.textContent = 'проверить снова';
-  }
-  creationsBtn.dataset.intent = 'check';
-}
-
 function updateResumeButton(state) {
   if (!canResumeRun(state)) {
     resumeBtn.style.display = 'none';
@@ -1422,12 +1416,6 @@ function updateResumeButton(state) {
   resumeBtn.disabled = false;
   const remaining = Math.max(0, (state.queuePlan?.length || 0) - Number(state.nextTaskIndex || 0));
   resumeBtn.textContent = remaining > 0 ? `возобновить (${remaining})` : 'возобновить';
-}
-
-function openMonitorDetails() {
-  if (!monitorDetails) return;
-  monitorDetails.open = true;
-  monitorDetails.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 const ALERT_ICON = {
@@ -1638,74 +1626,181 @@ function renderSummary(state) {
   monitorSummary.innerHTML = parts.join('') || '<div class="summary-line">сводка появится, когда очередь начнёт работу</div>';
 }
 
+const DM_FAILED_STATUSES = new Set(['failed', 'interrupted', 'missing']);
+const DM_ACTIVE_STATUSES = new Set(['queued', 'retry_wait', 'fetching', 'muxing', 'saving']);
+const WATCH_FAILED_STATUSES = new Set(['failed', 'submission_failed', 'submission_cancelled']);
+
+function getAccountLabel(accountId) {
+  const account = savedAccounts.find((item) => String(item.accountId) === String(accountId));
+  const raw = account?.thirdId || account?.userId || account?.accountId || accountId || 'аккаунт';
+  const value = String(raw);
+  if (value.includes('@')) return value.replace(/^(.{2}).*(@.*)$/, '$1***$2');
+  if (value.length <= 10) return value;
+  return `${value.slice(0, 4)}…${value.slice(-4)}`;
+}
+
+function deriveUnitStages(unit, dmByWorkId) {
+  const total = Math.max(0, Number(unit.targetCount ?? unit.expectedFileNames?.length ?? 0));
+  const workIds = (unit.workIds || []).filter(Boolean).map(String);
+  let downloaded = 0;
+  let downloading = 0;
+  let failed = new Set((unit.failedWorkIds || []).map(String)).size;
+  let dmReadyCount = 0;
+
+  for (const workId of workIds) {
+    if ((unit.failedWorkIds || []).map(String).includes(workId)) continue;
+    const entry = dmByWorkId.get(workId);
+    if (!entry) continue;
+    dmReadyCount += 1;
+    if (entry.status === 'done') downloaded += 1;
+    else if (DM_FAILED_STATUSES.has(entry.status)) failed += 1;
+    else if (DM_ACTIVE_STATUSES.has(entry.status)) downloading += 1;
+  }
+
+  if (WATCH_FAILED_STATUSES.has(unit.status)) {
+    failed = Math.max(failed, total - downloaded - downloading);
+  }
+
+  failed = Math.min(total, failed);
+  downloaded = Math.min(total - failed, downloaded);
+  downloading = Math.min(total - failed - downloaded, downloading);
+  const readyReported = Math.max(0, Number(unit.watcherStats?.ready || 0));
+  const ready = Math.min(total - failed - downloaded - downloading, Math.max(0, readyReported - dmReadyCount));
+  const processing = Math.max(0, total - failed - downloaded - downloading - ready);
+  return { total, processing, ready, downloading, downloaded, failed };
+}
+
+function deriveCurrentRunModel() {
+  const runId = latestRunState?.runId;
+  const units = runId ? latestWatchUnits.filter((unit) => unit.runId === runId) : [];
+  const currentWorkIds = new Set(units.flatMap((unit) => unit.workIds || []).filter(Boolean).map(String));
+  const currentDownloads = downloadsState.filter((entry) => (
+    (entry.runId && entry.runId === runId) || currentWorkIds.has(String(entry.workId))
+  ));
+  const dmByWorkId = new Map(currentDownloads.map((entry) => [String(entry.workId), entry]));
+  const accounts = new Map();
+  const stages = { sent: 0, processing: 0, ready: 0, downloading: 0, downloaded: 0, failed: 0 };
+
+  for (const unit of units) {
+    const unitStages = deriveUnitStages(unit, dmByWorkId);
+    stages.sent += unitStages.total;
+    stages.processing += unitStages.processing;
+    stages.ready += unitStages.ready;
+    stages.downloading += unitStages.downloading;
+    stages.downloaded += unitStages.downloaded;
+    stages.failed += unitStages.failed;
+    const key = String(unit.accountId || 'unknown');
+    const row = accounts.get(key) || { accountId: key, total: 0, downloaded: 0, failed: 0, errors: [] };
+    row.total += unitStages.total;
+    row.downloaded += unitStages.downloaded;
+    row.failed += unitStages.failed;
+    if (unit.lastError) row.errors.push(unit.lastError);
+    for (const workId of unit.workIds || []) {
+      const error = dmByWorkId.get(String(workId))?.error;
+      if (error && !row.errors.includes(error)) row.errors.push(error);
+    }
+    accounts.set(key, row);
+  }
+
+  const expected = Math.max(0, Number(latestRunState?.downloadPlan?.totalExpected || latestRunState?.total || 0));
+  if (expected > stages.sent) {
+    const unowned = expected - stages.sent;
+    stages.sent = expected;
+    if (latestRunState?.phase === 'failed' && !latestRunState?.recoverable) stages.failed += unowned;
+    else stages.processing += unowned;
+  }
+  stages.failed = Math.min(stages.sent, stages.failed);
+
+  return {
+    stages,
+    accounts: [...accounts.values()],
+    currentDownloads,
+    remaining: Math.max(0, stages.sent - stages.downloaded - stages.failed),
+  };
+}
+
+function renderCurrentRunMonitor() {
+  if (!latestRunState || latestRunState.phase === 'idle') return;
+  const model = deriveCurrentRunModel();
+  const labels = [
+    ['sent', 'Всего'],
+    ['processing', 'В обработке'],
+    ['ready', 'Готово'],
+    ['downloading', 'Скачивается'],
+    ['downloaded', 'Скачано'],
+    ['failed', 'Ошибки'],
+  ];
+  monitorStages.innerHTML = labels.map(([key, label]) => `
+    <div class="stage-item${key === 'failed' && model.stages.failed ? ' is-error' : ''}">
+      <span class="stage-value">${model.stages[key]}</span>
+      <span class="stage-label">${label}</span>
+    </div>
+  `).join('');
+
+  monitorAccounts.innerHTML = model.accounts.map((row) => {
+    const remaining = Math.max(0, row.total - row.downloaded - row.failed);
+    const error = row.errors[0] || (row.failed ? `Ошибок: ${row.failed}` : '');
+    return `
+      <div class="account-progress-row">
+        <span class="account-progress-name" title="${escapeHtml(getAccountLabel(row.accountId))}">${escapeHtml(getAccountLabel(row.accountId))}</span>
+        <span class="account-progress-counts">${row.downloaded}/${row.total} · осталось ${remaining}</span>
+        ${error ? `<span class="account-progress-error" title="${escapeHtml(error)}">${escapeHtml(error)}</span>` : ''}
+      </div>
+    `;
+  }).join('');
+  monitorAccounts.hidden = model.accounts.length === 0;
+
+  const failedDownloads = model.currentDownloads.filter((entry) => DM_FAILED_STATUSES.has(entry.status));
+  retryDownloadsBtn.hidden = failedDownloads.length === 0;
+  retryDownloadsBtn.textContent = failedDownloads.length ? `повторить ошибки (${failedDownloads.length})` : 'повторить ошибки';
+
+  const errorText = latestRunState.phase === 'failed' ? latestRunState.statusText : '';
+  monitorError.innerHTML = errorText
+    ? `<div class="alert-row error" role="alert"><div class="alert-copy"><div class="alert-headline">${escapeHtml(errorText)}</div></div></div>`
+    : '';
+  monitorError.classList.toggle('active', Boolean(errorText));
+  if (latestRunState.phase === 'stopped' || (latestRunState.phase === 'failed' && latestRunState.interrupted)) {
+    monitorTitle.textContent = 'Запуск остановлен';
+  } else if (latestRunState.phase === 'failed') {
+    monitorTitle.textContent = 'Ошибка запуска';
+  } else {
+    monitorTitle.textContent = isActiveRunPhase(latestRunState.phase)
+      ? 'Текущий запуск'
+      : (model.remaining === 0 ? 'Запуск завершён' : 'Результаты DreamFace');
+  }
+}
+
 function renderRunState(state) {
   latestRunState = state;
-
   if (!state || state.phase === 'idle') {
     showSetup();
-    if (monitorKicker) monitorKicker.textContent = KICKER_LABEL.idle;
-    if (monitorPhase) monitorPhase.textContent = PHASE_LABEL.idle;
-    if (monitorPhaseDot) monitorPhaseDot.dataset.phase = 'idle';
-    if (monitorFileName) {
-      monitorFileName.textContent = '—';
-      monitorFileName.removeAttribute('title');
-    }
-    if (monitorHeadlineNum) monitorHeadlineNum.textContent = '0';
-    if (monitorHeadlineOf) monitorHeadlineOf.textContent = 'из 0';
-    if (monitorProgressFill) monitorProgressFill.style.width = '0%';
-    if (monitorProgressText) monitorProgressText.textContent = '0 / 0';
-    if (monitorGroups) {
-      monitorGroups.innerHTML = '';
-      monitorGroups.hidden = true;
-    }
-    if (monitorLog) monitorLog.textContent = 'ничего не запущено';
-    if (monitorSummary) monitorSummary.innerHTML = '';
-    renderMonitorAlert(null);
-    renderMonitorVisual(null);
     updateResumeButton(null);
-    updateCreationsButton(null);
     return;
   }
 
   showMonitor();
-
-  const isNormalizing = state.phase === 'preparing' || state.phase === 'normalizing' || state.phase === 'ready';
-  const progressCurrent = isNormalizing
-    ? (state.normalization?.processedCount || 0)
-    : (state.current || 0);
-  const progressTotal = isNormalizing
-    ? (state.normalization?.totalCount || 0)
-    : (state.total || 0);
-  const progressPercent = progressTotal > 0 ? Math.min(100, Math.round((progressCurrent / progressTotal) * 100)) : 0;
-
-  if (monitorKicker) monitorKicker.textContent = getMonitorKickerLabel(state);
-  if (monitorPhase) monitorPhase.textContent = getMonitorPhaseLabel(state);
-  if (monitorPhaseDot) monitorPhaseDot.dataset.phase = state.phase || 'idle';
-  const fileLabel = isNormalizing
+  const isPreparing = ['preparing', 'normalizing', 'ready'].includes(state.phase);
+  const isSubmitting = state.phase === 'running';
+  const progressCurrent = isPreparing ? Number(state.normalization?.processedCount || 0) : Number(state.current || 0);
+  const progressTotal = isPreparing ? Number(state.normalization?.totalCount || 0) : Number(state.total || 0);
+  const progressPercent = progressTotal ? Math.min(100, Math.round((progressCurrent / progressTotal) * 100)) : 0;
+  const fileLabel = isPreparing
     ? (state.normalization?.currentFile || 'готовим файлы')
-    : (state.currentTaskName || 'ждём следующую задачу');
-  if (monitorFileName) {
-    monitorFileName.textContent = fileLabel;
-    monitorFileName.title = fileLabel;
-  }
-  if (monitorProgressFill) monitorProgressFill.style.width = `${progressPercent}%`;
-  if (monitorProgressText) {
-    monitorProgressText.textContent = progressTotal > 0
-      ? `${progressCurrent} / ${progressTotal}`
-      : '0 / 0';
-  }
-  if (monitorHeadlineNum) monitorHeadlineNum.textContent = String(progressCurrent || 0);
-  if (monitorHeadlineOf) monitorHeadlineOf.textContent = `из ${progressTotal || 0}`;
-  if (monitorLog) monitorLog.textContent = getCreationsLogText(state);
-  if (stopBtn) stopBtn.disabled = !isActiveRunPhase(state.phase);
-  if (backBtn) backBtn.disabled = isActiveRunPhase(state.phase);
-  updateResumeButton(state);
-  updateCreationsButton(state);
+    : (state.currentTaskName || 'ожидаем результаты');
 
-  renderMonitorAlert(state);
-  renderMonitorGroups(state);
-  renderMonitorVisual(state);
-  renderSummary(state);
+  monitorPreparation.hidden = !(isPreparing || isSubmitting);
+  monitorProgressLabel.textContent = isPreparing ? 'Подготовка' : 'Отправка';
+  monitorProgressFill.style.width = `${progressPercent}%`;
+  monitorProgressText.textContent = `${progressCurrent} / ${progressTotal}`;
+  monitorFileName.textContent = fileLabel;
+  monitorFileName.title = fileLabel;
+  monitorPhase.textContent = getMonitorPhaseLabel(state);
+  monitorPhaseDot.dataset.phase = state.phase || 'idle';
+  stopBtn.hidden = !isActiveRunPhase(state.phase);
+  stopBtn.disabled = !isActiveRunPhase(state.phase);
+  backBtn.disabled = isActiveRunPhase(state.phase);
+  updateResumeButton(state);
+  renderCurrentRunMonitor();
 }
 
 async function initialize() {
@@ -1715,10 +1810,10 @@ async function initialize() {
   overlapToggle.checked = settings.overlapEnabled;
   if (preLoopToggle) preLoopToggle.checked = Boolean(settings.preLoopEnabled);
   if (addBorderToggle) addBorderToggle.checked = settings.addBorderEnabled !== false;
-  if (removeBorderToggle) removeBorderToggle.checked = settings.removeBorderEnabled !== false;
   updateAudioModeCopy();
   updateBorderModeCopy();
   updateScanButtonLabel();
+  postScanContainer.style.display = 'none';
   await refreshActiveTabContext({ rerender: false });
 
   await chrome.runtime.sendMessage({ action: 'engine.ensure' }).catch(() => {});
@@ -1726,150 +1821,97 @@ async function initialize() {
   if (response?.ok && response.state) {
     renderRunState(response.state);
   }
-  // Загружаем актуальное состояние скачиваний
-  loadDownloadsState().catch(() => {});
-  loadDebugLog().catch(() => {});
+  await Promise.all([loadDownloadsState(), loadAccounts(), refreshWatcherState()]);
+  startMonitorRefresh();
 }
-
-// ============================================================
-// Debug log
-// ============================================================
-let debugLogEntries = [];
-async function loadDebugLog() {
-  try {
-    const r = await chrome.runtime.sendMessage({ action: 'dm.getDebugLog' });
-    if (r?.ok && Array.isArray(r.log)) {
-      debugLogEntries = r.log;
-      renderDebugLog();
-    }
-  } catch {}
-}
-
-function renderDebugLog() {
-  const list = document.getElementById('debugLogList');
-  const summary = document.getElementById('debugLogSummary');
-  if (!list) return;
-  if (summary) summary.textContent = String(debugLogEntries.length);
-  list.innerHTML = '';
-  const tail = debugLogEntries.slice(-120); // последние 120
-  for (const e of tail) {
-    const row = document.createElement('div');
-    row.className = 'debug-log-row is-' + (e.level || 'log');
-    const ts = new Date(e.ts || Date.now()).toISOString().slice(11, 23);
-    row.innerHTML = `<span class="ts">${ts}</span><span class="src">[${e.src}]</span>${escapeHtml(e.msg || '')}`;
-    list.appendChild(row);
-  }
-  list.scrollTop = list.scrollHeight;
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-  const refreshBtn = document.getElementById('debugLogRefreshBtn');
-  const clearBtn = document.getElementById('debugLogClearBtn');
-  const copyBtn = document.getElementById('debugLogCopyBtn');
-  if (refreshBtn) refreshBtn.addEventListener('click', () => loadDebugLog());
-  if (clearBtn) clearBtn.addEventListener('click', async () => {
-    await chrome.runtime.sendMessage({ action: 'dm.clearDebugLog' });
-    await loadDebugLog();
-  });
-  if (copyBtn) copyBtn.addEventListener('click', () => {
-    const text = debugLogEntries.map((e) => {
-      const ts = new Date(e.ts || 0).toISOString();
-      return `${ts} [${e.src}] [${e.level}] ${e.msg}`;
-    }).join('\n');
-    navigator.clipboard?.writeText(text).then(() => {
-      copyBtn.textContent = 'скопировано';
-      setTimeout(() => { copyBtn.textContent = 'скопировать'; }, 1500);
-    }).catch(() => {});
-  });
-
-  // дополнительная кнопка-фолбек: "скачать .txt" — на случай если
-  // буфер обмена не сработал. кнопка ищется по id, если её нет в html
-  // (старая версия popup'а) — тихо не делаем ничего.
-  const downloadBtn = document.getElementById('debugLogDownloadBtn');
-  if (downloadBtn) {
-    downloadBtn.addEventListener('click', () => {
-      const text = debugLogEntries.map((e) => {
-        const ts = new Date(e.ts || 0).toISOString();
-        return `${ts} [${e.src}] [${e.level}] ${e.msg}`;
-      }).join('\n');
-      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `dreamface-debug-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => {
-        URL.revokeObjectURL(url);
-        a.remove();
-      }, 500);
-    });
-  }
-
-  // Пока debug-panel открыта, поллим лог каждые 1.5с — даже если
-  // dm.logUpdate broadcast потерялся (например когда SW спал). Это
-  // гарантирует что юзер ВИДИТ актуальный лог сразу как открывает панель.
-  const debugPanel = document.querySelector('.debug-panel');
-  let debugPollTimer = null;
-  const startDebugPolling = () => {
-    if (debugPollTimer) return;
-    debugPollTimer = setInterval(() => {
-      if (!debugPanel || !debugPanel.open) {
-        clearInterval(debugPollTimer);
-        debugPollTimer = null;
-        return;
-      }
-      loadDebugLog().catch(() => {});
-    }, 1500);
-  };
-  if (debugPanel) {
-    debugPanel.addEventListener('toggle', () => {
-      if (debugPanel.open) {
-        loadDebugLog().catch(() => {});
-        startDebugPolling();
-      } else if (debugPollTimer) {
-        clearInterval(debugPollTimer);
-        debugPollTimer = null;
-      }
-    });
-    if (debugPanel.open) {
-      loadDebugLog().catch(() => {});
-      startDebugPolling();
-    }
-  }
-});
 
 document.addEventListener('DOMContentLoaded', initialize);
 window.addEventListener('focus', () => {
   refreshActiveTabContext().catch(() => {});
+  refreshMonitorState().catch(() => {});
 });
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) {
     refreshActiveTabContext().catch(() => {});
+    refreshMonitorState().catch(() => {});
   }
 });
+
+async function refreshWatcherState() {
+  if (!latestRunState?.runId) return;
+  const response = await chrome.runtime.sendMessage({ action: 'dfGetBulkWatchUnits' }).catch(() => null);
+  if (response?.ok && Array.isArray(response.units)) {
+    latestWatchUnits = response.units;
+    renderCurrentRunMonitor();
+  }
+}
+
+async function refreshMonitorState() {
+  if (!monitorView.classList.contains('active')) return;
+  const [runResponse, dmResponse] = await Promise.all([
+    chrome.runtime.sendMessage({ action: 'engine.getRunState' }).catch(() => null),
+    chrome.runtime.sendMessage({ action: 'dm.getState' }).catch(() => null),
+  ]);
+  if (runResponse?.ok && runResponse.state) renderRunState(runResponse.state);
+  if (dmResponse?.ok && Array.isArray(dmResponse.entries)) downloadsState = dmResponse.entries;
+  await refreshWatcherState();
+  renderCurrentRunMonitor();
+}
+
+function startMonitorRefresh() {
+  if (monitorRefreshTimer) clearInterval(monitorRefreshTimer);
+  monitorRefreshTimer = setInterval(() => refreshMonitorState().catch(() => {}), 5000);
+}
 
 durationModeToggle.addEventListener('change', saveSettings);
 autoNormalizeToggle.addEventListener('change', saveSettings);
 overlapToggle.addEventListener('change', saveSettings);
 if (preLoopToggle) preLoopToggle.addEventListener('change', saveSettings);
 if (addBorderToggle) addBorderToggle.addEventListener('change', saveSettings);
-if (removeBorderToggle) removeBorderToggle.addEventListener('change', saveSettings);
 addBatchBtn.addEventListener('click', addNewBatch);
 
-monitorAlert?.addEventListener('click', (event) => {
-  const trigger = event.target instanceof Element
-    ? event.target.closest('[data-monitor-details]')
-    : null;
-  if (!trigger) return;
-  openMonitorDetails();
+captureAccountBtn?.addEventListener('click', async () => {
+  captureAccountBtn.disabled = true;
+  const captured = await chrome.runtime.sendMessage({ action: 'dfCaptureAccount' }).catch((error) => ({ ok: false, error: error.message }));
+  if (!captured?.hasAuth || !captured?.sessionRaw) {
+    statusText.textContent = captured?.error || 'войдите в DreamFace на странице Avatar или Creation';
+    captureAccountBtn.disabled = false;
+    return;
+  }
+  const capabilityResponse = await chrome.runtime.sendMessage({
+    action: 'dfBulkOp',
+    op: 'getAccountCapabilities',
+    payload: {},
+  }).catch(() => null);
+  if (!capabilityResponse?.data?.maxDurationSeconds) {
+    statusText.textContent = capabilityResponse?.error || 'не удалось получить тариф и audioLimit из DreamFace';
+    captureAccountBtn.disabled = false;
+    return;
+  }
+  const account = { ...captured, ...(capabilityResponse?.data || {}) };
+  const saved = await chrome.runtime.sendMessage({ action: 'dfSaveAccount', account }).catch((error) => ({ ok: false, error: error.message }));
+  statusText.textContent = saved?.ok ? 'аккаунт сохранён' : (saved?.error || 'не удалось сохранить аккаунт');
+  if (saved?.ok) renderAccounts(saved.accounts);
+  captureAccountBtn.disabled = false;
 });
 
-scanBtn.addEventListener('click', async () => {
+diagnoseAccountsBtn?.addEventListener('click', async () => {
+  diagnoseAccountsBtn.disabled = true;
+  statusText.textContent = 'проверяем аккаунты без запуска генерации...';
+  const response = await chrome.runtime.sendMessage({ action: 'dfDiagnoseAccounts' }).catch((error) => ({ ok: false, error: error.message }));
+  if (!response?.ok) {
+    statusText.textContent = response?.error || 'диагностика аккаунтов не удалась';
+  } else {
+    const healthy = response.diagnostics.filter((item) => item.ok).length;
+    const summary = response.diagnostics.map((item) => item.ok
+      ? `${item.planName} ${item.maxDurationSeconds}s, active ${item.runningWorks}, batch ${item.quota?.remaining ?? '?'} / ${item.quota?.total ?? '?'}`
+      : `${item.error || 'invalid'}`).join(' | ');
+    statusText.textContent = `аккаунты: ${healthy}/${response.diagnostics.length} доступны. ${summary}`;
+  }
+  diagnoseAccountsBtn.disabled = false;
+});
+
+scanBtn?.addEventListener('click', async () => {
   await performScan();
 });
 
@@ -1887,7 +1929,7 @@ uploadVideosBtn?.addEventListener('click', async () => {
   const response = await new Promise((resolve) => {
     chrome.tabs.sendMessage(tab.id, {
       action: 'startMultiVideoUploadPicker',
-      addBorderEnabled: addBorderToggle ? addBorderToggle.checked : true,
+      addBorderEnabled: addBorderToggle ? addBorderToggle.checked : false,
     }, (pageResponse) => {
       if (chrome.runtime.lastError) {
         resolve({ ok: false, error: chrome.runtime.lastError.message });
@@ -1914,10 +1956,7 @@ startBtn.addEventListener('click', async () => {
     .filter((batch) => batch.selectedIndices.length > 0 && batch.audioFiles.length > 0)
     .map((batch) => ({
       id: batch.id,
-      selectedIndices: [...batch.selectedIndices],
-      selectedBorderCropPx: batch.selectedIndices.map((index) => (
-        Math.max(0, Math.floor(Number(foundVideos[index]?.borderCropPx) || 0))
-      )),
+      selectedAvatars: batch.selectedIndices.map((index) => foundVideos[index]).filter(Boolean),
       audioFiles: [...batch.audioFiles],
     }));
 
@@ -1974,6 +2013,7 @@ startBtn.addEventListener('click', async () => {
   const response = await chrome.runtime.sendMessage({
     action: 'engine.prepareRun',
     payload: {
+      mode: 'bulk',
       tabId: tab.id,
       batches: batchesWithRefs,
       options: settings,
@@ -1988,7 +2028,7 @@ startBtn.addEventListener('click', async () => {
 });
 
 stopBtn.addEventListener('click', async () => {
-  monitorLog.textContent = 'останавливаем очередь…';
+  monitorPhase.textContent = 'останавливаем очередь…';
   stopBtn.disabled = true;
   await chrome.runtime.sendMessage({ action: 'engine.stopRun' }).catch(() => {});
 });
@@ -1999,7 +2039,7 @@ resumeBtn.addEventListener('click', async () => {
   }
 
   resumeBtn.disabled = true;
-  monitorLog.textContent = 'возобновляем очередь…';
+  monitorPhase.textContent = 'возобновляем очередь…';
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const tabId = /dreamfaceapp\.com/i.test(tab?.url || '') ? tab.id : latestRunState?.tabId;
@@ -2013,7 +2053,7 @@ resumeBtn.addEventListener('click', async () => {
   }));
 
   if (!response?.ok) {
-    monitorLog.textContent = response?.error || 'не удалось возобновить очередь. попробуйте ещё раз.';
+    monitorPhase.textContent = response?.error || 'не удалось возобновить очередь. попробуйте ещё раз.';
     resumeBtn.disabled = false;
     return;
   }
@@ -2042,117 +2082,16 @@ backBtn.addEventListener('click', () => {
     });
 });
 
-creationsBtn.addEventListener('click', async () => {
-  await settingsSavePromise;
-  if (!latestRunState || !hasDownloadPlan(latestRunState) || isActiveRunPhase(latestRunState.phase)) {
-    return;
-  }
-
-  // Wrong tab → open Creations directly instead of telling the user to do it.
-  if (creationsBtn.dataset.intent === 'open-creations') {
-    try {
-      await chrome.tabs.create({ url: CREATIONS_URL, active: true });
-      monitorLog.textContent = 'открыли creations. вернитесь в расширение и нажмите «проверить результаты».';
-    } catch (error) {
-      monitorLog.textContent = `не удалось открыть creations: ${error.message || 'попробуйте вручную'}`;
-    }
-    return;
-  }
-
-  creationsBtn.disabled = true;
-  const tabContext = await refreshActiveTabContext({ rerender: false });
-
-  if (!tabContext?.id || !tabContext.isCreations) {
-    monitorLog.textContent = 'откройте вкладку creations и нажмите кнопку ещё раз.';
-    renderRunState(latestRunState);
-    return;
-  }
-
-  const expectedFileNames = Array.isArray(latestRunState.downloadPlan?.expectedFileNames)
-    ? latestRunState.downloadPlan.expectedFileNames.filter(Boolean)
-    : [];
-  const expectedWorkIds = Array.isArray(latestRunState.downloadPlan?.expectedWorkIds)
-    ? [...latestRunState.downloadPlan.expectedWorkIds]
-    : [];
-
-  if (expectedFileNames.length === 0) {
-    monitorLog.textContent = 'нет файлов для проверки в creations';
-    renderRunState(latestRunState);
-    return;
-  }
-
-  const totalExpected = getExpectedCreationsTotal(latestRunState);
-
-  try {
-    monitorLog.textContent = 'ищем готовые файлы в creations…';
-    const checkResult = await sendMessageToTab(tabContext.id, {
-      action: 'checkCreationsStatus',
-      expectedFileNames,
-      expectedWorkIds,
-      startedAt: latestRunState.startedAt,
-    });
-
-    const hasReadyFiles = Array.isArray(checkResult?.readyFiles) && checkResult.readyFiles.length > 0;
-    if (checkResult?.status === 'ready' || (checkResult?.status === 'failed' && hasReadyFiles)) {
-      monitorLog.textContent = checkResult.status === 'ready'
-        ? 'все файлы готовы. запускаем скачивание…'
-        : 'часть файлов готова. скачиваем готовые…';
-      const downloadResult = await sendMessageToTab(tabContext.id, {
-        action: 'downloadCreationsIfReady',
-        expectedFileNames,
-        expectedWorkIds,
-        startedAt: latestRunState.startedAt,
-      });
-
-      const nextMessage = buildCreationsDownloadMessage(downloadResult);
-      const nextStatus = downloadResult?.status === 'success'
-        ? 'success'
-        : (downloadResult?.status === 'partial' ? 'pending' : (downloadResult?.status || 'error'));
-      await updateStoredRunState((state) => {
-        state.downloadPlan = {
-          ...state.downloadPlan,
-          lastStatus: nextStatus,
-          lastMessage: nextMessage,
-          pendingFiles: Array.isArray(downloadResult?.pending) ? [...downloadResult.pending] : [],
-          downloadedCount: Number(downloadResult?.downloadedCount || 0),
-          matchedCount: Number(checkResult?.matchedCount || totalExpected),
-          totalExpected,
-          checkedAt: new Date().toISOString(),
-          checkedOnUrl: tabContext.url,
-        };
-        state.statusText = nextMessage;
-      });
-
-      return;
-    }
-
-    const nextMessage = buildCreationsCheckMessage(checkResult);
-    await updateStoredRunState((state) => {
-      state.downloadPlan = {
-        ...state.downloadPlan,
-        lastStatus: checkResult?.status === 'partial' ? 'pending' : (checkResult?.status || 'error'),
-        lastMessage: nextMessage,
-        pendingFiles: Array.isArray(checkResult?.pending) ? [...checkResult.pending] : [],
-        matchedCount: Number(checkResult?.matchedCount || 0),
-        totalExpected,
-        checkedAt: new Date().toISOString(),
-        checkedOnUrl: tabContext.url,
-      };
-      state.statusText = nextMessage;
-    });
-  } catch (error) {
-    const message = error.message || 'не удалось проверить результаты в Creations';
-    await updateStoredRunState((state) => {
-      state.downloadPlan = {
-        ...state.downloadPlan,
-        lastStatus: 'error',
-        lastMessage: message,
-        checkedAt: new Date().toISOString(),
-        checkedOnUrl: tabContext.url,
-      };
-      state.statusText = message;
-    });
-  }
+retryDownloadsBtn.addEventListener('click', async () => {
+  const model = deriveCurrentRunModel();
+  const failed = model.currentDownloads.filter((entry) => DM_FAILED_STATUSES.has(entry.status));
+  retryDownloadsBtn.disabled = true;
+  await Promise.all(failed.map((entry) => chrome.runtime.sendMessage({
+    action: 'dm.retry',
+    payload: { workId: entry.workId },
+  }).catch(() => null)));
+  retryDownloadsBtn.disabled = false;
+  await refreshMonitorState();
 });
 
 chrome.runtime.onMessage.addListener((message) => {
@@ -2182,6 +2121,7 @@ chrome.runtime.onMessage.addListener((message) => {
 
   if (message.action === 'runStateUpdate' && message.state) {
     renderRunState(message.state);
+    refreshWatcherState().catch(() => {});
     if (!isActiveRunPhase(message.state.phase)) {
       startBtn.disabled = false;
       if (message.state.phase === 'finished') {
@@ -2194,173 +2134,19 @@ chrome.runtime.onMessage.addListener((message) => {
 
   if (message.action === 'dm.stateUpdate' && Array.isArray(message.entries)) {
     downloadsState = message.entries;
-    renderDownloads();
-  }
-
-  if (message.action === 'dm.logUpdate') {
-    loadDebugLog().catch(() => {});
+    renderCurrentRunMonitor();
+    refreshWatcherState().catch(() => {});
   }
 });
-
-// ============================================================
-// Downloads section (DownloadManager UI)
-// ============================================================
-
-let downloadsState = [];
-let downloadsHideDone = false;
 
 async function loadDownloadsState() {
   try {
     const resp = await chrome.runtime.sendMessage({ action: 'dm.getState' });
     if (resp?.ok && Array.isArray(resp.entries)) {
       downloadsState = resp.entries;
-      renderDownloads();
+      renderCurrentRunMonitor();
     }
   } catch (err) {
     console.warn('[popup] dm.getState failed', err);
-  }
-}
-
-function describeStatus(status) {
-  switch (status) {
-    case 'queued': return 'в очереди';
-    case 'fetching': return 'загрузка';
-    case 'muxing': return 'обработка';
-    case 'saving': return 'сохранение';
-    case 'done': return 'готово';
-    case 'failed': return 'ошибка';
-    case 'interrupted': return 'прервано';
-    case 'missing': return 'не найдено';
-    default: return status || '';
-  }
-}
-
-function renderDownloads() {
-  const section = document.getElementById('downloadsSection');
-  const listEl = document.getElementById('downloadsList');
-  const summaryEl = document.getElementById('downloadsSummary');
-  const progressEl = document.getElementById('downloadsProgressFill');
-  const retryFailedBtn = document.getElementById('downloadsRetryFailedBtn');
-  const clearBtn = document.getElementById('downloadsClearCompletedBtn');
-  const hideToggleBtn = document.getElementById('downloadsToggleHideDoneBtn');
-  if (!section || !listEl) return;
-
-  if (!Array.isArray(downloadsState) || downloadsState.length === 0) {
-    section.hidden = true;
-    return;
-  }
-  section.hidden = false;
-
-  const total = downloadsState.length;
-  const done = downloadsState.filter((e) => e.status === 'done').length;
-  const failed = downloadsState.filter((e) => e.status === 'failed' || e.status === 'interrupted' || e.status === 'missing').length;
-  const active = downloadsState.filter((e) => e.status === 'fetching' || e.status === 'muxing' || e.status === 'saving' || e.status === 'queued').length;
-
-  if (summaryEl) {
-    let summary = `${done}/${total}`;
-    if (failed > 0) summary += ` <span class="dl-failed">✕${failed}</span>`;
-    if (active > 0) summary += ` · идёт ${active}`;
-    summaryEl.innerHTML = summary;
-  }
-  if (progressEl) {
-    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-    progressEl.style.width = pct + '%';
-  }
-  if (retryFailedBtn) {
-    retryFailedBtn.style.display = failed > 0 ? '' : 'none';
-    retryFailedBtn.textContent = `повторить ошибки (${failed})`;
-  }
-  if (hideToggleBtn) {
-    hideToggleBtn.textContent = downloadsHideDone ? 'показать готовые' : 'скрыть готовые';
-  }
-
-  // фильтр
-  const filtered = downloadsHideDone
-    ? downloadsState.filter((e) => e.status !== 'done')
-    : downloadsState;
-
-  listEl.innerHTML = '';
-  for (const entry of filtered) {
-    const row = document.createElement('div');
-    row.className = 'download-row';
-    if (entry.status === 'done') row.classList.add('is-done');
-    if (entry.status === 'failed' || entry.status === 'interrupted' || entry.status === 'missing') {
-      row.classList.add('is-failed');
-    }
-
-    const dot = document.createElement('span');
-    dot.className = 'dl-status-dot is-' + entry.status;
-    row.appendChild(dot);
-
-    const name = document.createElement('span');
-    name.className = 'dl-row-name';
-    const displayName = entry.savedAs || entry.audioFileName || entry.workName || entry.fileName || entry.workId;
-    name.textContent = displayName;
-    if (entry.error) {
-      name.classList.add('has-error');
-      name.title = entry.error;
-    } else {
-      name.title = `workId: ${entry.workId}`;
-    }
-    row.appendChild(name);
-
-    const status = document.createElement('span');
-    status.className = 'dl-row-status';
-    status.textContent = describeStatus(entry.status);
-    row.appendChild(status);
-
-    const retryBtn = document.createElement('button');
-    retryBtn.className = 'dl-row-retry';
-    retryBtn.type = 'button';
-    retryBtn.textContent = '↻';
-    retryBtn.title = 'повторить';
-    const canRetry = (entry.status === 'failed' || entry.status === 'interrupted' || entry.status === 'missing');
-    retryBtn.hidden = !canRetry;
-    retryBtn.addEventListener('click', async () => {
-      retryBtn.disabled = true;
-      try {
-        await chrome.runtime.sendMessage({ action: 'dm.retry', payload: { workId: entry.workId } });
-      } catch (err) {
-        console.warn('[popup] dm.retry failed', err);
-      } finally {
-        retryBtn.disabled = false;
-      }
-    });
-    row.appendChild(retryBtn);
-
-    listEl.appendChild(row);
-  }
-
-  // wire actions один раз
-  if (retryFailedBtn && !retryFailedBtn.dataset.wired) {
-    retryFailedBtn.dataset.wired = '1';
-    retryFailedBtn.addEventListener('click', async () => {
-      retryFailedBtn.disabled = true;
-      try {
-        await chrome.runtime.sendMessage({ action: 'dm.retry', payload: { workId: null } });
-      } catch (err) {
-        console.warn('[popup] dm.retry all failed', err);
-      } finally {
-        retryFailedBtn.disabled = false;
-      }
-    });
-  }
-  if (clearBtn && !clearBtn.dataset.wired) {
-    clearBtn.dataset.wired = '1';
-    clearBtn.addEventListener('click', async () => {
-      try {
-        await chrome.runtime.sendMessage({ action: 'dm.clearCompleted' });
-        await loadDownloadsState();
-      } catch (err) {
-        console.warn('[popup] dm.clearCompleted failed', err);
-      }
-    });
-  }
-  if (hideToggleBtn && !hideToggleBtn.dataset.wired) {
-    hideToggleBtn.dataset.wired = '1';
-    hideToggleBtn.addEventListener('click', () => {
-      downloadsHideDone = !downloadsHideDone;
-      renderDownloads();
-    });
   }
 }

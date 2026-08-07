@@ -2,9 +2,15 @@ const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
 const RUN_STATE_KEY = 'dreamfaceRunState';
 const DOWNLOADS_STORAGE_KEY = 'dreamfaceDownloads';
 const PADDED_VIDEO_MARKERS_KEY = 'dreamfacePaddedVideoMarkers';
+const DREAMFACE_ACCOUNTS_KEY = 'dreamfaceAccounts';
+const AVATAR_CACHE_KEY = 'dreamfaceAvatarCache';
+const AVATAR_CACHE_LIMIT = 2000;
+const BULK_WATCH_ALARM = 'bulk-watch';
+const BULK_WATCH_STORAGE_KEY = 'dreamfaceBulkWatchUnits';
 const PADDED_VIDEO_MARKERS_LIMIT = 500;
 const DEFAULT_MAX_DURATION_SECONDS = 180;
-const CREATIONS_URL = 'https://www.dreamfaceapp.com/ru/creation?type=Avatar+Video';
+const CREATIONS_URL = 'https://www.dreamfaceapp.com/creation?type=Avatar+Video';
+const BULK_RELAY_URL = `${CREATIONS_URL}#dreamface-extension-relay`;
 const CREATIONS_URL_PATTERNS = [
   'https://tools.dreamfaceapp.com/user*',
   'https://tools.dreamfaceapp.com/*/user*',
@@ -26,7 +32,130 @@ const DREAMFACE_URL_PATTERNS = [
 ];
 
 let offscreenCreationPromise = null;
+let bulkRelayTabId = null;
+let bulkWatchMutationChain = Promise.resolve();
+const DREAMFACE_RELAY_PATH_RE = /\/(?:[a-z]{2}\/)?(?:avatar(?:-bulk)?|creation)(?:\/|\?|#|$)/i;
+
+function withBulkWatchMutation(callback) {
+  const run = bulkWatchMutationChain.then(callback, callback);
+  bulkWatchMutationChain = run.catch(() => {});
+  return run;
+}
 let paddedVideoMarkerWrite = Promise.resolve();
+
+function getAccountIdentity(account) {
+  let session = null;
+  try { session = account?.sessionRaw ? JSON.parse(account.sessionRaw) : null; } catch {}
+  const thirdPlatform = String(session?.thirdPlatform || account?.thirdPlatform || '').trim();
+  const thirdId = String(session?.thirdId || account?.thirdId || '').trim();
+  const userId = String(session?.userId || account?.userId || '').trim();
+  const accountId = String(session?.accountId || account?.accountId || '').trim();
+  const principalKey = thirdPlatform && thirdId
+    ? `${thirdPlatform.toLowerCase()}:${thirdId.toLowerCase()}`
+    : (userId ? `user:${userId.toLowerCase()}` : `account:${accountId}`);
+  return { principalKey, thirdPlatform, thirdId, userId, accountId };
+}
+
+function getStoredAccountAuth(account) {
+  let session = null;
+  try { session = account?.sessionRaw ? JSON.parse(account.sessionRaw) : null; } catch {}
+  const token = String(session?.token || account?.token || '');
+  const userId = String(session?.userId || account?.userId || '');
+  const accountId = String(session?.accountId || account?.accountId || '');
+  const clientId = String(account?.clientId || '');
+  if (!token || !userId || !accountId || !clientId) {
+    throw new Error('account session is incomplete');
+  }
+  return { token, userId, accountId, clientId };
+}
+
+async function diagnoseStoredAccount(account) {
+  const auth = getStoredAccountAuth(account);
+  const headers = {
+    accept: 'application/json',
+    'content-type': 'application/json',
+    'dream-face-web': 'dream-face-web',
+    token: auth.token,
+    'client-id': auth.clientId,
+  };
+  const requestJson = async (path, options = {}) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 20000);
+    try {
+      const requestHeaders = { ...headers, ...(options.headers || {}) };
+      if (!options.body) delete requestHeaders['content-type'];
+      const response = await fetch(`https://www.dreamfaceapp.com${path}`, {
+        ...options,
+        headers: requestHeaders,
+        credentials: 'include',
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      let payload = null;
+      try { payload = JSON.parse(text); } catch {}
+      if (!response.ok) throw new Error(`${path} failed: HTTP ${response.status}`);
+      if (!payload) throw new Error(`${path}: invalid JSON response`);
+      const status = payload.status_msg || payload.statusMsg || payload.status || '';
+      if (status && !/^success$/i.test(String(status))) throw new Error(`${path}: ${status}`);
+      return payload;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+  const post = (path, body) => requestJson(path, { method: 'POST', body: JSON.stringify(body) });
+  const [running, quota, rights, templateResponse] = await Promise.all([
+    requestJson(`/dw-server/work/get_user_running_works/${encodeURIComponent(auth.accountId)}`),
+    requestJson(`/dw-server/face/get_batch_times?user_id=${encodeURIComponent(auth.userId)}&account_id=${encodeURIComponent(auth.accountId)}&work_type=AVATAR_VIDEO`),
+    post('/df-subscribe/subscribe/get_user_rights', { userId: auth.userId, accountId: auth.accountId }),
+    requestJson('/dw-server/sys_config/query/template_config'),
+  ]);
+  let config = {};
+  try {
+    const raw = templateResponse?.data?.value;
+    config = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});
+  } catch {}
+  const audioLimit = config.audioLimit || {};
+  const tier = rights.vipLabel ? (rights.vipLevel === 'normal' ? 'pro' : 'premium') : 'free';
+  const maxDurationSeconds = Number(audioLimit[tier]);
+  if (!Number.isFinite(maxDurationSeconds) || maxDurationSeconds <= 0) {
+    throw new Error(`DreamFace audioLimit.${tier} unavailable`);
+  }
+  const quotaData = quota.data || {};
+  const quotaTotal = Number(quotaData.total_times);
+  const quotaRemaining = Number(quotaData.remaining_times);
+  return {
+    accountId: auth.accountId,
+    ok: true,
+    runningWorks: Array.isArray(running.data) ? running.data.length : 0,
+    quota: {
+      total: Number.isFinite(quotaTotal) && quotaTotal >= 0 ? quotaTotal : null,
+      remaining: Number.isFinite(quotaRemaining) && quotaRemaining >= 0 ? quotaRemaining : null,
+    },
+    maxDurationSeconds,
+    planName: tier === 'premium' ? 'Premium' : (tier === 'pro' ? 'Pro' : 'Free'),
+    durationSource: 'dreamface-api',
+    vipLevel: rights.vipLevel || '',
+    audioLimit: {
+      free: Number(audioLimit.free || 0),
+      pro: Number(audioLimit.pro || 0),
+      premium: Number(audioLimit.premium || 0),
+    },
+  };
+}
+
+function canonicalizeAccounts(accounts) {
+  const byPrincipal = new Map();
+  for (const source of Array.isArray(accounts) ? accounts : []) {
+    const identity = getAccountIdentity(source);
+    if (!identity.principalKey) continue;
+    const account = { ...source, ...identity };
+    const current = byPrincipal.get(identity.principalKey);
+    if (!current || Number(account.capturedAt || 0) >= Number(current.capturedAt || 0)) {
+      byPrincipal.set(identity.principalKey, account);
+    }
+  }
+  return [...byPrincipal.values()];
+}
 
 function savePaddedVideoMarker(source, borderCropPx) {
   paddedVideoMarkerWrite = paddedVideoMarkerWrite.catch(() => {}).then(async () => {
@@ -142,6 +271,7 @@ function sanitizeFileNameForDownload(name) {
 function createIdleRunState() {
   return {
     phase: 'idle',
+    mode: 'legacy',
     runId: null,
     tabId: null,
     total: 0,
@@ -175,6 +305,7 @@ function createIdleRunState() {
     recoverable: false,
     interruptionReason: '',
     queuePlan: [],
+    bulkContext: null,
     nextTaskIndex: 0,
     downloadPlan: {
       expectedFileNames: [],
@@ -232,6 +363,7 @@ const DM_NETWORK_CONCURRENCY = 6;
 const DM_MAX_ATTEMPTS = 3;
 const DM_PERSIST_THROTTLE_MS = 300;
 const DM_HEARTBEAT_ALARM = 'dm-heartbeat';
+const DM_RETRY_ALARM = 'dm-retry';
 const DM_RETRY_BACKOFF_BASE_MS = 1500;
 
 // in-memory state: workId → entry
@@ -249,6 +381,9 @@ function dmCreateEntry(item) {
   const now = Date.now();
   return {
     workId: String(item.workId),
+    runId: item.runId || '',
+    accountId: item.accountId || '',
+    watchUnitId: item.watchUnitId || '',
     url: item.url || '',
     fileName: item.fileName || '',
     audioFileName: item.audioFileName || '',
@@ -256,7 +391,6 @@ function dmCreateEntry(item) {
     audioMs: Number.isFinite(item.audioMs) ? Number(item.audioMs) : null,
     videoMs: Number.isFinite(item.videoMs) ? Number(item.videoMs) : null,
     hasChapters: Boolean(item.hasChapters),
-    borderCropPx: Math.max(0, Math.floor(Number(item.borderCropPx) || 0)),
     status: 'queued',
     error: '',
     attempts: 0,
@@ -266,6 +400,7 @@ function dmCreateEntry(item) {
     createdAt: now,
     updatedAt: now,
     completedAt: null,
+    nextRetryAt: null,
   };
 }
 
@@ -274,7 +409,8 @@ function dmIsTerminal(status) {
 }
 
 function dmIsActive(status) {
-  return status === 'fetching' || status === 'muxing' || status === 'saving' || status === 'queued';
+  return status === 'fetching' || status === 'muxing' || status === 'saving'
+    || status === 'queued' || status === 'retry_wait';
 }
 
 async function dmLoad() {
@@ -292,7 +428,10 @@ async function dmLoad() {
         if (entry.completedAt && now - entry.completedAt > DM_TTL_MS) continue;
         if (!entry.completedAt && now - (entry.updatedAt || entry.createdAt || 0) > DM_TTL_MS) continue;
         // saving с downloadId проверит recovery scan; остальные незавершённые операции прерваны.
-        if (entry.status === 'fetching' || entry.status === 'muxing' || entry.status === 'queued'
+        if (entry.status === 'queued') {
+          entry.updatedAt = now;
+          if (!dmQueue.includes(String(workId))) dmQueue.push(String(workId));
+        } else if (entry.status === 'fetching' || entry.status === 'muxing'
           || (entry.status === 'saving' && !entry.downloadId)) {
           entry.status = 'interrupted';
           entry.error = entry.error || 'SW restarted';
@@ -355,7 +494,7 @@ function dmUpdateEntry(workId, patch) {
 function dmUpdateKeepAlive() {
   let hasActive = false;
   for (const entry of dmEntries.values()) {
-    if (dmIsActive(entry.status)) { hasActive = true; break; }
+    if (dmIsActive(entry.status) && entry.status !== 'retry_wait') { hasActive = true; break; }
   }
   if (hasActive && !dmKeepAliveActive) {
     dmKeepAliveActive = true;
@@ -368,10 +507,92 @@ function dmUpdateKeepAlive() {
   }
 }
 
+async function dmScheduleRetryAlarm() {
+  let nextRetryAt = Infinity;
+  for (const entry of dmEntries.values()) {
+    if (entry.status !== 'retry_wait') continue;
+    const retryAt = Number(entry.nextRetryAt);
+    if (Number.isFinite(retryAt) && retryAt > 0) nextRetryAt = Math.min(nextRetryAt, retryAt);
+  }
+  if (!Number.isFinite(nextRetryAt)) {
+    await chrome.alarms.clear(DM_RETRY_ALARM);
+    return;
+  }
+  await chrome.alarms.create(DM_RETRY_ALARM, { when: Math.max(Date.now(), nextRetryAt) });
+}
+
+async function dmRecoverRetries() {
+  const now = Date.now();
+  let recovered = 0;
+  for (const entry of dmEntries.values()) {
+    if (entry.status !== 'retry_wait') continue;
+    const retryAt = Number(entry.nextRetryAt);
+    if (Number.isFinite(retryAt) && retryAt > now) continue;
+    entry.status = 'queued';
+    entry.nextRetryAt = null;
+    entry.updatedAt = now;
+    if (!dmQueue.includes(entry.workId)) dmQueue.push(entry.workId);
+    recovered++;
+  }
+  if (recovered > 0) await dmPersistNow();
+  await dmScheduleRetryAlarm();
+  dmUpdateKeepAlive();
+  dmTick();
+}
+
+function isAllowedDownloadUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.username || url.password || (url.port && url.port !== '443')) return false;
+    const host = url.hostname.toLowerCase();
+    return host === 'dreamfaceapp.com' || host.endsWith('.dreamfaceapp.com')
+      || host === 'aliyuncs.com' || host.endsWith('.aliyuncs.com');
+  } catch {
+    return false;
+  }
+}
+
+async function getBulkWatchUnitsFromStorage() {
+  const stored = await chrome.storage.local.get(BULK_WATCH_STORAGE_KEY);
+  const units = stored[BULK_WATCH_STORAGE_KEY];
+  if (units !== undefined && !Array.isArray(units)) {
+    throw new Error('stored bulk watch units are malformed');
+  }
+  return units || [];
+}
+
+async function syncBulkWatchAlarm(units = null) {
+  const currentUnits = units || await getBulkWatchUnitsFromStorage();
+  if (currentUnits.some((unit) => unit?.status === 'pending')) {
+    const alarm = await chrome.alarms.get(BULK_WATCH_ALARM);
+    if (!alarm) await chrome.alarms.create(BULK_WATCH_ALARM, { periodInMinutes: 1 });
+    return true;
+  }
+  await chrome.alarms.clear(BULK_WATCH_ALARM);
+  return false;
+}
+
+async function handleBulkWatchAlarm() {
+  const units = await getBulkWatchUnitsFromStorage();
+  if (!await syncBulkWatchAlarm(units)) return;
+  await forwardToOffscreen({ action: 'bulkWatcherTick' });
+}
+
 if (chrome.alarms?.onAlarm) {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm?.name === DM_HEARTBEAT_ALARM) {
       // просто будит SW, ничего не делаем
+    }
+    if (alarm?.name === DM_RETRY_ALARM) {
+      dmLoad().then(dmRecoverRetries).catch((error) => {
+        console.error('[dm] retry alarm failed:', error.message || String(error));
+      });
+    }
+    if (alarm?.name === BULK_WATCH_ALARM) {
+      handleBulkWatchAlarm().catch((error) => {
+        console.error('[bg] bulk watcher tick failed:', error.message || String(error));
+      });
     }
   });
 }
@@ -379,6 +600,18 @@ if (chrome.alarms?.onAlarm) {
 async function dmEnqueue(items) {
   await dmLoad();
   if (!Array.isArray(items) || items.length === 0) return { ok: true, accepted: 0, skipped: 0 };
+
+  const invalidItemIndex = items.findIndex((item) => (
+    !item || typeof item !== 'object' || Array.isArray(item)
+    || !['string', 'number'].includes(typeof item.workId)
+    || (typeof item.workId === 'number' && !Number.isFinite(item.workId))
+    || !String(item.workId).trim()
+    || !isAllowedDownloadUrl(item.url)
+  ));
+  if (invalidItemIndex !== -1) {
+    dmLog('bg', 'warn', 'dm.enqueue rejected malformed item', { index: invalidItemIndex });
+    return { ok: false, accepted: 0, skipped: items.length, error: `invalid download item at index ${invalidItemIndex}` };
+  }
 
   dmLog('bg', 'log', 'dm.enqueue items=', items.length, items.map((i) => ({ workId: i.workId, hasChapters: i.hasChapters, name: i.audioFileName || i.workName, url: (i.url || '').slice(0, 80) })));
   let accepted = 0;
@@ -388,13 +621,11 @@ async function dmEnqueue(items) {
     const workId = String(item?.workId || '').trim();
     if (!workId) { skipped++; continue; }
     const existing = dmEntries.get(workId);
-    const requestedBorderCropPx = Math.max(0, Math.floor(Number(item.borderCropPx) || 0));
     const processingChanged = existing && (
       Boolean(existing.hasChapters) !== Boolean(item.hasChapters)
-      || Math.max(0, Math.floor(Number(existing.borderCropPx) || 0)) !== requestedBorderCropPx
     );
     if (existing && existing.status === 'done' && !processingChanged) {
-      // Идентичный результат уже скачан. Изменившийся crop/chapter режим создаёт
+      // Идентичный результат уже скачан. Изменившийся chapter режим создаёт
       // новый download того же workId с актуальной обработкой.
       skipped++;
       continue;
@@ -413,15 +644,15 @@ async function dmEnqueue(items) {
       // reuse + reset
       entry = existing;
       entry.url = item.url || entry.url;
+      entry.runId = item.runId || entry.runId || '';
+      entry.accountId = item.accountId || entry.accountId || '';
+      entry.watchUnitId = item.watchUnitId || entry.watchUnitId || '';
       entry.fileName = item.fileName || entry.fileName;
       entry.audioFileName = item.audioFileName || entry.audioFileName;
       entry.workName = item.workName || entry.workName;
       if (Number.isFinite(item.audioMs)) entry.audioMs = Number(item.audioMs);
       if (Number.isFinite(item.videoMs)) entry.videoMs = Number(item.videoMs);
       entry.hasChapters = Boolean(item.hasChapters);
-      if (Number.isFinite(Number(item.borderCropPx))) {
-        entry.borderCropPx = Math.max(0, Math.floor(Number(item.borderCropPx)));
-      }
       entry.status = 'queued';
       entry.error = '';
       entry.attempts = 0;
@@ -429,6 +660,7 @@ async function dmEnqueue(items) {
       entry.savedAs = '';
       entry.bytes = 0;
       entry.completedAt = null;
+      entry.nextRetryAt = null;
       entry.updatedAt = Date.now();
     } else {
       entry = dmCreateEntry(item);
@@ -441,6 +673,7 @@ async function dmEnqueue(items) {
   dmSchedulePersist();
   dmUpdateKeepAlive();
   dmTick();
+  await dmPersistNow();
   return { ok: true, accepted, skipped };
 }
 
@@ -457,6 +690,7 @@ async function dmRetry(workId) {
       entry.savedAs = '';
       entry.bytes = 0;
       entry.completedAt = null;
+      entry.nextRetryAt = null;
       entry.updatedAt = Date.now();
       dmQueue.push(entry.workId);
       retried = 1;
@@ -471,6 +705,7 @@ async function dmRetry(workId) {
         entry.savedAs = '';
         entry.bytes = 0;
         entry.completedAt = null;
+        entry.nextRetryAt = null;
         entry.updatedAt = Date.now();
         dmQueue.push(entry.workId);
         retried++;
@@ -486,6 +721,7 @@ async function dmRetry(workId) {
 function dmRemoveEntry(workId) {
   dmEntries.delete(String(workId));
   dmSchedulePersist();
+  dmScheduleRetryAlarm().catch(() => {});
 }
 
 function dmClearCompleted() {
@@ -541,14 +777,12 @@ function dmComputeFileName(entry) {
 async function dmProcess(entry) {
   const useChapters = entry.hasChapters && Number.isFinite(entry.audioMs)
     && Number.isFinite(entry.videoMs) && entry.videoMs > 0 && entry.audioMs > entry.videoMs;
-  const cropLeftPx = Math.max(0, Math.floor(Number(entry.borderCropPx) || 0));
-  const requiresProcessing = useChapters || cropLeftPx > 0;
+  const requiresProcessing = useChapters;
 
   dmLog('bg', 'log', 'dm.process start', {
     workId: entry.workId,
     name: entry.audioFileName || entry.workName,
     hasChapters: entry.hasChapters,
-    cropLeftPx,
     path: requiresProcessing ? 'processed' : 'direct',
   });
 
@@ -568,7 +802,6 @@ async function dmProcess(entry) {
           audioMs: entry.audioMs,
           videoMs: entry.videoMs,
           hasChapters: useChapters,
-          cropLeftPx,
         },
       });
 
@@ -597,7 +830,6 @@ async function dmProcess(entry) {
         workId: entry.workId,
         fileName,
         chapters: chaptersMade,
-        cropped: Boolean(muxResp.transformed),
       });
     } else {
       // ===== direct path: отдаём прямой OSS URL в chrome.downloads =====
@@ -644,18 +876,23 @@ async function dmProcess(entry) {
     if (!isUserCanceled && entry.attempts < DM_MAX_ATTEMPTS) {
       // backoff
       const delay = DM_RETRY_BACKOFF_BASE_MS * entry.attempts;
-      dmUpdateEntry(entry.workId, { status: 'queued', downloadId: null, error: errMsg });
-      setTimeout(() => {
-        // повторно ставим в очередь, если за это время ничего не сделали
-        const e = dmEntries.get(entry.workId);
-        if (e && e.status === 'queued') {
-          dmQueue.push(entry.workId);
-          dmUpdateKeepAlive();
-          dmTick();
-        }
-      }, delay);
+      const nextRetryAt = Date.now() + delay;
+      dmUpdateEntry(entry.workId, {
+        status: 'retry_wait',
+        downloadId: null,
+        error: errMsg,
+        nextRetryAt,
+      });
+      await dmPersistNow();
+      await dmScheduleRetryAlarm();
     } else {
-      dmUpdateEntry(entry.workId, { status: 'failed', error: errMsg, completedAt: Date.now() });
+      dmUpdateEntry(entry.workId, {
+        status: 'failed',
+        error: errMsg,
+        completedAt: Date.now(),
+        nextRetryAt: null,
+      });
+      await dmScheduleRetryAlarm();
     }
   } finally {
     // освобождаем blob:URL в offscreen — chrome.downloads уже забрал данные
@@ -763,6 +1000,7 @@ async function dmRecoveryScan() {
   }
   dmSchedulePersist();
   dmUpdateKeepAlive();
+  await dmRecoverRetries();
 }
 
 function dmWatchRecoveredDownload(entry, blobUrlToRevoke = '') {
@@ -891,6 +1129,26 @@ async function ensureCreationsTab() {
     status: tab.status,
     discarded: Boolean(tab.discarded),
   };
+}
+
+async function findBulkTab() {
+  if (bulkRelayTabId) {
+    let pinned = await chrome.tabs.get(bulkRelayTabId).catch(() => null);
+    if (pinned && pinned.url?.includes('#dreamface-extension-relay')) {
+      if (pinned.discarded) {
+        pinned = await chrome.tabs.reload(pinned.id).then(() => chrome.tabs.get(pinned.id)).catch(() => null);
+      }
+      if (pinned) return waitForTabComplete(pinned.id);
+    }
+    bulkRelayTabId = null;
+  }
+  const tabs = await chrome.tabs.query({ url: DREAMFACE_URL_PATTERNS });
+  let tab = tabs.find((item) => item.url?.includes('#dreamface-extension-relay')) || null;
+  if (!tab) tab = await chrome.tabs.create({ url: BULK_RELAY_URL, active: false });
+  tab = await waitForTabComplete(tab.id);
+  if (!DREAMFACE_RELAY_PATH_RE.test(tab.url || '')) return null;
+  bulkRelayTabId = tab.id;
+  return tab;
 }
 
 // =========================================================================
@@ -1035,6 +1293,256 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return;
       }
 
+      // ============ BULK RELAY actions (offscreen -> avatar-bulk tab) ============
+      case 'dfBulkOp': {
+        const tab = await findBulkTab();
+        if (!tab) { sendResponse({ ok: false, error: 'DreamFace avatar or creation tab not found' }); return; }
+        sendResponse(await sendPageAction(tab.id, 'dfBulkOp', { op: request.op, payload: request.payload }));
+        return;
+      }
+
+      case 'dfCaptureAccount': {
+        const tab = await findBulkTab();
+        if (!tab) { sendResponse({ ok: false, error: 'DreamFace avatar or creation tab not found' }); return; }
+        sendResponse(await sendPageAction(tab.id, 'dfCaptureAccount', {}));
+        return;
+      }
+
+      case 'dfSaveAccount': {
+        const account = { ...(request.account || {}), ...getAccountIdentity(request.account || {}) };
+        if (!account.accountId || !account.sessionRaw || !account.clientId) {
+          sendResponse({ ok: false, error: 'account session is incomplete' });
+          return;
+        }
+        const stored = await chrome.storage.local.get(DREAMFACE_ACCOUNTS_KEY);
+        const accounts = Array.isArray(stored[DREAMFACE_ACCOUNTS_KEY]) ? stored[DREAMFACE_ACCOUNTS_KEY] : [];
+        const existing = canonicalizeAccounts(accounts).find((item) => item.principalKey === account.principalKey);
+        const next = accounts.filter((item) => {
+          const identity = getAccountIdentity(item);
+          return identity.accountId !== account.accountId && identity.principalKey !== account.principalKey;
+        });
+        next.push({
+          ...account,
+          ...(existing?.durationSource === 'manual' && account.durationSource !== 'dreamface-api' ? {
+            maxDurationSeconds: existing.maxDurationSeconds,
+            durationSource: 'manual',
+          } : {}),
+          capturedAt: Date.now(),
+        });
+        await chrome.storage.local.set({ [DREAMFACE_ACCOUNTS_KEY]: next });
+        sendResponse({ ok: true, accounts: canonicalizeAccounts(next) });
+        return;
+      }
+
+      case 'dfListAccounts': {
+        const stored = await chrome.storage.local.get(DREAMFACE_ACCOUNTS_KEY);
+        sendResponse({ ok: true, accounts: canonicalizeAccounts(stored[DREAMFACE_ACCOUNTS_KEY]) });
+        return;
+      }
+
+      case 'dfGetAccountSession': {
+        const stored = await chrome.storage.local.get(DREAMFACE_ACCOUNTS_KEY);
+        const accounts = Array.isArray(stored[DREAMFACE_ACCOUNTS_KEY]) ? stored[DREAMFACE_ACCOUNTS_KEY] : [];
+        const exact = accounts.find((item) => getAccountIdentity(item).accountId === request.accountId) || null;
+        const principalKey = exact ? getAccountIdentity(exact).principalKey : request.principalKey;
+        const canonical = principalKey
+          ? canonicalizeAccounts(accounts).find((item) => item.principalKey === principalKey)
+          : null;
+        const account = canonical || exact || null;
+        sendResponse(account
+          ? { ok: true, account: { ...account, ...getAccountIdentity(account) }, canonicalAccount: canonical || null }
+          : { ok: false, error: 'account session not found' });
+        return;
+      }
+
+      case 'dfRemoveAccount': {
+        const stored = await chrome.storage.local.get(DREAMFACE_ACCOUNTS_KEY);
+        const accounts = Array.isArray(stored[DREAMFACE_ACCOUNTS_KEY]) ? stored[DREAMFACE_ACCOUNTS_KEY] : [];
+        const targetPrincipal = request.principalKey
+          || getAccountIdentity(accounts.find((item) => item.accountId === request.accountId) || {}).principalKey;
+        const next = accounts.filter((item) => getAccountIdentity(item).principalKey !== targetPrincipal);
+        await chrome.storage.local.set({ [DREAMFACE_ACCOUNTS_KEY]: next });
+        sendResponse({ ok: true, accounts: canonicalizeAccounts(next) });
+        return;
+      }
+
+      case 'dfUpdateAccount': {
+        const stored = await chrome.storage.local.get(DREAMFACE_ACCOUNTS_KEY);
+        const accounts = Array.isArray(stored[DREAMFACE_ACCOUNTS_KEY]) ? stored[DREAMFACE_ACCOUNTS_KEY] : [];
+        const next = accounts.map((item) => (
+          (request.principalKey && getAccountIdentity(item).principalKey === request.principalKey)
+          || item.accountId === request.accountId
+        )
+          ? {
+            ...item,
+            maxDurationSeconds: [30, 180, 600].includes(Number(request.maxDurationSeconds))
+              ? Number(request.maxDurationSeconds)
+              : 180,
+            durationSource: 'manual',
+          }
+          : item);
+        await chrome.storage.local.set({ [DREAMFACE_ACCOUNTS_KEY]: next });
+        sendResponse({ ok: true, accounts: canonicalizeAccounts(next) });
+        return;
+      }
+
+      case 'dfGetAvatarCache': {
+        const stored = await chrome.storage.local.get(AVATAR_CACHE_KEY);
+        const cache = stored[AVATAR_CACHE_KEY] || {};
+        const key = JSON.stringify([request.videoUrl, request.accountId]);
+        const entry = cache[key];
+        sendResponse({ ok: true, avatarId: entry?.avatarId || null });
+        return;
+      }
+
+      case 'dfSetAvatarCache': {
+        const stored = await chrome.storage.local.get(AVATAR_CACHE_KEY);
+        const cache = stored[AVATAR_CACHE_KEY] || {};
+        const key = JSON.stringify([request.videoUrl, request.accountId]);
+        cache[key] = { avatarId: request.avatarId, registeredAt: Date.now() };
+        const entries = Object.entries(cache);
+        if (entries.length > AVATAR_CACHE_LIMIT) {
+          entries.sort((a, b) => (a[1].registeredAt || 0) - (b[1].registeredAt || 0));
+          for (let i = 0; i < entries.length - AVATAR_CACHE_LIMIT; i += 1) delete cache[entries[i][0]];
+        }
+        await chrome.storage.local.set({ [AVATAR_CACHE_KEY]: cache });
+        sendResponse({ ok: true });
+        return;
+      }
+
+      case 'dfDeleteAvatarCache': {
+        const stored = await chrome.storage.local.get(AVATAR_CACHE_KEY);
+        const cache = stored[AVATAR_CACHE_KEY] || {};
+        const key = JSON.stringify([request.videoUrl, request.accountId]);
+        delete cache[key];
+        await chrome.storage.local.set({ [AVATAR_CACHE_KEY]: cache });
+        sendResponse({ ok: true });
+        return;
+      }
+
+      case 'dfClearAvatarCache': {
+        await chrome.storage.local.set({ [AVATAR_CACHE_KEY]: {} });
+        sendResponse({ ok: true });
+        return;
+      }
+
+      case 'dfGetBulkWatchUnits': {
+        const stored = await chrome.storage.local.get(BULK_WATCH_STORAGE_KEY);
+        const storedUnits = stored[BULK_WATCH_STORAGE_KEY];
+        if (storedUnits !== undefined && !Array.isArray(storedUnits)) {
+          sendResponse({ ok: false, error: 'stored bulk watch units are malformed' });
+          return;
+        }
+        const units = storedUnits || [];
+        console.log('[bg] dfGetBulkWatchUnits →', units.length, 'units');
+        sendResponse({ ok: true, units });
+        return;
+      }
+
+      case 'dfUpsertBulkWatchUnit': {
+        if (!request.unit?.id) {
+          sendResponse({ ok: false, error: 'bulk watch unit id is required' });
+          return;
+        }
+        const next = await withBulkWatchMutation(async () => {
+          const stored = await chrome.storage.local.get(BULK_WATCH_STORAGE_KEY);
+          const storedUnits = stored[BULK_WATCH_STORAGE_KEY];
+          if (storedUnits !== undefined && !Array.isArray(storedUnits)) {
+            throw new Error('stored bulk watch units are malformed');
+          }
+          const units = storedUnits || [];
+          const updated = units.filter((unit) => unit.id !== request.unit.id);
+          updated.push(request.unit);
+          await chrome.storage.local.set({ [BULK_WATCH_STORAGE_KEY]: updated });
+          await syncBulkWatchAlarm(updated);
+          return updated;
+        });
+        console.log('[bg] dfUpsertBulkWatchUnit ←', request.unit.id, '| total:', next.length);
+        sendResponse({ ok: true, units: next });
+        return;
+      }
+
+      case 'dfRemoveBulkWatchUnit': {
+        const next = await withBulkWatchMutation(async () => {
+          const stored = await chrome.storage.local.get(BULK_WATCH_STORAGE_KEY);
+          const storedUnits = stored[BULK_WATCH_STORAGE_KEY];
+          if (storedUnits !== undefined && !Array.isArray(storedUnits)) {
+            throw new Error('stored bulk watch units are malformed');
+          }
+          const units = storedUnits || [];
+          const updated = units.filter((unit) => unit.id !== request.id);
+          await chrome.storage.local.set({ [BULK_WATCH_STORAGE_KEY]: updated });
+          await syncBulkWatchAlarm(updated);
+          return updated;
+        });
+        console.log('[bg] dfRemoveBulkWatchUnit ←', request.id, '| total:', next.length);
+        sendResponse({ ok: true, units: next });
+        return;
+      }
+
+      case 'dfPatchBulkWatchUnits': {
+        if (!Array.isArray(request.units)) {
+          sendResponse({ ok: false, error: 'bulk watch unit patches must be an array' });
+          return;
+        }
+        const next = await withBulkWatchMutation(async () => {
+          const stored = await chrome.storage.local.get(BULK_WATCH_STORAGE_KEY);
+          const storedUnits = stored[BULK_WATCH_STORAGE_KEY];
+          if (storedUnits !== undefined && !Array.isArray(storedUnits)) {
+            throw new Error('stored bulk watch units are malformed');
+          }
+          const patchById = new Map(request.units.filter((unit) => unit?.id).map((unit) => [unit.id, unit]));
+          const updated = (storedUnits || []).map((unit) => patchById.get(unit.id) || unit);
+          await chrome.storage.local.set({ [BULK_WATCH_STORAGE_KEY]: updated });
+          await syncBulkWatchAlarm(updated);
+          return updated;
+        });
+        console.log('[bg] dfPatchBulkWatchUnits ←', request.units.length, 'patches | total:', next.length, '| watcher:', request.units.map((unit) => ({
+          id: unit.id,
+          accountId: unit.accountId,
+          scanned: unit.watcherStats?.scanned || 0,
+          matched: unit.watcherStats?.matched || 0,
+          statuses: unit.watcherStats?.statuses || {},
+          ready: unit.watcherStats?.ready || 0,
+          urls: `${unit.watcherStats?.receivedUrls || 0}/${unit.watcherStats?.requestedUrls || 0}`,
+          enqueued: unit.enqueuedWorkIds?.length || 0,
+          error: unit.lastError || '',
+        })));
+        sendResponse({ ok: true, units: next });
+        return;
+      }
+
+      case 'dfDiagnoseAccounts': {
+        const stored = await chrome.storage.local.get(DREAMFACE_ACCOUNTS_KEY);
+        const accounts = canonicalizeAccounts(stored[DREAMFACE_ACCOUNTS_KEY]);
+        if (accounts.length === 0) {
+          sendResponse({ ok: false, error: 'сохранённых аккаунтов нет' });
+          return;
+        }
+        const diagnostics = [];
+        for (let index = 0; index < accounts.length; index += 2) {
+          const chunk = accounts.slice(index, index + 2);
+          const chunkResults = await Promise.all(chunk.map(async (account) => {
+            try {
+              return await diagnoseStoredAccount(account);
+            } catch (error) {
+              const message = error?.name === 'AbortError' ? 'DreamFace request timed out' : (error.message || String(error));
+              return { accountId: account.accountId, ok: false, error: message };
+            }
+          }));
+          diagnostics.push(...chunkResults);
+          }
+        sendResponse({ ok: true, diagnostics });
+        return;
+      }
+
+      case 'dfSwitchAccount': {
+        const tab = await findBulkTab();
+        if (!tab) { sendResponse({ ok: false, error: 'DreamFace avatar or creation tab not found' }); return; }
+        sendResponse(await sendPageAction(tab.id, 'dfSwitchAccount', { session: request.session }));
+        return;
+      }
+
       // ============ DOWNLOAD MANAGER actions ============
 
       case 'dm.enqueue': {
@@ -1140,16 +1648,19 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   if (details?.reason === 'install') {
     await persistRunState(createIdleRunState());
   }
-  await ensureOffscreenDocument().catch(() => {});
   await dmLoad();
   await dmRecoveryScan();
+  await syncBulkWatchAlarm().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(async () => {
-  ensureOffscreenDocument().catch(() => {});
   await dmLoad();
   await dmRecoveryScan();
+  await syncBulkWatchAlarm().catch(() => {});
 });
 
 // Eager recovery also covers service-worker restarts inside a Chrome session.
-dmLoad().then(dmRecoveryScan).catch(() => {});
+dmLoad().then(async () => {
+  await dmRecoveryScan();
+  await syncBulkWatchAlarm();
+}).catch(() => {});

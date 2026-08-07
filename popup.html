@@ -1685,6 +1685,135 @@
         transition: none;
       }
     }
+
+    .monitor-card {
+      padding: 16px;
+    }
+
+    .monitor-status {
+      display: flex;
+      align-items: flex-start;
+      gap: 9px;
+      margin-bottom: 14px;
+    }
+
+    .monitor-status-copy {
+      min-width: 0;
+    }
+
+    .monitor-title {
+      margin: 0;
+      font-size: 16px;
+      line-height: 1.35;
+      font-weight: 650;
+      letter-spacing: -0.01em;
+    }
+
+    .monitor-phase {
+      margin: 2px 0 0;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .monitor-progress-copy {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 7px;
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stage-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1px;
+      margin: 16px 0 4px;
+      overflow: hidden;
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.07);
+    }
+
+    .stage-item {
+      min-width: 0;
+      padding: 10px;
+      background: var(--surface);
+    }
+
+    .stage-value {
+      display: block;
+      font-size: 19px;
+      line-height: 1.1;
+      font-weight: 650;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stage-label {
+      display: block;
+      margin-top: 3px;
+      color: var(--text-tertiary);
+      font-size: 10.5px;
+      line-height: 1.25;
+    }
+
+    .stage-item.is-error .stage-value {
+      color: var(--error, #b3261e);
+    }
+
+    .account-progress {
+      margin-top: 16px;
+      border-top: 1px solid rgba(0, 0, 0, 0.07);
+    }
+
+    .account-progress-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 4px 12px;
+      padding: 10px 0;
+      border-bottom: 1px solid rgba(0, 0, 0, 0.07);
+    }
+
+    .account-progress-name {
+      overflow: hidden;
+      color: var(--text-primary);
+      font-size: 12px;
+      font-weight: 600;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .account-progress-counts {
+      color: var(--text-secondary);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .account-progress-error {
+      grid-column: 1 / -1;
+      overflow: hidden;
+      color: var(--error, #b3261e);
+      font-size: 11px;
+      line-height: 1.35;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .monitor-actions-stack {
+      flex-direction: row;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }
+
+    .monitor-actions-stack .btn {
+      min-width: 0;
+    }
+
+    @media (max-width: 360px) {
+      .stage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .monitor-actions-stack { flex-direction: column; }
+    }
   </style>
 </head>
 <body>
@@ -1695,8 +1824,8 @@
         <section class="surface intro-surface" aria-labelledby="setupScanTitle">
           <div class="surface-topline">
             <div class="surface-heading">
-              <h2 id="setupScanTitle" class="surface-title">Сканирование</h2>
-              <div id="statusText" class="status-text">Сканируйте страницу DreamFace, чтобы подхватить превью и собрать очередь.</div>
+              <h2 id="setupScanTitle" class="surface-title">Bulk-очередь</h2>
+              <div id="statusText" class="status-text">Сканируйте библиотеку DreamFace, выберите видео для групп и добавьте аудио.</div>
             </div>
 
             <div class="toolbar-actions">
@@ -1721,13 +1850,27 @@
               <div class="toggle-subtitle" id="addBorderSubtitle">вкл. загружает в DreamFace видео с полосой слева</div>
             </div>
             <label class="toggle-switch">
-              <input id="addBorderToggle" type="checkbox" checked aria-label="Добавить защитную полосу 64 пикселя при загрузке">
+                  <input id="addBorderToggle" type="checkbox" aria-label="Добавить защитную полосу 64 пикселя при загрузке">
               <span class="toggle-slider"></span>
             </label>
           </div>
         </section>
 
         <div id="postScanContainer" class="container post-scan">
+          <section class="surface" aria-labelledby="accountsTitle">
+            <div class="surface-topline">
+              <div class="surface-heading">
+                <h2 id="accountsTitle" class="surface-title">Аккаунты DreamFace</h2>
+                <div class="surface-caption">Сохраните текущий вход. Движок выберет аккаунт с наименьшим числом активных работ.</div>
+              </div>
+              <div class="toolbar-actions">
+                <button id="diagnoseAccountsBtn" type="button" class="mini-btn">проверить</button>
+                <button id="captureAccountBtn" type="button" class="mini-btn">сохранить текущий</button>
+              </div>
+            </div>
+            <div id="accountsList" class="audio-list"><div class="empty-state">сохранённых аккаунтов нет — используется текущий вход</div></div>
+          </section>
+
           <section class="surface groups-surface">
             <div id="batchesList"></div>
             <button id="addBatchBtn" class="dashed-btn">
@@ -1774,24 +1917,13 @@
                 </label>
               </div>
 
-              <div class="toggle-row">
+              <div class="toggle-row" hidden aria-hidden="true">
                 <div class="toggle-copy">
                   <div class="toggle-title">Pre-loop видео под аудио</div>
                   <div class="toggle-subtitle" id="preLoopSubtitle">локально склеивает видео встык (forward only) под длительность самого длинного аудио в группе, без реверса. результат заливается как новый источник на dreamface.</div>
                 </div>
                 <label class="toggle-switch">
                   <input id="preLoopToggle" type="checkbox">
-                  <span class="toggle-slider"></span>
-                </label>
-              </div>
-
-              <div class="toggle-row">
-                <div class="toggle-copy">
-                  <div class="toggle-title">Убирать защитную полосу</div>
-                  <div class="toggle-subtitle" id="removeBorderSubtitle">вкл. обрезает только видео с добавленной полосой при скачивании</div>
-                </div>
-                <label class="toggle-switch">
-                  <input id="removeBorderToggle" type="checkbox" checked aria-label="Убирать защитную полосу при скачивании">
                   <span class="toggle-slider"></span>
                 </label>
               </div>
@@ -1815,99 +1947,39 @@
         </div>
       </div>
 
-      <div id="monitor-view" class="view-container" aria-labelledby="monitorFileName">
+      <div id="monitor-view" class="view-container" aria-labelledby="monitorTitle">
         <div class="container">
           <section class="monitor-card">
-            <!-- главный фокус: cколько готово / всего -->
-            <div class="monitor-headline">
-              <span class="monitor-headline-num" id="monitorHeadlineNum">0</span>
-              <span class="monitor-headline-of" id="monitorHeadlineOf">из 0</span>
-            </div>
-
-            <!-- статус: фаза + текущая группа -->
-            <div class="monitor-phase-line">
+            <div class="monitor-status" aria-live="polite">
               <span class="phase-dot" id="monitorPhaseDot" aria-hidden="true"></span>
-              <span class="monitor-phase" id="monitorPhase">ожидание</span>
+              <div class="monitor-status-copy">
+                <h2 class="monitor-title" id="monitorTitle">Подготовка очереди</h2>
+                <p class="monitor-phase" id="monitorPhase">ожидание</p>
+              </div>
             </div>
-
-            <!-- прогресс-бар -->
-            <div class="progress-track">
+            <div id="monitorPreparation">
+              <div class="monitor-progress-copy">
+                <span id="monitorProgressLabel">Подготовка</span>
+                <span id="monitorProgressText">0 / 0</span>
+              </div>
+              <div class="progress-track">
               <div class="progress-fill" id="monitorProgressFill"></div>
+              </div>
+              <p class="monitor-file" id="monitorFileName" title=""></p>
             </div>
-
-            <!-- имя текущего файла (мелко, под прогрессом) -->
-            <p class="monitor-file" id="monitorFileName" title=""></p>
-
-            <!-- алерт (восстановление и пр.) -->
-            <div id="monitorAlert" class="monitor-alert" aria-live="polite"></div>
-
-            <!-- действия: stack -->
+            <div id="monitorStages" class="stage-grid" aria-label="Этапы текущего запуска"></div>
+            <div id="monitorAccounts" class="account-progress" aria-label="Прогресс по аккаунтам"></div>
+            <div id="monitorError" class="monitor-alert" aria-live="polite"></div>
             <div class="monitor-actions-stack">
               <button id="stopBtn" class="btn btn-surface btn-block">
                 <svg class="solar-icon" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
                 остановить
               </button>
               <button id="resumeBtn" class="btn btn-surface btn-block" style="display:none;">возобновить</button>
-              <button id="creationsBtn" class="btn btn-surface btn-block" style="display:none;">проверить результаты</button>
-              <button id="backBtn" class="btn btn-ghost btn-block">назад</button>
+              <button id="retryDownloadsBtn" class="btn btn-surface btn-block" type="button" hidden>повторить ошибки</button>
+              <button id="backBtn" class="btn btn-ghost btn-block">новая очередь</button>
             </div>
-
-            <!-- debug-лог DownloadManager -->
-            <section id="debugLogSection" class="downloads-section" style="margin-top:8px;">
-              <div class="downloads-header">
-                <h3 class="downloads-title">лог (debug)</h3>
-                <span class="downloads-summary" id="debugLogSummary">0</span>
-              </div>
-              <div class="downloads-actions">
-                <button id="debugLogRefreshBtn" class="btn btn-ghost dl-action-btn" type="button">обновить</button>
-                <button id="debugLogClearBtn" class="btn btn-ghost dl-action-btn" type="button">очистить</button>
-                <button id="debugLogCopyBtn" class="btn btn-ghost dl-action-btn" type="button">скопировать</button>
-                <button id="debugLogDownloadBtn" class="btn btn-ghost dl-action-btn" type="button">скачать .txt</button>
-              </div>
-              <div id="debugLogList" class="debug-log-list"></div>
-            </section>
-
-            <!-- список файлов в очереди скачивания (DownloadManager) -->
-            <section id="downloadsSection" class="downloads-section" hidden>
-              <div class="downloads-header">
-                <h3 class="downloads-title">скачивания</h3>
-                <span class="downloads-summary" id="downloadsSummary">0/0</span>
-              </div>
-              <div class="downloads-progress-track">
-                <div class="downloads-progress-fill" id="downloadsProgressFill"></div>
-              </div>
-              <div class="downloads-actions">
-                <button id="downloadsRetryFailedBtn" class="btn btn-surface dl-action-btn" style="display:none;" type="button">повторить ошибки</button>
-                <button id="downloadsToggleHideDoneBtn" class="btn btn-ghost dl-action-btn" type="button">скрыть готовые</button>
-                <button id="downloadsClearCompletedBtn" class="btn btn-ghost dl-action-btn" type="button">очистить готовые</button>
-              </div>
-              <div class="downloads-list" id="downloadsList"></div>
-            </section>
-
-            <!-- список групп с инлайн-прогрессом -->
-            <div id="monitorGroups" class="monitor-groups" hidden></div>
-
-            <!-- старый visual (queue map + next tasks) уезжает внутрь details ниже -->
-            <div id="monitorVisual" class="monitor-visual" hidden></div>
           </section>
-
-          <details class="surface debug-panel">
-            <summary class="debug-toggle">детали</summary>
-            <div class="debug-content">
-              <div>
-                <h3 class="section-title">сейчас</h3>
-                <div class="log-area" id="monitorLog">ничего не запущено</div>
-              </div>
-              <div>
-                <h3 class="section-title">сводка</h3>
-                <div class="summary-card" id="monitorSummary"></div>
-              </div>
-              <div>
-                <h3 class="section-title">очередь</h3>
-                <div id="monitorAdvancedVisual" class="monitor-advanced-visual"></div>
-              </div>
-            </div>
-          </details>
         </div>
       </div>
     </main>

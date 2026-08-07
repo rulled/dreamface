@@ -15,13 +15,11 @@ function toPositivePixels(value) {
 
 export async function transformMp4(buffer, {
   padLeftPx = 0,
-  cropLeftPx = 0,
   onProgress = null,
 } = {}) {
   const pad = toPositivePixels(padLeftPx);
-  const crop = toPositivePixels(cropLeftPx);
-  if ((pad > 0) === (crop > 0)) {
-    throw new Error('exactly one video transform is required');
+  if (pad <= 0) {
+    throw new Error('padLeftPx must be a positive number');
   }
 
   const sourceBytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
@@ -35,74 +33,99 @@ export async function transformMp4(buffer, {
     target,
   });
 
+  let conversion = null;
+  let operationFailed = false;
   let inputWidth = 0;
   let inputHeight = 0;
   let outputWidth = 0;
   let outputHeight = 0;
-  const firstTimestamp = await input.getFirstTimestamp();
 
-  const conversion = await Conversion.init({
-    input,
-    output,
-    tracks: 'all',
-    trim: { start: Number.isFinite(firstTimestamp) ? firstTimestamp : 0 },
-    video: async (track) => {
-      inputWidth = await track.getDisplayWidth();
-      inputHeight = await track.getDisplayHeight();
-      outputWidth = pad > 0 ? inputWidth + pad : inputWidth - crop;
-      outputHeight = inputHeight;
+  try {
+    const firstTimestamp = await input.getFirstTimestamp();
 
-      if (outputWidth <= 0 || outputHeight <= 0) {
-        throw new Error(`invalid transformed size: ${outputWidth}x${outputHeight}`);
-      }
+    conversion = await Conversion.init({
+      input,
+      output,
+      tracks: 'all',
+      trim: { start: Number.isFinite(firstTimestamp) ? firstTimestamp : 0 },
+      video: async (track) => {
+        inputWidth = await track.getDisplayWidth();
+        inputHeight = await track.getDisplayHeight();
+        outputWidth = inputWidth + pad;
+        outputHeight = inputHeight;
 
-      const canvas = new OffscreenCanvas(outputWidth, outputHeight);
-      const context = canvas.getContext('2d', { alpha: false });
-      if (!context) {
-        throw new Error('2D canvas unavailable');
-      }
+        if (outputWidth <= 0 || outputHeight <= 0) {
+          throw new Error(`invalid transformed size: ${outputWidth}x${outputHeight}`);
+        }
 
-      return {
-        codec: 'avc',
-        forceTranscode: true,
-        hardwareAcceleration: 'prefer-hardware',
-        allowRotationMetadata: false,
-        processedWidth: outputWidth,
-        processedHeight: outputHeight,
-        process(sample) {
-          context.fillStyle = '#000';
-          context.fillRect(0, 0, outputWidth, outputHeight);
-          if (pad > 0) {
+        const canvas = new OffscreenCanvas(outputWidth, outputHeight);
+        const context = canvas.getContext('2d', { alpha: false });
+        if (!context) {
+          throw new Error('2D canvas unavailable');
+        }
+
+        return {
+          codec: 'avc',
+          forceTranscode: true,
+          hardwareAcceleration: 'prefer-hardware',
+          allowRotationMetadata: false,
+          processedWidth: outputWidth,
+          processedHeight: outputHeight,
+          process(sample) {
+            context.fillStyle = '#000';
+            context.fillRect(0, 0, outputWidth, outputHeight);
             sample.draw(context, pad, 0, inputWidth, inputHeight);
-          } else {
-            sample.draw(context, crop, 0, outputWidth, outputHeight, 0, 0, outputWidth, outputHeight);
-          }
-          return canvas;
-        },
-      };
-    },
-    audio: {},
-    showWarnings: false,
-  });
+            return canvas;
+          },
+        };
+      },
+      audio: {},
+      showWarnings: false,
+    });
 
-  if (!conversion.isValid) {
-    const reasons = conversion.discardedTracks.map((entry) => entry.reason).join(', ');
-    throw new Error(`unsupported media conversion${reasons ? `: ${reasons}` : ''}`);
-  }
-  if (typeof onProgress === 'function') {
-    conversion.onProgress = onProgress;
-  }
+    if (!conversion.isValid) {
+      const reasons = conversion.discardedTracks.map((entry) => entry.reason).join(', ');
+      throw new Error(`unsupported media conversion${reasons ? `: ${reasons}` : ''}`);
+    }
+    if (typeof onProgress === 'function') {
+      conversion.onProgress = onProgress;
+    }
 
-  await conversion.execute();
-  if (!target.buffer) {
-    throw new Error('media conversion returned no output');
-  }
+    await conversion.execute();
+    if (!target.buffer) {
+      throw new Error('media conversion returned no output');
+    }
 
-  return {
-    bytes: new Uint8Array(target.buffer),
-    inputWidth,
-    inputHeight,
-    outputWidth,
-    outputHeight,
-  };
+    return {
+      bytes: new Uint8Array(target.buffer),
+      inputWidth,
+      inputHeight,
+      outputWidth,
+      outputHeight,
+    };
+  } catch (error) {
+    operationFailed = true;
+    throw error;
+  } finally {
+    let cleanupError = null;
+    try {
+      if (!conversion || conversion.state === 'canceled') {
+        await output.cancel();
+      } else {
+        await conversion.cancel();
+      }
+    } catch (error) {
+      cleanupError = error;
+    }
+
+    try {
+      input.dispose();
+    } catch (error) {
+      cleanupError ??= error;
+    }
+
+    if (cleanupError && !operationFailed) {
+      throw cleanupError;
+    }
+  }
 }

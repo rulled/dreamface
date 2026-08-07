@@ -4,3 +4,5 @@ Users_*.js
 .DS_Store
 Thumbs.db
 *.log
+# release artifacts
+dist/

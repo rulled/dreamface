@@ -76,6 +76,7 @@ function persistCreationsSnapshot() {
 const MIN_DURATION_SECONDS = 2;
 const DEFAULT_MAX_DURATION_SECONDS = 180;
 const AVATAR_DISPLAY_LIMIT = 200;
+const CREATIONS_SNAPSHOT_LIMIT = 500;
 
 // persist submitMeta в chrome.storage.local, чтобы маркеры работали после
 // refresh страницы / закрытия вкладки. Ключи в storage:
@@ -84,28 +85,11 @@ const AVATAR_DISPLAY_LIMIT = 200;
 const SUBMIT_META_STORAGE_ANIMATE = 'dreamfaceSubmitMetaByAnimate';
 const SUBMIT_META_STORAGE_WORK = 'dreamfaceSubmitMetaByWork';
 const SUBMIT_META_MAX_ENTRIES = 5000;
-const PROCESSING_SETTINGS_KEY = 'audioProcessingSettings';
 const PADDED_VIDEO_MARKERS_KEY = 'dreamfacePaddedVideoMarkers';
 const AVATAR_BORDER_PX = 64;
-let removeBorderEnabled = true;
 let mediaTransformModulePromise = null;
 
-function applyProcessingSettings(settings) {
-  removeBorderEnabled = settings?.removeBorderEnabled !== false;
-}
-
-async function refreshProcessingSettings() {
-  const result = await chrome.storage.local.get(PROCESSING_SETTINGS_KEY);
-  applyProcessingSettings(result[PROCESSING_SETTINGS_KEY]);
-  return removeBorderEnabled;
-}
-
-const processingSettingsHydrationPromise = refreshProcessingSettings().catch(() => {});
-chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName === 'local' && changes[PROCESSING_SETTINGS_KEY]) {
-    applyProcessingSettings(changes[PROCESSING_SETTINGS_KEY].newValue);
-  }
-});
+const processingSettingsHydrationPromise = Promise.resolve();
 
 // Подгружаем существующий стор сразу при старте
 const submitMetaHydrationPromise = chrome.storage.local.get([SUBMIT_META_STORAGE_ANIMATE, SUBMIT_META_STORAGE_WORK]).then((res) => {
@@ -172,9 +156,13 @@ function enrichSubmitMetaFromApiItems(items) {
     if (it?.id) byId.set(String(it.id), it);
   }
   for (const it of items) {
-    if (it?.id) byId.set(String(it.id), it);
+    if (it?.id) {
+      const id = String(it.id);
+      byId.delete(id);
+      byId.set(id, it);
+    }
   }
-  lastCreationsApiItems = Array.from(byId.values());
+  lastCreationsApiItems = Array.from(byId.values()).slice(-CREATIONS_SNAPSHOT_LIMIT);
   persistCreationsSnapshot();
 
 
@@ -755,8 +743,14 @@ function findVideoUploadInput() {
 
   const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
   return inputs.find((input) => {
-    const accept = input.getAttribute('accept') || '';
-    return looksLikeVideoAccept(accept) || (looksLikeImageAccept(accept) && looksLikeVideoAccept(accept));
+    const accept = (input.getAttribute('accept') || '').toLowerCase();
+    const isMixedAudioInput = accept.includes('audio/')
+      || accept.includes('.mp3')
+      || accept.includes('.wav')
+      || accept.includes('.ogg')
+      || accept.includes('.aac')
+      || accept.includes('.flac');
+    return !isMixedAudioInput && (looksLikeVideoAccept(accept) || looksLikeImageAccept(accept));
   }) || null;
 }
 
@@ -1306,6 +1300,331 @@ function requestRunningWorks() {
     }));
   });
 }
+
+// =========================================================================
+// BULK RELAY (background/offscreen -> injected.js MAIN world via postMessage)
+// =========================================================================
+// injected.js слушает window 'message' (marker __dfBulkReq), отвечает __dfBulkRes.
+// postMessage структурно клонирует payload -> Blobs (видео/аудио) доходят в MAIN world.
+// Channel token снижает риск spoofing/replay, но не является секретом от page scripts.
+// Auth = JWT в localStorage (НЕ cookies). Multi-account: swap localStorage-сессии.
+
+const DF_BULK_SESSION_KEY = '49f290d6e8459c53f31f97de37921086';
+const DF_BULK_CLIENT_ID_KEY = '19fb90a3b8f09f14a91f48eee48c12af';
+const DF_BULK_USER_ID_KEY = '1d5d4096d2b4e7d671adcb4661b5725d';
+
+let bulkRelayCounter = 0;
+const DF_BULK_ALLOWED_OPS = new Set([
+  'getAuthContext',
+  'putUrl',
+  'putOssFile',
+  'uploadAudio',
+  'avatarAdd',
+  'listAvatars',
+  'listBatchConfig',
+  'getBatchConfigDetail',
+  'updateBatchConfig',
+  'batchCheckText',
+  'animateImageBatch',
+  'getBatchTimes',
+  'getPtVideoInfo',
+  'getRunningWorks',
+  'getAccountCapabilities',
+  'getRecentCreations',
+  'getWorkStatuses',
+  'getDownloadUrls',
+]);
+const DF_BULK_CHANNEL_TOKEN = (() => {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+})();
+
+function isSameWindowMessage(event) {
+  return event.source === window && event.origin === location.origin;
+}
+
+function hasExactKeys(value, expectedKeys) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === expectedKeys.length && expectedKeys.every((key) => keys.includes(key));
+}
+
+function hasOnlyKeys(value, allowedKeys) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).every((key) => allowedKeys.includes(key));
+}
+
+function isValidBulkPayload(op, payload) {
+  if (!hasOnlyKeys(payload, [])) {
+    switch (op) {
+      case 'putUrl':
+        return hasExactKeys(payload, ['fileName', 'contentType'])
+          && typeof payload.fileName === 'string'
+          && typeof payload.contentType === 'string';
+      case 'putOssFile':
+        return hasOnlyKeys(payload, ['putUrl', 'blob', 'dataUrl', 'contentType'])
+          && Object.hasOwn(payload, 'putUrl')
+          && Object.hasOwn(payload, 'contentType')
+          && (Object.hasOwn(payload, 'blob') || Object.hasOwn(payload, 'dataUrl'))
+          && typeof payload.putUrl === 'string'
+          && typeof payload.contentType === 'string';
+      case 'uploadAudio':
+        return hasOnlyKeys(payload, ['blob', 'dataUrl', 'fileName'])
+          && Object.hasOwn(payload, 'fileName')
+          && (Object.hasOwn(payload, 'blob') || Object.hasOwn(payload, 'dataUrl'))
+          && typeof payload.fileName === 'string';
+      case 'avatarAdd':
+        return hasExactKeys(payload, ['fileUrl']) && typeof payload.fileUrl === 'string';
+      case 'listBatchConfig':
+        return hasExactKeys(payload, ['configType']) && typeof payload.configType === 'string';
+      case 'getBatchConfigDetail':
+        return hasExactKeys(payload, ['id']) && ['string', 'number'].includes(typeof payload.id);
+      case 'updateBatchConfig':
+        return hasExactKeys(payload, ['id', 'name', 'scriptConfigs'])
+          && ['string', 'number'].includes(typeof payload.id)
+          && typeof payload.name === 'string'
+          && Array.isArray(payload.scriptConfigs);
+      case 'animateImageBatch':
+        return hasOnlyKeys(payload, ['avatarId', 'videoUrl', 'scriptConfigs', 'batchConfigId', 'name', 'templateId'])
+          && ['string', 'number'].includes(typeof payload.avatarId)
+          && typeof payload.videoUrl === 'string'
+          && Array.isArray(payload.scriptConfigs)
+          && ['string', 'number'].includes(typeof payload.batchConfigId)
+          && (!Object.hasOwn(payload, 'name') || typeof payload.name === 'string')
+          && (!Object.hasOwn(payload, 'templateId')
+            || typeof payload.templateId === 'string'
+            || (typeof payload.templateId === 'number' && Number.isFinite(payload.templateId)));
+      case 'getRecentCreations':
+        return hasExactKeys(payload, ['page', 'size'])
+          && Number.isInteger(payload.page)
+          && Number.isInteger(payload.size);
+      case 'getWorkStatuses':
+      case 'getDownloadUrls':
+        return hasExactKeys(payload, ['ids'])
+          && Array.isArray(payload.ids)
+          && payload.ids.every((id) => typeof id === 'string');
+      default:
+        return false;
+    }
+  }
+  return [
+    'getAuthContext',
+    'listAvatars',
+    'batchCheckText',
+    'getBatchTimes',
+    'getPtVideoInfo',
+    'getRunningWorks',
+    'getAccountCapabilities',
+  ].includes(op);
+}
+
+const bulkChannelReady = new Promise((resolve, reject) => {
+  let timer = null;
+  let timeout = null;
+  const cleanup = () => {
+    window.removeEventListener('message', onMessage);
+    if (timer) clearInterval(timer);
+    if (timeout) clearTimeout(timeout);
+  };
+  const onMessage = (event) => {
+    if (!isSameWindowMessage(event)) return;
+    const data = event.data;
+    if (!hasExactKeys(data, ['__dfBulkInitAck', 'channelToken'])
+      || data.__dfBulkInitAck !== true
+      || data.channelToken !== DF_BULK_CHANNEL_TOKEN) return;
+    cleanup();
+    resolve();
+  };
+  const announce = () => {
+    window.postMessage({
+      __dfBulkInit: true,
+      channelToken: DF_BULK_CHANNEL_TOKEN,
+    }, location.origin);
+  };
+  window.addEventListener('message', onMessage);
+  announce();
+  timer = setInterval(announce, 250);
+  timeout = setTimeout(() => {
+    cleanup();
+    reject(new Error('DreamFace page bridge did not initialize'));
+  }, 10000);
+});
+
+function getAccountEntitlements(session) {
+  const rights = session?.userRights;
+  const candidates = [];
+  const planValues = [];
+  const explicitLimitKeys = new Set([
+    'maxdurationseconds',
+    'maxvideodurationseconds',
+    'maxaudiodurationseconds',
+    'avatarvideodurationseconds',
+    'videodurationlimit',
+    'audiodurationlimit',
+  ]);
+
+  const visit = (value, path = '') => {
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => visit(item, `${path}.${index}`));
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    for (const [key, nested] of Object.entries(value)) {
+      const nextPath = `${path}.${key}`.toLowerCase();
+      const normalizedKey = key.toLowerCase().replace(/[^a-z]/g, '');
+      if (typeof nested === 'number'
+        && explicitLimitKeys.has(normalizedKey)
+        && (nested === 180 || nested === 600)) {
+        candidates.push(Number(nested));
+      }
+      if (typeof nested === 'string' && /(plan|tier|subscription|product|membership)/i.test(key)) {
+        planValues.push(nested.toLowerCase());
+      }
+      visit(nested, nextPath);
+    }
+  };
+
+  visit(rights);
+  visit(session);
+  if (candidates.length > 0) {
+    return {
+      planName: 'rights',
+      maxDurationSeconds: Math.max(...candidates),
+      durationSource: 'userRights',
+    };
+  }
+  const text = planValues.join(' ');
+  if (text.includes('premium')) {
+    return { planName: 'Premium', maxDurationSeconds: 600, durationSource: 'plan-name' };
+  }
+  if (/(^|[^a-z])pro([^a-z]|$)/i.test(text)) {
+    return { planName: 'Pro', maxDurationSeconds: 180, durationSource: 'plan-name' };
+  }
+  return { planName: 'Unknown', maxDurationSeconds: 180, durationSource: 'safe-default' };
+}
+
+async function requestBulkOp(op, payload, timeoutMs = 120000) {
+  if (!DF_BULK_ALLOWED_OPS.has(op)) {
+    throw new Error(`unknown bulk op: ${op}`);
+  }
+  if (!isValidBulkPayload(op, payload)) {
+    throw new Error(`invalid payload for bulk op: ${op}`);
+  }
+
+  await bulkChannelReady;
+  return new Promise((resolve, reject) => {
+    bulkRelayCounter += 1;
+    const requestId = `df-bulk-${crypto.randomUUID()}-${bulkRelayCounter}`;
+    let timer = null;
+    const cleanup = () => {
+      window.removeEventListener('message', onMessage);
+      if (timer) { clearTimeout(timer); timer = null; }
+    };
+    const onMessage = (event) => {
+      if (!isSameWindowMessage(event)) return;
+      const data = event.data;
+      if (!data || typeof data !== 'object' || Array.isArray(data)
+        || data.__dfBulkRes !== true
+        || data.channelToken !== DF_BULK_CHANNEL_TOKEN
+        || data.requestId !== requestId
+        || typeof data.ok !== 'boolean') return;
+      const expectedKeys = data.ok
+        ? ['__dfBulkRes', 'channelToken', 'requestId', 'ok', 'data']
+        : ['__dfBulkRes', 'channelToken', 'requestId', 'ok', 'error'];
+      if (!hasExactKeys(data, expectedKeys) || (!data.ok && typeof data.error !== 'string')) return;
+      cleanup();
+      if (data.ok) resolve(data.data);
+      else reject(new Error(data.error || `bulk op ${op} failed`));
+    };
+    window.addEventListener('message', onMessage);
+    timer = setTimeout(() => { cleanup(); reject(new Error(`bulk op ${op} timeout`)); }, timeoutMs);
+    window.postMessage({
+      __dfBulkReq: true,
+      channelToken: DF_BULK_CHANNEL_TOKEN,
+      requestId,
+      op,
+      payload,
+    }, location.origin);
+  });
+}
+
+function readPageAuthSession() {
+  try {
+    const sessionRaw = localStorage.getItem(DF_BULK_SESSION_KEY) || '';
+    let session = null;
+    try { session = sessionRaw ? JSON.parse(sessionRaw) : null; } catch {}
+    const clientId = localStorage.getItem(DF_BULK_CLIENT_ID_KEY) || '';
+    const userId = localStorage.getItem(DF_BULK_USER_ID_KEY) || (session && session.userId) || '';
+    const accountId = (session && session.accountId) || '';
+    const token = (session && session.token) || '';
+    const thirdPlatform = String(session?.thirdPlatform || '').trim();
+    const thirdId = String(session?.thirdId || '').trim();
+    const principalKey = thirdPlatform && thirdId
+      ? `${thirdPlatform.toLowerCase()}:${thirdId.toLowerCase()}`
+      : (userId ? `user:${String(userId).toLowerCase()}` : `account:${accountId}`);
+    const hasAuth = Boolean(token && userId && accountId);
+    return {
+      ok: hasAuth,
+      hasAuth,
+      sessionRaw,
+      clientId,
+      userId,
+      accountId,
+      token,
+      thirdPlatform,
+      thirdId,
+      principalKey,
+      ...getAccountEntitlements(session),
+    };
+  } catch (error) {
+    return { ok: false, hasAuth: false, error: error.message || String(error) };
+  }
+}
+
+function writePageAuthSession(session) {
+  try {
+    if (session && session.sessionRaw != null) {
+      if (session.sessionRaw) localStorage.setItem(DF_BULK_SESSION_KEY, session.sessionRaw);
+      else localStorage.removeItem(DF_BULK_SESSION_KEY);
+    }
+    if (session && Object.hasOwn(session, 'clientId')) {
+      if (session.clientId) localStorage.setItem(DF_BULK_CLIENT_ID_KEY, session.clientId);
+      else localStorage.removeItem(DF_BULK_CLIENT_ID_KEY);
+    }
+    if (session && Object.hasOwn(session, 'userId')) {
+      if (session.userId) localStorage.setItem(DF_BULK_USER_ID_KEY, session.userId);
+      else localStorage.removeItem(DF_BULK_USER_ID_KEY);
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error.message || String(error) };
+  }
+}
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'dfBulkOp') {
+    requestBulkOp(request.op, request.payload)
+      .then((data) => sendResponse({ ok: true, data }))
+      .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
+    return true;
+  }
+  if (request.action === 'dfCaptureAccount') {
+    sendResponse(readPageAuthSession());
+    return false;
+  }
+  if (request.action === 'dfSwitchAccount') {
+    sendResponse(writePageAuthSession(request.session || {}));
+    return false;
+  }
+  if (request.action === 'scanBulkAvatars') {
+    requestBulkOp('listAvatars', {})
+      .then((data) => sendResponse({ ok: true, videos: data.avatars || [], accountId: data.accountId || '' }))
+      .catch((error) => sendResponse({ ok: false, videos: [], error: error.message || String(error) }));
+    return true;
+  }
+  return false;
+});
 
 function extractRunningWorkIds(body) {
   const ids = Array.isArray(body?.data) ? body.data : [];
@@ -2370,19 +2689,18 @@ async function waitForCreationsDownload(request) {
 }
 
 // Для каждого ready-item получаем download URL и ставим локальную обработку
-// в очередь. Crop-обязательные items никогда не уходят в site-button fallback.
+// в очередь. Items с chapters никогда не уходят в site-button fallback.
 async function downloadReadyItemsLocally(items) {
   if (!Array.isArray(items) || items.length === 0) {
     return { ok: false, reason: 'empty' };
   }
 
   await Promise.allSettled([
-    refreshProcessingSettings(),
+    Promise.resolve(),
     submitMetaHydrationPromise,
   ]);
 
   const queueNameByWorkId = new Map();
-  const queueBorderByWorkId = new Map();
   try {
     const runStateResponse = await chrome.runtime.sendMessage({ action: 'engine.getRunState' });
     const queuePlan = Array.isArray(runStateResponse?.state?.queuePlan)
@@ -2390,12 +2708,8 @@ async function downloadReadyItemsLocally(items) {
       : [];
     for (const task of queuePlan) {
       const fileName = String(task?.fileName || '');
-      const cropPx = Math.max(0, Math.floor(Number(task?.borderCropPx) || 0));
       if (task?.workId && fileName) {
         queueNameByWorkId.set(String(task.workId), fileName);
-      }
-      if (task?.workId && cropPx > 0) {
-        queueBorderByWorkId.set(String(task.workId), cropPx);
       }
     }
   } catch (err) {
@@ -2406,15 +2720,11 @@ async function downloadReadyItemsLocally(items) {
     const workId = String(item?.id || '');
     const animateId = String(item?.animate_id || '');
     const meta = submitMetaByWorkId.get(workId) || submitMetaByAnimateId.get(animateId);
-    const requiresChapters = Boolean(meta
+    return Boolean(meta
       && Number.isFinite(meta.audioMs)
       && Number.isFinite(meta.videoMs)
       && meta.videoMs > 0
       && meta.audioMs > meta.videoMs);
-    return requiresChapters || (removeBorderEnabled && (
-      Number(meta?.borderCropPx) > 0
-      || Number(queueBorderByWorkId.get(workId)) > 0
-    ));
   });
   const ids = items.map((it) => String(it?.id || '')).filter(Boolean);
   if (ids.length === 0) {
@@ -2488,19 +2798,10 @@ async function downloadReadyItemsLocally(items) {
     const apiName = (item.work_name || '').trim();
     const audioFileName = metaName || queueName || '';
     const resolvedName = audioFileName || apiName || workId;
-    const storedBorderCropPx = Math.max(0, Math.floor(Number(
-      meta?.borderCropPx || queueBorderByWorkId.get(workId)
-    ) || 0));
-    const borderCropPx = removeBorderEnabled ? storedBorderCropPx : 0;
 
     // апсейв имени обратно в meta, чтобы при следующем скачивании не лазить в queuePlan
     if (!metaName && queueName && meta) {
       meta.audioFileName = queueName;
-      submitMetaByWorkId.set(workId, meta);
-      persistSubmitMeta();
-    }
-    if (meta && storedBorderCropPx > 0 && Number(meta.borderCropPx) !== storedBorderCropPx) {
-      meta.borderCropPx = storedBorderCropPx;
       submitMetaByWorkId.set(workId, meta);
       persistSubmitMeta();
     }
@@ -2514,14 +2815,13 @@ async function downloadReadyItemsLocally(items) {
       audioMs: meta?.audioMs ?? null,
       videoMs: meta?.videoMs ?? null,
       hasChapters: Boolean(meta && Number.isFinite(meta.audioMs) && Number.isFinite(meta.videoMs) && meta.videoMs > 0 && meta.audioMs > meta.videoMs),
-      borderCropPx,
     });
   }
 
   if (payload.length === 0) {
     return { ok: false, reason: 'no items resolved', requiresLocalProcessing: requiresKnownProcessing };
   }
-  const requiresLocalProcessing = payload.some((item) => item.borderCropPx > 0 || item.hasChapters);
+  const requiresLocalProcessing = payload.some((item) => item.hasChapters);
   if (payload.length !== ids.length) {
     return {
       ok: false,
@@ -2532,7 +2832,7 @@ async function downloadReadyItemsLocally(items) {
 
   // Единая точка скачивания — DownloadManager в background. Он сам:
   //   - разруливает direct vs local processing path,
-  //   - держит семафор fetch=6 и media-transform mutex=1,
+  //   - держит семафор fetch=6,
   //   - персистит per-workId статус,
   //   - делает retry с backoff,
   //   - поднимает alarms keep-alive чтобы SW не уснул на больших батчах.
@@ -2549,7 +2849,6 @@ async function downloadReadyItemsLocally(items) {
       audioMs: p.audioMs,
       videoMs: p.videoMs,
       hasChapters: p.hasChapters,
-      borderCropPx: p.borderCropPx,
     })),
   });
 
@@ -2695,9 +2994,6 @@ async function downloadCreationsIfReady(request) {
     if (result.requiresLocalProcessing) {
       return { status: 'error', message: `локальная обработка обязательна: ${result.reason}` };
     }
-    if (removeBorderEnabled) {
-      return { status: 'error', message: `не удалось проверить необходимость локальной обработки: ${result.reason}` };
-    }
     console.warn('[dreamface] local download failed, evaluating safe fallback:', result.reason);
   }
 
@@ -2765,8 +3061,8 @@ function sendScanProgress(iteration, count, maxIterations) {
   }).catch(() => {});
 }
 
-function forceLoadThumbnails() {
-  const validElements = getValidVideoElements();
+function forceLoadThumbnails(maxElements = AVATAR_DISPLAY_LIMIT) {
+  const validElements = getValidVideoElements().slice(0, maxElements);
   let loadedCount = 0;
   let failedCount = 0;
 
@@ -3118,8 +3414,9 @@ async function waitForVideoUploadOutcome(previousCount, file) {
 async function waitForNewVideoSource(previousSources, file) {
   const timeoutMs = getVideoUploadTimeoutMs(file);
   return waitForCondition(() => {
-    forceLoadThumbnailsForElements(getValidVideoElements());
-    const addedSources = getValidVideoElements()
+    const candidateElements = getValidVideoElements();
+    forceLoadThumbnailsForElements(candidateElements.slice(0, 20));
+    const addedSources = candidateElements
       .map(getVideoThumbnailSource)
       .filter((source) => source && !previousSources.has(getVideoMarkerKey(source)));
     return addedSources.length === 1 ? addedSources[0] : null;
@@ -3133,7 +3430,7 @@ async function waitForNewVideoSource(previousSources, file) {
 async function uploadSingleVideoToDreamFace(file, current, total, { identifySource = false } = {}) {
   const input = findVideoUploadInput();
   if (!input) {
-    throw new Error('поле загрузки видео не найдено');
+    throw new Error('загрузка видео доступна на странице Avatar или Avatar Bulk; язык сайта не важен');
   }
 
   const videoElementsBefore = getValidVideoElements();
@@ -3226,7 +3523,7 @@ async function pickFilesForDreamFaceUpload(input) {
   });
 }
 
-async function startMultiVideoUploadPicker({ addBorderEnabled = true } = {}) {
+async function startMultiVideoUploadPicker({ addBorderEnabled = false } = {}) {
   if (videoUploadJobActive) {
     throw new Error('загрузка видео уже выполняется');
   }
@@ -3719,7 +4016,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'startMultiVideoUploadPicker') {
-    startMultiVideoUploadPicker({ addBorderEnabled: request.addBorderEnabled !== false }).catch((error) => {
+    startMultiVideoUploadPicker({ addBorderEnabled: request.addBorderEnabled === true }).catch((error) => {
       sendVideoUploadCompleted({
         canceled: false,
         uploadedCount: 0,
@@ -3849,7 +4146,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         // принудительно загружаем превью всех элементов, чтобы scan мог взять
         // карточку нового видео (иначе у новой ячейки img.src=пустой/placeholder).
-        forceLoadThumbnails();
+        forceLoadThumbnails(AVATAR_DISPLAY_LIMIT);
 
         // ищем индекс новой ячейки. сайт показывает новое видео первым
         // в списке (порядок 'недавние'). если порядок поменялся — пробуем
@@ -4046,20 +4343,43 @@ function installHoverDownloadInterceptor() {
   // решаем — берём ли скачивание на себя. Если да: detail.handled=true и
   // асинхронно делаем dm.enqueue. Если нет: сайт получит свой нативный click.
   window.addEventListener('DreamFaceAnchorClickIntercept', (event) => {
-    const detail = event.detail;
-    if (!detail || !detail.href) return;
+    let detail;
+    let safeDetail;
+    try {
+      detail = event.detail;
+      if (!detail || typeof detail !== 'object'
+        || typeof detail.href !== 'string'
+        || typeof detail.download !== 'string'
+        || typeof detail.ossUuid !== 'string'
+        || typeof detail.fileName !== 'string') return;
+      const url = new URL(detail.href);
+      const hostname = url.hostname.toLowerCase();
+      const isAllowedHost = hostname === 'dreamfaceapp.com'
+        || hostname.endsWith('.dreamfaceapp.com')
+        || hostname === 'aliyuncs.com'
+        || hostname.endsWith('.aliyuncs.com');
+      if (url.protocol !== 'https:' || !isAllowedHost) return;
+      safeDetail = {
+        href: url.href,
+        download: detail.download,
+        ossUuid: detail.ossUuid,
+        fileName: detail.fileName,
+      };
+    } catch {
+      return;
+    }
 
     dmLog('log', 'anchor-click event received', {
-      ossUuid: detail.ossUuid, fileName: detail.fileName, download: detail.download.slice(0, 80),
+      ossUuid: safeDetail.ossUuid, fileName: safeDetail.fileName, download: safeDetail.download.slice(0, 80),
       snapshotSize: lastCreationsApiItems.length,
     });
 
     // Маппинг: имя файла из OSS Content-Disposition (например "d10.mp3.mp4")
     // → ищем item с work_name="d10.mp3" (work_name без .mp4 расширения).
-    const fileBase = (detail.fileName || '').replace(/\.mp4$/i, '');
+    const fileBase = safeDetail.fileName.replace(/\.mp4$/i, '');
     const matchingApiItems = lastCreationsApiItems.filter((it) => {
       if (!it?.work_name) return false;
-      return it.work_name === fileBase || it.work_name === detail.fileName;
+      return it.work_name === fileBase || it.work_name === safeDetail.fileName;
     });
     const apiItem = matchingApiItems.length === 1 ? matchingApiItems[0] : null;
 
@@ -4068,13 +4388,18 @@ function installHoverDownloadInterceptor() {
         refreshCreationsSnapshot();
       }
       dmLog('warn', 'anchor-click: work_name unresolved, fallthrough',
-        { fileName: detail.fileName, fileBase, matches: matchingApiItems.length,
+        { fileName: safeDetail.fileName, fileBase, matches: matchingApiItems.length,
           snapshotSize: lastCreationsApiItems.length, sampleNames: lastCreationsApiItems.slice(0, 5).map((it) => it.work_name) });
       return;
     }
 
     // помечаем что мы взяли перехват — injected НЕ вызовет оригинальный click
-    detail.handled = true;
+    try {
+      detail.handled = true;
+      if (detail.handled !== true) return;
+    } catch {
+      return;
+    }
     Promise.allSettled([processingSettingsHydrationPromise, submitMetaHydrationPromise]).then(() => {
       const workId = String(apiItem.id);
       const workName = apiItem.work_name;
@@ -4097,14 +4422,11 @@ function installHoverDownloadInterceptor() {
         workId,
         workName: audioFileName || workName,
         audioFileName: audioFileName || '',
-        url: detail.href,
+        url: safeDetail.href,
         audioMs: meta?.audioMs ?? null,
         videoMs: meta?.videoMs ?? null,
         hasChapters: Boolean(meta && Number.isFinite(meta.audioMs) && Number.isFinite(meta.videoMs)
           && meta.videoMs > 0 && meta.audioMs > meta.videoMs),
-        borderCropPx: removeBorderEnabled
-          ? Math.max(0, Math.floor(Number(meta?.borderCropPx) || 0))
-          : 0,
       }];
 
       // асинхронный dm.enqueue
@@ -4117,12 +4439,12 @@ function installHoverDownloadInterceptor() {
           showDmInterceptToast(`в очередь: ${items[0].workName}${tail}`);
         } else {
           showDmInterceptToast('ошибка постановки в очередь');
-          if (items[0].borderCropPx <= 0 && !items[0].hasChapters) startNativeDownloadFallback(detail);
+          if (!items[0].hasChapters) startNativeDownloadFallback(safeDetail);
         }
       }).catch((err) => {
         console.error('[dreamface] dm.enqueue failed:', err);
         showDmInterceptToast('ошибка: ' + err.message);
-        if (items[0].borderCropPx <= 0 && !items[0].hasChapters) startNativeDownloadFallback(detail);
+        if (!items[0].hasChapters) startNativeDownloadFallback(safeDetail);
       });
     });
   });
