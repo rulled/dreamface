@@ -18,10 +18,13 @@ let mediaTransformModulePromise = null;
 let runState = createIdleRunState();
 let currentRunToken = 0;
 let stopRequested = false;
-let bulkAccountBusy = false;
 let bulkWatcherPromise = null;
-let bulkAccountMutex = Promise.resolve();
+let dreamFaceApiModulePromise = null;
+let initializationError = null;
+let initializationRetryPromise = null;
+const accountMutationLocks = new Map();
 let runAdmissionToken = null;
+const processedBlobLeases = new Map();
 
 function acquireRunAdmission() {
   if (runAdmissionToken) return null;
@@ -33,17 +36,18 @@ function releaseRunAdmission(token) {
   if (runAdmissionToken === token) runAdmissionToken = null;
 }
 
-async function withBulkAccountLock(callback) {
-  const previous = bulkAccountMutex;
+async function withAccountMutationLock(accountId, callback) {
+  if (!accountId) throw new Error('DreamFace mutation account is required');
+  const previous = accountMutationLocks.get(accountId) || Promise.resolve();
   let release;
-  bulkAccountMutex = new Promise((resolve) => { release = resolve; });
+  const current = new Promise((resolve) => { release = resolve; });
+  accountMutationLocks.set(accountId, current);
   await previous;
-  bulkAccountBusy = true;
   try {
     return await callback();
   } finally {
-    bulkAccountBusy = false;
     release();
+    if (accountMutationLocks.get(accountId) === current) accountMutationLocks.delete(accountId);
   }
 }
 
@@ -152,6 +156,22 @@ function throwIfStopped(runToken) {
     error.code = 'run_stopped';
     throw error;
   }
+}
+
+function isSubmissionUncertain(unit) {
+  return ['dispatching', 'submission_uncertain', 'requires_review'].includes(unit?.submissionPhase)
+    || ['submission_uncertain', 'requires_review'].includes(unit?.status);
+}
+
+function setQueueSubmissionPhase(index, unit, submissionPhase, patch = {}) {
+  Object.assign(unit, patch, { submissionPhase });
+  runState.queuePlan[index] = { ...unit };
+}
+
+async function patchWatchSubmissionPhase(watchUnit, submissionPhase, patch = {}) {
+  if (!watchUnit) return;
+  Object.assign(watchUnit, patch, { submissionPhase, updatedAt: Date.now() });
+  await callBackground('dfPatchBulkWatchUnits', { units: [{ ...watchUnit }] });
 }
 
 function sleep(ms) {
@@ -416,12 +436,15 @@ async function blobToDataUrl(blob) {
 }
 
 async function encodeMp3(inputPath, outputPath, args, timeoutMs = 180000) {
-  const vbrArgs = [...args, '-c:a', 'libmp3lame', '-q:a', '2', outputPath];
-  let code = await ffmpeg.exec(vbrArgs, timeoutMs);
+  // Принудительно 44100 Hz mono, чтобы избежать 32000 Hz по дефолту ffmpeg.wasm
+  // и рассинхрона с downstream pipeline (ffmpeg ругается "Invalid data" на 32k).
+  const normalizedArgs = [...args, '-ar', '44100', '-ac', '1', '-c:a', 'libmp3lame', '-q:a', '2', outputPath];
+  let code = await ffmpeg.exec(normalizedArgs, timeoutMs);
 
   if (code !== 0) {
     await safeDeleteFsFile(outputPath);
-    code = await ffmpeg.exec([...args, '-c:a', 'libmp3lame', '-b:a', '192k', outputPath], timeoutMs);
+    const fallbackArgs = [...args, '-ar', '44100', '-ac', '1', '-c:a', 'libmp3lame', '-b:a', '192k', outputPath];
+    code = await ffmpeg.exec(fallbackArgs, timeoutMs);
   }
 
   if (code !== 0) {
@@ -457,10 +480,14 @@ async function repairConcatenatedMp3(file, timeoutMs = 180000) {
     await ffmpeg.writeFile(inputPath, await readUint8Array(file));
 
     // Используем -err_detect ignore_err для игнорирования ошибок конкатенации
-    // и перекодируем в чистый MP3 с корректной структурой
+    // и перекодируем в чистый MP3 с корректной структурой.
+    // -ar 44100 -ac 1 фиксирует sample_rate, иначе ffmpeg.wasm оставит 32000 Hz
+    // от источника, что ломает downstream ffmpeg на "Invalid data".
     const args = [
       '-err_detect', 'ignore_err',
       '-i', inputPath,
+      '-ar', '44100',
+      '-ac', '1',
       '-c:a', 'libmp3lame',
       '-b:a', '192k',
       '-write_xing', '1',
@@ -696,15 +723,36 @@ async function normalizeFile(file, options, runToken) {
     }
 
     if (isMp3Like(file)) {
-      return {
-        ok: true,
-        kind: 'kept',
-        outputs: [{
-          name: file.name,
-          blob: file,
-          type: MP3_MIME,
-        }],
-      };
+      // Даже если MP3 валидный и не нуждается в pad/split/transcode,
+      // прогоняем через transcodeFileToMp3 чтобы нормализовать sample_rate
+      // (иначе расширение вернёт файл как есть, 32000 Hz, и downstream
+      // ffmpeg будет ругаться "Invalid data" из-за bit reservoir / frame
+      // header mismatches, которые ffmpeg.wasm пишет).
+      try {
+        const normalizedBlob = await transcodeFileToMp3(file, file.name);
+        return {
+          ok: true,
+          kind: 'kept',
+          outputs: [{
+            name: file.name,
+            blob: normalizedBlob,
+            type: MP3_MIME,
+          }],
+        };
+      } catch (transcodeError) {
+        // Если перекодирование не получилось — возвращаем как есть,
+        // чтобы не сломать обработку полностью
+        console.warn('[offscreen] kept→transcode failed, falling back to blob:', transcodeError.message);
+        return {
+          ok: true,
+          kind: 'kept',
+          outputs: [{
+            name: file.name,
+            blob: file,
+            type: MP3_MIME,
+          }],
+        };
+      }
     }
 
     const convertedBlob = await transcodeFileToMp3(file, toMp3Name(file.name));
@@ -1165,9 +1213,37 @@ async function callBackground(action, payload = {}) {
   return response;
 }
 
-async function callBulkOp(op, payload = {}) {
-  const response = await callBackground('dfBulkOp', { op, payload });
-  return response.data;
+function getDreamFaceApiModule() {
+  dreamFaceApiModulePromise ||= import('./dreamface-api.js');
+  return dreamFaceApiModulePromise;
+}
+
+function toAccountMetadata(account) {
+  if (!account) return null;
+  const {
+    sessionRaw: _sessionRaw,
+    token: _token,
+    clientId: _clientId,
+    userId: _userId,
+    ...metadata
+  } = account;
+  return metadata;
+}
+
+async function getAccountBinding(accountId, principalKey = '') {
+  const response = await callBackground('dfGetAccountCredential', { accountId, principalKey });
+  const credential = response.account;
+  const { createDreamFaceClient } = await getDreamFaceApiModule();
+  const client = createDreamFaceClient(credential);
+  const auth = client.getAuthContext();
+  return {
+    client,
+    account: {
+      ...toAccountMetadata(credential),
+      accountId: auth.accountId,
+      principalKey: auth.principalKey,
+    },
+  };
 }
 
 async function getCachedAvatarId(videoUrl, accountId) {
@@ -1189,42 +1265,29 @@ async function invalidateCachedAvatarId(videoUrl, accountId) {
   }).catch(() => {});
 }
 
-async function capturePageSession() {
-  return chrome.runtime.sendMessage({ action: 'dfCaptureAccount' }).catch(() => null);
-}
-
-async function selectLeastLoadedAccount(requiredDurationSeconds = 0, plannedLoads = new Map(), sourceVideoUrl = '') {
+async function selectLeastLoadedAccount(
+  requiredDurationSeconds = 0,
+  plannedLoads = new Map(),
+  sourceVideoUrl = '',
+  excludedAccountIds = new Set(),
+) {
   const listed = await callBackground('dfListAccounts');
-  const captured = await callBackground('dfCaptureAccount').catch(() => null);
-  const accounts = Array.isArray(listed.accounts) ? [...listed.accounts] : [];
-  if (captured?.hasAuth && captured.accountId) {
-    const savedIndex = accounts.findIndex((account) => account.principalKey === captured.principalKey);
-    const saved = savedIndex >= 0 ? accounts[savedIndex] : null;
-    const current = {
-      ...captured,
-      ...(saved?.durationSource === 'manual' ? {
-        maxDurationSeconds: saved.maxDurationSeconds,
-        durationSource: 'manual',
-      } : {}),
-      capturedAt: Date.now(),
-    };
-    if (savedIndex >= 0) accounts[savedIndex] = current;
-    else accounts.push(current);
-  }
+  const accounts = Array.isArray(listed.accounts) ? listed.accounts.map(toAccountMetadata) : [];
   if (accounts.length === 0) throw new Error('DreamFace account is not authenticated');
 
   let selected = null;
-  let fallback = null;
+  let availableMaximumSeconds = 0;
+  let unavailableAccountCount = 0;
+  let attemptedAccountCount = 0;
   for (const account of accounts) {
+    if (excludedAccountIds.has(String(account.accountId))) continue;
+    attemptedAccountCount += 1;
     try {
-      await callBackground('dfSwitchAccount', { session: account });
-      const auth = await callBulkOp('getAuthContext');
-      if (!auth?.hasAuth || auth.accountId !== account.accountId) {
-        throw new Error(`DreamFace account ${account.accountId} switch verification failed`);
-      }
-      const capabilities = await callBulkOp('getAccountCapabilities');
-      const effectiveAccount = { ...account, ...auth, ...capabilities };
-      const running = await callBulkOp('getRunningWorks');
+      const binding = await getAccountBinding(account.accountId, account.principalKey);
+      if (excludedAccountIds.has(String(binding.account.accountId))) continue;
+      const capabilities = await binding.client.getAccountCapabilities();
+      const effectiveAccount = { ...account, ...binding.account, ...capabilities };
+      const running = await binding.client.getRunningWorks();
       const load = Array.isArray(running?.workIds) ? running.workIds.length : Number.MAX_SAFE_INTEGER;
       let reservation = plannedLoads.get(effectiveAccount.accountId);
       if (!reservation || typeof reservation !== 'object') {
@@ -1242,87 +1305,72 @@ async function selectLeastLoadedAccount(requiredDurationSeconds = 0, plannedLoad
         hasCachedAvatar,
         score: Math.max(0, Math.max(load, reservation.baselineLoad + reservation.assigned) - affinityBonus),
       };
-      if (!fallback
-        || Number(effectiveAccount.maxDurationSeconds || 0) > Number(fallback.account.maxDurationSeconds || 0)
-        || (Number(effectiveAccount.maxDurationSeconds || 0) === Number(fallback.account.maxDurationSeconds || 0) && candidate.score < fallback.score)) {
-        fallback = candidate;
-      }
+      availableMaximumSeconds = Math.max(
+        availableMaximumSeconds,
+        Number(effectiveAccount.maxDurationSeconds || 0),
+      );
       if (Number(effectiveAccount.maxDurationSeconds || 0) >= requiredDurationSeconds
         && (!selected || candidate.score < selected.score)) {
         selected = candidate;
       }
-    } catch (_) {}
+    } catch (_) {
+      unavailableAccountCount += 1;
+    }
   }
 
-  selected ||= fallback;
-  if (!selected) throw new Error('captured DreamFace accounts are unavailable or expired');
-  await callBackground('dfSwitchAccount', { session: selected.account });
-  const selectedAuth = await callBulkOp('getAuthContext');
-  if (!selectedAuth?.hasAuth || selectedAuth.accountId !== selected.account.accountId) {
-    throw new Error(`DreamFace account ${selected.account.accountId} switch verification failed`);
+  if (!selected) {
+    const allRemainingAccountsUnavailable = attemptedAccountCount > 0
+      && unavailableAccountCount === attemptedAccountCount;
+    let message = 'captured DreamFace accounts are unavailable or expired';
+    let code = 'accounts_unavailable';
+    if (excludedAccountIds.size > 0 && !allRemainingAccountsUnavailable) {
+      message = 'all DreamFace accounts reached their active-work limit for this group';
+      code = 'all_accounts_at_limit';
+    } else if (availableMaximumSeconds > 0 && availableMaximumSeconds < requiredDurationSeconds) {
+      message = `no DreamFace account supports ${Math.ceil(requiredDurationSeconds)}s audio; maximum is ${availableMaximumSeconds}s`;
+      code = 'no_account_supports_duration';
+    }
+    const error = new Error(message);
+    error.code = code;
+    throw error;
   }
-  await callBackground('dfSaveAccount', { account: selected.account }).catch(() => {});
-  return selected.account;
+  return { ...selected.account, availableMaximumSeconds };
 }
 
 async function activateAccount(accountId, principalKey = '') {
-  const captured = await callBackground('dfCaptureAccount').catch(() => null);
-  let account = captured?.hasAuth
-    && (captured.accountId === accountId || (principalKey && captured.principalKey === principalKey))
-    ? captured
-    : null;
-  let canonicalAccount = null;
-  if (!account) {
-    const response = await callBackground('dfGetAccountSession', { accountId, principalKey }).catch(() => null);
-    canonicalAccount = response?.canonicalAccount || null;
-    account = canonicalAccount || response?.account || null;
-  }
-  if (!account) throw new Error(`DreamFace account ${accountId} is not saved`);
-  await callBackground('dfSwitchAccount', { session: account });
-  const auth = await callBulkOp('getAuthContext');
-  if (!auth?.hasAuth
-    || auth.accountId !== account.accountId
-    || (account.principalKey && auth.principalKey !== account.principalKey)) {
-    throw new Error(`DreamFace account ${accountId} switch failed`);
-  }
-  return { ...account, ...auth, rotatedFromAccountId: canonicalAccount?.accountId !== accountId ? accountId : '' };
-}
-
-async function activateBulkRunAccount(requiredDurationSeconds = 0) {
-  if (!runState.bulkContext?.accountId) {
-    const selected = await selectLeastLoadedAccount(requiredDurationSeconds);
-    const auth = await callBulkOp('getAuthContext');
-    if (!auth?.hasAuth) throw new Error('DreamFace account is not authenticated');
-    runState.bulkContext = {
-      accountId: selected?.accountId || auth.accountId,
-      maxDurationSeconds: Number(selected?.maxDurationSeconds || 180),
-    };
-    await pushState();
-    return auth;
-  }
-
-  const listed = await callBackground('dfListAccounts');
-  const saved = (listed.accounts || []).find((account) => account.accountId === runState.bulkContext.accountId);
-  if (saved) await callBackground('dfSwitchAccount', { session: saved });
-  const auth = await callBulkOp('getAuthContext');
-  if (!auth?.hasAuth || auth.accountId !== runState.bulkContext.accountId) {
-    throw new Error(`DreamFace account ${runState.bulkContext.accountId} is unavailable or expired`);
-  }
-  return auth;
+  const binding = await getAccountBinding(accountId, principalKey);
+  return {
+    ...binding,
+    account: {
+      ...binding.account,
+      rotatedFromAccountId: binding.account.accountId !== accountId ? accountId : '',
+    },
+  };
 }
 
 async function restoreBulkPresetIfNeeded() {
   const context = runState.bulkContext;
-  if (!context?.presetDirty || !context.batchConfigId) return;
+  const presetState = context?.presetState || (context?.presetDirty ? 'restore_required' : 'clean');
+  if (!context?.batchConfigId || !['dirty', 'restoring', 'restore_required'].includes(presetState)) return;
   if (!context.accountId) throw new Error('dirty preset account is unknown');
-  await activateAccount(context.accountId);
-  await callBulkOp('updateBatchConfig', {
-    id: context.batchConfigId,
-    name: context.batchName || 'Bulk Batch',
-    scriptConfigs: Array.isArray(context.originalScriptConfigs) ? context.originalScriptConfigs : [],
-  });
-  runState.bulkContext = { ...context, presetDirty: false };
+  runState.bulkContext = { ...context, presetState: 'restoring' };
   await pushState();
+  const { account, client } = await activateAccount(context.accountId, context.principalKey || '');
+  try {
+    await withAccountMutationLock(account.accountId, async () => {
+      await client.updateBatchConfig(
+        context.batchConfigId,
+        context.batchName || 'Bulk Batch',
+        Array.isArray(context.originalScriptConfigs) ? context.originalScriptConfigs : [],
+      );
+    });
+    runState.bulkContext = { ...context, accountId: account.accountId, principalKey: account.principalKey, presetState: 'clean' };
+    await pushState();
+  } catch (error) {
+    runState.bulkContext = { ...runState.bulkContext, presetState: 'restore_required' };
+    await pushState().catch(() => {});
+    throw error;
+  }
 }
 
 async function putOssFileDirect(putUrl, blob, contentType) {
@@ -1332,29 +1380,6 @@ async function putOssFileDirect(putUrl, blob, contentType) {
     body: blob,
   });
   if (!response.ok) throw new Error(`OSS upload failed: ${response.status}`);
-}
-
-async function uploadAudioDirect(blob, fileName, auth) {
-  const form = new FormData();
-  form.append('file', blob, fileName);
-  form.append('userId', auth.userId);
-  form.append('ossDir', 'AVATAR_AUDIO');
-  const response = await fetch('https://www.dreamfaceapp.com/dw-server/phone_file/upload_audio_with_dir', {
-    method: 'POST',
-    headers: {
-      accept: 'application/json',
-      'dream-face-web': 'dream-face-web',
-      token: auth.token,
-      'client-id': auth.clientId,
-    },
-    body: form,
-    credentials: 'include',
-  });
-  const parsed = await response.json().catch(() => null);
-  if (!response.ok || parsed?.status_msg !== 'Success' || !parsed?.data?.file_path) {
-    throw new Error(parsed?.status_msg || `audio upload failed: ${response.status}`);
-  }
-  return { filePath: parsed.data.file_path };
 }
 
 async function prepareBulkPlan(payload, runToken) {
@@ -1438,6 +1463,7 @@ async function prepareBulkPlan(payload, runToken) {
         video: videos[videoIndex],
         audios: assigned[videoIndex],
         workIds: [],
+        submissionPhase: 'preparing',
       });
     }
 
@@ -1469,9 +1495,18 @@ async function getLongestInputDurationSeconds(batches, runToken) {
 async function getBulkWatchUnits() {
   const resp = await callBackground('dfGetBulkWatchUnits');
   const units = Array.isArray(resp?.units) ? resp.units : [];
+  for (const unit of units) {
+    if (unit.submissionPhase === 'dispatching') {
+      unit.submissionPhase = 'submission_uncertain';
+      unit.status = 'submission_uncertain';
+      unit.lastError ||= 'Submission outcome was not persisted before the executor stopped';
+      unit.updatedAt = Date.now();
+    }
+  }
   const now = Date.now();
   const expiredTerminalUnits = units.filter((unit) => (
     unit.status !== 'pending'
+    && unit.status !== 'submission_uncertain'
     && now - Number(unit.updatedAt || unit.createdAt || 0) > BULK_WATCH_MAX_AGE_MS
   ));
   for (const unit of expiredTerminalUnits) await removeBulkWatchUnit(unit.id);
@@ -1484,8 +1519,8 @@ async function enrichWatchUnitPrincipals(units) {
   for (const unit of units) {
     if (unit.principalKey && !/^(account|user):/i.test(unit.principalKey)) continue;
     if (!cache.has(unit.accountId)) {
-      const response = await callBackground('dfGetAccountSession', { accountId: unit.accountId }).catch(() => null);
-      cache.set(unit.accountId, response?.account?.principalKey || `account:${unit.accountId}`);
+      const binding = await activateAccount(unit.accountId).catch(() => null);
+      cache.set(unit.accountId, binding?.account?.principalKey || `account:${unit.accountId}`);
     }
     unit.principalKey = cache.get(unit.accountId);
   }
@@ -1515,7 +1550,8 @@ async function addBulkWatchUnit(unit) {
     failedWorkIds: [],
     baselineWorkIds: Array.isArray(unit.baselineWorkIds) ? unit.baselineWorkIds : [],
     correlationDeadline: unit.correlationDeadline || new Date(Date.now() + (30 * 60 * 1000)).toISOString(),
-    status: 'pending',
+    status: unit.status || 'pending',
+    submissionPhase: unit.submissionPhase || 'correlating',
     targetCount: Math.max(0, Number(unit.targetCount ?? unit.expectedFileNames.length)),
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -1588,14 +1624,14 @@ function toEpochMs(value) {
 }
 
 async function watchAccountUnits(accountId, units, allAccountUnits) {
-  const activeAccount = await activateAccount(accountId, units[0]?.principalKey || '');
-  if (activeAccount.accountId !== accountId) {
-    for (const unit of units) unit.accountId = activeAccount.accountId;
+  const { account, client } = await activateAccount(accountId, units[0]?.principalKey || '');
+  if (account.accountId !== accountId) {
+    for (const unit of units) unit.accountId = account.accountId;
   }
   let allItems = [];
   const oldestSubmitMs = Math.min(...units.map((unit) => new Date(unit.submittedAt).getTime()).filter(Number.isFinite));
   for (let page = 1; ; page += 1) {
-    const result = await callBulkOp('getRecentCreations', { page, size: 100 });
+    const result = await client.getRecentCreations(page, 100);
     const pageItems = result?.items || [];
     allItems = allItems.concat(pageItems);
     const pageTimes = pageItems.map((item) => toEpochMs(item?.create_time)).filter((time) => time > 0);
@@ -1606,6 +1642,11 @@ async function watchAccountUnits(accountId, units, allAccountUnits) {
   }
   assignCreationItemsToWatchUnits(units, allItems, allAccountUnits);
   for (const unit of units) {
+    if (isSubmissionUncertain(unit)
+      && (unit.workIds || []).filter(Boolean).length >= Number(unit.targetCount || unit.expectedFileNames.length)) {
+      unit.submissionPhase = 'correlating';
+      unit.status = 'pending';
+    }
     unit.watcherStats = {
       checkedAt: new Date().toISOString(),
       scanned: allItems.length,
@@ -1615,15 +1656,15 @@ async function watchAccountUnits(accountId, units, allAccountUnits) {
     unit.lastError = '';
   }
 
-  const dmState = await callBackground('dm.getState').catch(() => ({ entries: [] }));
-  const dmStatusById = new Map((dmState.entries || []).map((entry) => [String(entry.workId), entry.status]));
+  let dmState = await callBackground('dm.getState').catch(() => ({ entries: [] }));
+  let dmStatusById = new Map((dmState.entries || []).map((entry) => [String(entry.workId), entry.status]));
   const terminalDownloadFailures = new Set(['failed', 'interrupted', 'missing']);
   for (const unit of units) {
     unit.enqueuedWorkIds = (unit.enqueuedWorkIds || []).filter((id) => dmStatusById.has(String(id)));
   }
 
   const discoveredIds = units.flatMap((unit) => unit.workIds || []).filter(Boolean);
-  const statusResult = await callBulkOp('getWorkStatuses', { ids: discoveredIds });
+  const statusResult = await client.getWorkStatuses(discoveredIds);
   const statusById = new Map((statusResult?.statuses || []).map((row) => [String(row.id), Number(row.web_work_status)]));
   for (const item of allItems) {
     if (item?.id && !statusById.has(String(item.id))) statusById.set(String(item.id), Number(item.web_work_status));
@@ -1652,7 +1693,7 @@ async function watchAccountUnits(accountId, units, allAccountUnits) {
   }
 
   if (readyIds.length > 0) {
-    const downloadResult = await callBulkOp('getDownloadUrls', { ids: [...new Set(readyIds)] });
+    const downloadResult = await client.getDownloadUrls([...new Set(readyIds)]);
     const urlById = new Map((downloadResult?.urls || []).filter((item) => item?.id && item?.url).map((item) => [String(item.id), item.url]));
     const queueItems = [];
     const queueRefs = [];
@@ -1685,17 +1726,29 @@ async function watchAccountUnits(accountId, units, allAccountUnits) {
       for (const { unit, id } of queueRefs) {
         unit.enqueuedWorkIds = [...new Set([...(unit.enqueuedWorkIds || []), id])];
       }
+      dmState = await callBackground('dm.getState').catch(() => ({ entries: [] }));
+      dmStatusById = new Map((dmState.entries || []).map((entry) => [String(entry.workId), entry.status]));
     }
   }
 
   for (const unit of units) {
+    const wasSubmissionUncertain = isSubmissionUncertain(unit);
+    const wasRequiresReview = unit.submissionPhase === 'requires_review' || unit.status === 'requires_review';
     const doneIds = (unit.workIds || []).filter((id) => dmStatusById.get(String(id)) === 'done');
     const downloadFailedIds = (unit.workIds || []).filter((id) => terminalDownloadFailures.has(dmStatusById.get(String(id))));
     const targetCount = Number(unit.targetCount || unit.expectedFileNames.length);
+    const hasAllWorkIds = (unit.workIds || []).filter(Boolean).length >= targetCount;
     if (doneIds.length >= targetCount) unit.status = 'complete';
-    else if (doneIds.length + (unit.failedWorkIds || []).length + downloadFailedIds.length >= targetCount) unit.status = 'failed';
-    else if (unit.correlationDeadline && Date.now() > new Date(unit.correlationDeadline).getTime()) unit.status = 'failed';
-    else unit.status = 'pending';
+    else if (!wasSubmissionUncertain
+      && doneIds.length + (unit.failedWorkIds || []).length + downloadFailedIds.length >= targetCount) unit.status = 'failed';
+    else if (!hasAllWorkIds && unit.correlationDeadline && Date.now() > new Date(unit.correlationDeadline).getTime()) {
+      unit.status = wasSubmissionUncertain ? 'requires_review' : 'failed';
+      if (wasSubmissionUncertain) unit.submissionPhase = 'requires_review';
+    } else {
+      unit.status = wasRequiresReview ? 'requires_review' : wasSubmissionUncertain ? 'submission_uncertain' : 'pending';
+      if (wasRequiresReview) unit.submissionPhase = 'requires_review';
+      else if (wasSubmissionUncertain) unit.submissionPhase = 'submission_uncertain';
+    }
     unit.updatedAt = Date.now();
   }
 }
@@ -1703,11 +1756,23 @@ async function watchAccountUnits(accountId, units, allAccountUnits) {
 async function runBulkWatcher({ allowDuringRun = false } = {}) {
   if (!allowDuringRun && runState.phase === 'running') return { ok: true, skipped: 'run-active' };
   if (bulkWatcherPromise) return bulkWatcherPromise;
-  bulkWatcherPromise = withBulkAccountLock(async () => {
-    const original = await capturePageSession();
-    try {
+  bulkWatcherPromise = (async () => {
     const units = await enrichWatchUnitPrincipals(await getBulkWatchUnits());
-    const pendingUnits = units.filter((unit) => unit.status === 'pending');
+    const queueById = new Map((runState.queuePlan || []).map((unit) => [String(unit.id), unit]));
+    for (const unit of units) {
+      const queueUnit = queueById.get(String(unit.id));
+      if (!isSubmissionUncertain(queueUnit)) continue;
+      unit.status = 'submission_uncertain';
+      unit.submissionPhase = 'submission_uncertain';
+      unit.lastError ||= queueUnit.lastError || 'Submission outcome is unknown after executor restart';
+    }
+    const pendingUnits = units.filter((unit) => (
+      unit.status === 'pending'
+      || unit.status === 'submission_uncertain'
+      || (unit.status === 'requires_review' && (unit.workIds || []).some(Boolean))
+      || ['dispatching', 'correlating', 'submission_uncertain'].includes(unit.submissionPhase)
+      || (unit.submissionPhase === 'requires_review' && (unit.workIds || []).some(Boolean))
+    ));
     reconcileDuplicateWatchClaims(pendingUnits);
     const byAccount = new Map();
     for (const unit of pendingUnits) {
@@ -1730,21 +1795,10 @@ async function runBulkWatcher({ allowDuringRun = false } = {}) {
     await callBackground('dfPatchBulkWatchUnits', { units: pendingUnits });
     return {
       ok: errors.length === 0,
-      pending: pendingUnits.filter((unit) => unit.status === 'pending').length,
+      pending: pendingUnits.filter((unit) => unit.status === 'pending' || unit.status === 'submission_uncertain').length,
       errors,
     };
-    } finally {
-      if (original) {
-        const restore = await callBackground('dfSwitchAccount', { session: original }).catch((error) => ({ ok: false, error: error.message }));
-        const restored = await capturePageSession();
-        if (!restore?.ok
-          || Boolean(restored?.hasAuth) !== Boolean(original.hasAuth)
-          || (original.hasAuth && restored?.accountId !== original.accountId)) {
-          throw new Error(restore?.error || 'watcher could not restore original DreamFace session');
-        }
-      }
-    }
-  }).finally(() => {
+  })().finally(() => {
     bulkWatcherPromise = null;
   });
   return bulkWatcherPromise;
@@ -1765,23 +1819,33 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
   };
   await pushState();
 
-  let completedAudioCount = queue.slice(0, startIndex).reduce((sum, unit) => sum + unit.audios.length, 0);
+  let completedAudioCount = queue.slice(0, startIndex).reduce((sum, unit) => (
+    unit.status === 'submitted'
+      || unit.submissionPhase === 'accepted'
+      ? sum + Number(unit.acceptedCount ?? unit.audios.length)
+      : sum
+  ), 0);
   runState.current = completedAudioCount;
   const plannedLoads = new Map();
 
   for (let index = startIndex; index < queue.length; index += 1) {
     throwIfStopped(runToken);
     const unit = queue[index];
-    if (unit.status === 'submitting' || unit.status === 'partial') {
-      await failRun(
-        `${unit.video.name}: статус bulk-отправки неизвестен. проверьте Creations перед повторным запуском, чтобы избежать дублей.`,
-        'bulk_submission_uncertain',
-      );
-      return;
+    if (isSubmissionUncertain(unit)) {
+      runState.nextTaskIndex = index + 1;
+      runState.recoverable = index + 1 < queue.length;
+      runState.warnings = [...runState.warnings, `${unit.video.name}: отправка не повторена (${unit.submissionPhase || unit.status})`];
+      await pushState();
+      continue;
     }
-    if (unit.status === 'submitted') {
-      for (const audio of unit.audios) await deleteTaskBlob(audio.id);
-      completedAudioCount += unit.audios.length;
+    if (unit.submissionPhase === 'accepted' || unit.submissionPhase === 'rejected_confirmed' || unit.status === 'submitted') {
+      const acceptedCount = unit.submissionPhase === 'rejected_confirmed'
+        ? 0
+        : Number(unit.acceptedCount ?? unit.audios.length);
+      if (acceptedCount === unit.audios.length) {
+        for (const audio of unit.audios) await deleteTaskBlob(audio.id);
+      }
+      completedAudioCount += acceptedCount;
       runState.current = completedAudioCount;
       runState.nextTaskIndex = index + 1;
       runState.queuePlan[index] = { ...unit, status: unit.status };
@@ -1789,19 +1853,46 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       continue;
     }
 
-    await withBulkAccountLock(async () => {
     const requiredDurationSeconds = unit.audios.reduce((max, audio) => Math.max(max, Number(audio.durationMs || 0) / 1000), 0);
+    const excludedAccountIds = new Set((unit.retryExcludedAccountIds || []).map(String));
     let selectedAccount;
+    let client;
     if (unit.accountId) {
-      selectedAccount = await activateAccount(unit.accountId);
+      const binding = await activateAccount(unit.accountId, unit.principalKey || '');
+      selectedAccount = binding.account;
+      client = binding.client;
+      unit.accountId = selectedAccount.accountId;
+      unit.principalKey = selectedAccount.principalKey;
+      runState.queuePlan[index] = { ...unit };
+      await pushState();
       throwIfStopped(runToken);
-      const capabilities = await callBulkOp('getAccountCapabilities');
+      const capabilities = await client.getAccountCapabilities();
       throwIfStopped(runToken);
       selectedAccount = { ...selectedAccount, ...capabilities };
     } else {
-      selectedAccount = await selectLeastLoadedAccount(requiredDurationSeconds, plannedLoads, unit.video.videoUrl);
+      try {
+        selectedAccount = await selectLeastLoadedAccount(
+          requiredDurationSeconds,
+          plannedLoads,
+          unit.video.videoUrl,
+          excludedAccountIds,
+        );
+      } catch (error) {
+        if (error.code !== 'all_accounts_at_limit') throw error;
+        unit.retryExcludedAccountIds = [];
+        unit.status = 'retry_wait';
+        unit.submissionPhase = 'account_limit_retry_pending';
+        unit.lastError = 'All accounts are currently at their active-work limit';
+        runState.queuePlan[index] = { ...unit };
+        runState.nextTaskIndex = index;
+        await pushState();
+        const retryError = new Error('все аккаунты достигли лимита активных работ. дождитесь освобождения слота и нажмите «возобновить»');
+        retryError.code = 'all_accounts_at_limit';
+        throw retryError;
+      }
       throwIfStopped(runToken);
       unit.accountId = selectedAccount.accountId;
+      unit.principalKey = selectedAccount.principalKey;
       const reservation = plannedLoads.get(unit.accountId) || {
         baselineLoad: Number(unit.assignmentBaselineLoad || 0),
         assigned: 0,
@@ -1809,31 +1900,31 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       reservation.assigned += unit.audios.length;
       plannedLoads.set(unit.accountId, reservation);
       unit.assignmentBaselineLoad = reservation.baselineLoad;
-      runState.queuePlan[index] = { ...unit, accountId: unit.accountId, status: 'assigned' };
+      runState.queuePlan[index] = { ...unit, accountId: unit.accountId, principalKey: unit.principalKey, status: 'assigned' };
       await pushState();
       throwIfStopped(runToken);
     }
-    await activateAccount(unit.accountId);
+    if (!client) ({ client } = await activateAccount(unit.accountId, selectedAccount.principalKey));
     throwIfStopped(runToken);
-    const unitAuth = await callBulkOp('getAuthContext');
+    const template = await client.getPtVideoInfo();
     throwIfStopped(runToken);
-    const template = await callBulkOp('getPtVideoInfo');
-    throwIfStopped(runToken);
-    const configResult = await callBulkOp('listBatchConfig', { configType: 'SCRIPT' });
+    const configResult = await client.listBatchConfigs('SCRIPT');
     throwIfStopped(runToken);
     const batchConfig = configResult?.configs?.[0];
     if (!batchConfig?.id) throw new Error(`DreamFace SCRIPT batch preset not found for ${unit.accountId}`);
-    const detailResult = await callBulkOp('getBatchConfigDetail', { id: batchConfig.id });
+    const detailResult = await client.getBatchConfigDetail(batchConfig.id);
     throwIfStopped(runToken);
     const originalConfig = detailResult?.config || {};
     const context = {
       accountId: unit.accountId,
+      principalKey: selectedAccount.principalKey,
       templateId: template.templateId,
       batchConfigId: batchConfig.id,
       batchName: batchConfig.name || 'Bulk Batch',
       originalScriptConfigs: Array.isArray(originalConfig.script_configs) ? originalConfig.script_configs : [],
-      presetDirty: false,
+      presetState: 'clean',
     };
+    setQueueSubmissionPhase(index, unit, 'preparing');
     runState.bulkContext = context;
     runState.currentTaskName = unit.video.name;
     setStatusText(`[${index + 1}/${queue.length}] подготовка аватара ${unit.video.name}`);
@@ -1848,7 +1939,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       avatar = { avatarId };
       setStatusText(`[${index + 1}/${queue.length}] аватар ${unit.video.name}: кэш (уже зарегистрирован)`);
     } else {
-      avatar = await callBulkOp('avatarAdd', { fileUrl: unit.video.videoUrl });
+      avatar = await client.addAvatar(unit.video.videoUrl);
       throwIfStopped(runToken);
       await setCachedAvatarId(unit.video.videoUrl, unit.accountId, avatar.avatarId);
       throwIfStopped(runToken);
@@ -1864,7 +1955,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       setStatusText(`[${index + 1}/${queue.length}] аудио ${audioIndex + 1}/${unit.audios.length}: ${audio.fileName}`);
       await pushState();
       throwIfStopped(runToken);
-      const uploaded = await uploadAudioDirect(record.blob, audio.fileName, unitAuth);
+      const uploaded = await client.uploadAudio(record.blob, audio.fileName);
       throwIfStopped(runToken);
       scriptConfigs.push({
         type: 'AUDIO',
@@ -1878,156 +1969,243 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
     }
 
     const batchName = context.batchName || 'Bulk Batch';
-    runState.bulkContext = { ...context, presetDirty: true };
-    await pushState();
-    throwIfStopped(runToken);
-    await callBulkOp('updateBatchConfig', { id: context.batchConfigId, name: batchName, scriptConfigs });
-    throwIfStopped(runToken);
     let submitted;
     let watchUnit;
-    try {
-      await callBulkOp('batchCheckText');
-      throwIfStopped(runToken);
-      unit.status = 'submitting';
-      const baseline = await callBulkOp('getRunningWorks');
-      throwIfStopped(runToken);
-      const recentBaseline = await callBulkOp('getRecentCreations', { page: 1, size: 100 });
-      throwIfStopped(runToken);
-      unit.baselineWorkIds = [
-        ...(baseline?.workIds || []),
-        ...(recentBaseline?.items || []).map((item) => String(item?.id || '')).filter(Boolean),
-      ];
-      unit.submittedAt = new Date().toISOString();
-      unit.correlationDeadline = new Date(Date.now() + (30 * 60 * 1000)).toISOString();
-      watchUnit = await addBulkWatchUnit({
-        id: unit.id,
-        runId: runState.runId,
-        accountId: unit.accountId,
-        principalKey: selectedAccount.principalKey,
-        expectedFileNames: unit.audios.map((audio) => audio.fileName),
-        submittedAt: unit.submittedAt,
-        correlationDeadline: unit.correlationDeadline,
-        baselineWorkIds: unit.baselineWorkIds || [],
-        targetCount: unit.audios.length,
-      });
-      try {
-        throwIfStopped(runToken);
-      } catch (error) {
-        await callBackground('dfPatchBulkWatchUnits', { units: [{
-          ...watchUnit,
-          status: 'submission_cancelled',
-          lastError: 'Run stopped before DreamFace submission',
-          updatedAt: Date.now(),
-        }] });
-        throw error;
+    let dispatchStarted = false;
+    let retryAfterAccountLimit = false;
+    const prepareAccountLimitRetry = async (error) => {
+      if (retryAfterAccountLimit) return;
+      retryAfterAccountLimit = true;
+      const failedAccountId = String(unit.accountId);
+      const reservation = plannedLoads.get(failedAccountId);
+      if (reservation && typeof reservation === 'object') {
+        reservation.assigned = Math.max(0, Number(reservation.assigned || 0) - unit.audios.length);
       }
-      runState.queuePlan[index] = { ...unit, status: 'submitting', accountId: unit.accountId };
+      unit.retryExcludedAccountIds = [...new Set([...(unit.retryExcludedAccountIds || []), failedAccountId])];
+      unit.accountId = '';
+      unit.principalKey = '';
+      unit.status = 'retrying';
+      unit.submissionPhase = 'account_limit_retry_pending';
+      unit.acceptedCount = 0;
+      unit.targetCount = unit.audios.length;
+      unit.lastError = `Account ${failedAccountId} reached its active-work limit; retrying this group on another account`;
+      delete unit.dispatchStartedAt;
+      delete unit.submissionResult;
+      runState.queuePlan[index] = { ...unit };
+      runState.warnings = [...runState.warnings, `${unit.video.name}: лимит активных работ на ${failedAccountId}, группа перенаправляется`];
       await pushState();
+      if (watchUnit) await removeBulkWatchUnit(watchUnit.id);
+    };
+    await withAccountMutationLock(unit.accountId, async () => {
       try {
+        runState.bulkContext = { ...context, presetState: 'dirty' };
+        await pushState();
         throwIfStopped(runToken);
-      } catch (error) {
-        await callBackground('dfPatchBulkWatchUnits', { units: [{
-          ...watchUnit,
-          status: 'submission_cancelled',
-          lastError: 'Run stopped before DreamFace submission',
-          updatedAt: Date.now(),
-        }] });
-        throw error;
-      }
-      try {
-        submitted = await callBulkOp('animateImageBatch', {
-          avatarId: avatar.avatarId,
-          videoUrl: unit.video.videoUrl,
-          scriptConfigs,
-          batchConfigId: context.batchConfigId,
-          name: batchName,
-          templateId: context.templateId,
-        });
-      } catch (error) {
-        if (usedCache) {
-          await invalidateCachedAvatarId(unit.video.videoUrl, unit.accountId);
-          runState.warnings = [...runState.warnings, `кэш аватара инвалидирован для ${unit.video.name} на ${unit.accountId}: ${error.message}`];
+        await client.updateBatchConfig(context.batchConfigId, batchName, scriptConfigs);
+        throwIfStopped(runToken);
+        try {
+          await client.checkBatchText();
+          throwIfStopped(runToken);
+          const baseline = await client.getRunningWorks();
+          throwIfStopped(runToken);
+          const recentBaseline = await client.getRecentCreations(1, 100);
+          throwIfStopped(runToken);
+          unit.baselineWorkIds = [
+            ...(baseline?.workIds || []),
+            ...(recentBaseline?.items || []).map((item) => String(item?.id || '')).filter(Boolean),
+          ];
+          unit.submittedAt = new Date().toISOString();
+          unit.correlationDeadline = new Date(Date.now() + (30 * 60 * 1000)).toISOString();
+          watchUnit = await addBulkWatchUnit({
+            id: unit.id,
+            runId: runState.runId,
+            accountId: unit.accountId,
+            principalKey: selectedAccount.principalKey,
+            expectedFileNames: unit.audios.map((audio) => audio.fileName),
+            submittedAt: unit.submittedAt,
+            correlationDeadline: unit.correlationDeadline,
+            baselineWorkIds: unit.baselineWorkIds || [],
+            targetCount: unit.audios.length,
+            status: 'pending',
+            submissionPhase: 'ready_to_dispatch',
+          });
+          setQueueSubmissionPhase(index, unit, 'ready_to_dispatch', { status: 'pending' });
+          await pushState();
+          try {
+            throwIfStopped(runToken);
+          } catch (error) {
+            setQueueSubmissionPhase(index, unit, 'cancelled_before_dispatch', {
+              status: 'cancelled',
+              lastError: 'Run stopped before DreamFace submission',
+            });
+            await pushState();
+            await patchWatchSubmissionPhase(watchUnit, 'cancelled_before_dispatch', {
+              status: 'cancelled',
+              targetCount: 0,
+              lastError: 'Run stopped before DreamFace submission',
+            });
+            throw error;
+          }
+          setQueueSubmissionPhase(index, unit, 'dispatching', { status: 'submitting', dispatchStartedAt: new Date().toISOString() });
+          await pushState();
+          await patchWatchSubmissionPhase(watchUnit, 'dispatching', { status: 'pending', dispatchStartedAt: unit.dispatchStartedAt });
+          dispatchStarted = true;
+          submitted = await client.animateImageBatch({
+            avatarId: avatar.avatarId,
+            videoUrl: unit.video.videoUrl,
+            scriptConfigs,
+            batchConfigId: context.batchConfigId,
+            name: batchName,
+            templateId: context.templateId,
+          });
+          if (submitted.successCount > 0) {
+            const submissionPhase = submitted.successCount < scriptConfigs.length ? 'requires_review' : 'accepted';
+            setQueueSubmissionPhase(index, unit, submissionPhase, {
+              status: submitted.successCount < scriptConfigs.length ? 'partial' : 'submitted',
+              acceptedCount: submitted.successCount,
+              targetCount: submitted.successCount,
+              submissionResult: submitted,
+            });
+            await patchWatchSubmissionPhase(watchUnit, 'correlating', {
+              status: 'pending',
+              submissionResult: submitted,
+              targetCount: submitted.successCount,
+            }).catch((error) => {
+              runState.warnings = [...runState.warnings, `не удалось сразу сохранить watcher отправки: ${error.message || String(error)}`];
+            });
+          } else {
+            setQueueSubmissionPhase(index, unit, 'rejected_confirmed', {
+              status: 'rejected',
+              acceptedCount: 0,
+              targetCount: unit.audios.length,
+              submissionResult: submitted,
+            });
+            await patchWatchSubmissionPhase(watchUnit, 'rejected_confirmed', {
+              status: 'rejected',
+              submissionResult: submitted,
+              lastError: 'DreamFace confirmed zero successful submissions',
+              targetCount: unit.audios.length,
+            }).catch((error) => {
+              runState.warnings = [...runState.warnings, `не удалось сразу сохранить watcher отказа: ${error.message || String(error)}`];
+            });
+          }
+          await pushState().catch((error) => {
+            runState.warnings = [...runState.warnings, `не удалось сразу сохранить результат отправки: ${error.message || String(error)}`];
+          });
+        } catch (error) {
+          if (submitted) throw error;
+          if (error.code === 'account_limit_reached') {
+            await prepareAccountLimitRetry(error);
+            return;
+          }
+          if (dispatchStarted && usedCache) {
+            await invalidateCachedAvatarId(unit.video.videoUrl, unit.accountId);
+            runState.warnings = [...runState.warnings, `кэш аватара инвалидирован для ${unit.video.name} на ${unit.accountId}: ${error.message}`];
+          }
+          if (watchUnit) {
+            const stoppedBeforeDispatch = !dispatchStarted && error.code === 'run_stopped';
+            const submissionPhase = dispatchStarted
+              ? 'submission_uncertain'
+              : stoppedBeforeDispatch ? 'cancelled_before_dispatch' : 'ready_to_dispatch';
+            setQueueSubmissionPhase(index, unit, submissionPhase, {
+              status: dispatchStarted ? 'submission_uncertain' : stoppedBeforeDispatch ? 'cancelled' : 'ready',
+              lastError: error.message || String(error),
+            });
+            await Promise.allSettled([
+              pushState(),
+              patchWatchSubmissionPhase(watchUnit, submissionPhase, {
+                status: dispatchStarted ? 'submission_uncertain' : stoppedBeforeDispatch ? 'cancelled' : 'ready',
+                targetCount: stoppedBeforeDispatch ? 0 : watchUnit.targetCount,
+                lastError: error.message || String(error),
+                submissionError: dispatchStarted ? {
+                  message: error.message || String(error),
+                  recordedAt: new Date().toISOString(),
+                } : undefined,
+              }),
+            ]);
+          }
+          throw error;
         }
-        await callBackground('dfPatchBulkWatchUnits', { units: [{
-          ...watchUnit,
-          status: 'submission_uncertain',
-          lastError: error.message || String(error),
-          submissionError: {
-            message: error.message || String(error),
-            recordedAt: new Date().toISOString(),
-          },
-          updatedAt: Date.now(),
-        }] });
-        throw error;
-      }
-      if (submitted.successCount === 0) {
-        await callBackground('dfPatchBulkWatchUnits', { units: [{
-          ...watchUnit,
-          status: 'submission_failed',
-          submissionResult: submitted,
-          lastError: 'DreamFace confirmed zero successful submissions',
-          updatedAt: Date.now(),
-        }] });
-      }
-      if (submitted.successCount > 0) {
-        await addBulkWatchUnit({
-          id: unit.id,
-          runId: runState.runId,
-          accountId: unit.accountId,
-          principalKey: selectedAccount.principalKey,
-          expectedFileNames: unit.audios.map((audio) => audio.fileName),
-          submittedAt: unit.submittedAt,
-          correlationDeadline: unit.correlationDeadline,
-          baselineWorkIds: unit.baselineWorkIds || [],
-          targetCount: submitted.successCount,
+        throwIfStopped(runToken);
+      } catch (error) {
+        if (error.code !== 'account_limit_reached') throw error;
+        await prepareAccountLimitRetry(error);
+      } finally {
+        runState.bulkContext = { ...runState.bulkContext, presetState: 'restoring' };
+        await pushState().catch(() => {});
+        let presetState = 'restore_required';
+        await client.updateBatchConfig(
+          context.batchConfigId,
+          batchName,
+          context.originalScriptConfigs || [],
+        ).then(() => {
+          presetState = 'clean';
+        }).catch((error) => {
+          runState.warnings = [...runState.warnings, `не удалось восстановить preset ${unit.accountId}: ${error.message}`];
         });
+        runState.bulkContext = { ...runState.bulkContext, presetState };
+        await pushState();
       }
-      throwIfStopped(runToken);
-    } finally {
-      let presetRestored = false;
-      await callBulkOp('updateBatchConfig', {
-        id: context.batchConfigId,
-        name: batchName,
-        scriptConfigs: context.originalScriptConfigs || [],
-      }).then(() => {
-        presetRestored = true;
-      }).catch((error) => {
-        runState.warnings = [...runState.warnings, `не удалось восстановить preset ${unit.accountId}: ${error.message}`];
-      });
-      runState.bulkContext = { ...runState.bulkContext, presetDirty: !presetRestored };
-      await pushState();
-    }
-    if (runState.bulkContext?.presetDirty) {
+    });
+    if (runState.bulkContext?.presetState === 'restore_required') {
       throw new Error('DreamFace preset restoration failed; run can be resumed after connection recovery');
     }
-    if (submitted.successCount !== scriptConfigs.length) {
-      unit.status = 'partial';
-      runState.queuePlan[index] = { ...unit, status: 'partial' };
+    if (retryAfterAccountLimit) {
+      setStatusText(`[${index + 1}/${queue.length}] лимит аккаунта, выбираем другой`);
       await pushState();
-      throw new Error(`bulk submit accepted ${submitted.successCount}/${scriptConfigs.length}; failed ${submitted.failCount || 0}`);
+      index -= 1;
+      continue;
     }
-    unit.status = 'submitted';
+    if (submitted.successCount !== scriptConfigs.length) {
+      runState.warnings = [...runState.warnings, `bulk submit accepted ${submitted.successCount}/${scriptConfigs.length}; failed ${submitted.failCount || 0}`];
+    }
+    if (submitted.successCount === 0) {
+      runState.failures = [...runState.failures, `${unit.video.name}: DreamFace rejected all submissions`];
+    }
 
-    completedAudioCount += unit.audios.length;
+    completedAudioCount += submitted.successCount;
     runState.current = completedAudioCount;
     runState.nextTaskIndex = index + 1;
-    runState.queuePlan[index] = { ...unit, status: 'submitted', accountId: unit.accountId, submittedAt: unit.submittedAt, workIds: [] };
+    runState.queuePlan[index] = { ...unit, accountId: unit.accountId, submittedAt: unit.submittedAt, workIds: [] };
     await pushState();
 
     unit.workIds = [];
-    for (const audio of unit.audios) await deleteTaskBlob(audio.id);
+    if (submitted.successCount === unit.audios.length) {
+      for (const audio of unit.audios) await deleteTaskBlob(audio.id);
+    }
 
-    runState.queuePlan[index] = { ...unit, status: 'submitted', workIds: [...unit.workIds] };
+    runState.queuePlan[index] = { ...unit, workIds: [...unit.workIds] };
     runState.downloadPlan = {
       ...runState.downloadPlan,
       expectedWorkIds: runState.queuePlan.flatMap((item) => item.workIds || []),
     };
     setStatusText(`[${index + 1}/${queue.length}] bulk OK: ${unit.audios.length}`);
     await pushState();
-    });
     await runBulkWatcher({ allowDuringRun: true }).catch(() => {});
   }
 
+  const uncertainCount = runState.queuePlan.filter(isSubmissionUncertain).length;
+  const rejectedCount = runState.queuePlan.filter((unit) => (
+    unit.submissionPhase === 'rejected_confirmed' && Number(unit.acceptedCount || 0) === 0
+  )).length;
+  const reviewCount = uncertainCount + rejectedCount;
+  if (reviewCount > 0) {
+    runState.phase = 'finished';
+    runState.interrupted = true;
+    runState.recoverable = false;
+    runState.interruptionReason = uncertainCount > 0
+      ? 'completed_with_submission_uncertain'
+      : 'completed_with_rejected_submissions';
+    runState.finishedAt = new Date().toISOString();
+    runState.downloadPlan = {
+      ...runState.downloadPlan,
+      lastStatus: 'requires_review',
+      lastMessage: `безопасная очередь завершена; групп для проверки: ${reviewCount}`,
+    };
+    setStatusText(runState.downloadPlan.lastMessage);
+    await pushState();
+    return;
+  }
   await finishRun('Отправка завершена. Ожидаем результаты DreamFace.');
 }
 
@@ -2073,6 +2251,40 @@ async function finishRun(message) {
   runState.finishedAt = new Date().toISOString();
   setStatusText(message);
   await pushState();
+}
+
+async function finishStoppedRun() {
+  const uncertainCount = (runState.queuePlan || []).filter(isSubmissionUncertain).length;
+  const nextIndex = Number(runState.nextTaskIndex || 0);
+  const hasSafeRemaining = (runState.queuePlan || []).slice(nextIndex).some((unit) => !isSubmissionUncertain(unit)
+    && unit.submissionPhase !== 'accepted'
+    && unit.submissionPhase !== 'rejected_confirmed');
+  runState.phase = 'finished';
+  runState.interrupted = true;
+  runState.recoverable = hasSafeRemaining;
+  runState.interruptionReason = uncertainCount > 0 ? 'stopped_with_submission_uncertain' : 'user_stopped';
+  runState.finishedAt = new Date().toISOString();
+  runState.downloadPlan = {
+    ...runState.downloadPlan,
+    lastStatus: uncertainCount > 0 ? 'submission_uncertain' : 'stopped',
+    lastMessage: uncertainCount > 0
+      ? `остановлено; отправок с неизвестным результатом: ${uncertainCount}`
+      : 'обработка остановлена пользователем',
+  };
+  setStatusText(runState.downloadPlan.lastMessage);
+  await pushState();
+}
+
+async function failBulkRun(error) {
+  const uncertainCount = (runState.queuePlan || []).filter(isSubmissionUncertain).length;
+  if (uncertainCount === 0) {
+    await failRun(`ошибка движка: ${error.message}`, 'bulk_failure');
+    return;
+  }
+  await failRun(
+    `ошибка после начала отправки; результат ${uncertainCount} отправок неизвестен и отслеживается без повтора: ${error.message}`,
+    'bulk_submission_uncertain',
+  );
 }
 
 async function runCreationsDownload(expectedFileNames) {
@@ -2475,11 +2687,18 @@ async function resetRunState() {
     return { ok: false, error: 'engine is busy' };
   }
 
+  try {
+    await restoreBulkPresetIfNeeded();
+  } catch (error) {
+    return { ok: false, error: `DreamFace preset must be restored before reset: ${error.message || String(error)}` };
+  }
   await resetRunStateInternal();
+  initializationError = null;
   return { ok: true, state: cloneState() };
 }
 
 async function startRun(payload, admissionToken) {
+  await restoreBulkPresetIfNeeded();
   currentRunToken += 1;
   const runToken = currentRunToken;
   stopRequested = false;
@@ -2503,21 +2722,25 @@ async function startRun(payload, admissionToken) {
   runState.recoverable = false;
   setStatusText(`${ENGINE_STATUS_PREFIX} подготовка очереди`);
   await pushState();
-  const originalSession = await capturePageSession();
 
   try {
     if (runState.mode === 'bulk') {
-      const longestInput = await getLongestInputDurationSeconds(payload.batches, runToken);
-      await withBulkAccountLock(async () => {
-        const selected = await selectLeastLoadedAccount(longestInput);
-        const auth = await callBulkOp('getAuthContext');
-        if (!auth?.hasAuth) throw new Error('DreamFace account is not authenticated');
-        const selectedLimit = Number(selected.maxDurationSeconds || DEFAULT_MAX_DURATION_SECONDS);
-        runState.bulkContext = { accountId: selected.accountId || auth.accountId, maxDurationSeconds: selectedLimit };
-        runState.maxDurationSeconds = selectedLimit;
-        payload.options = { ...payload.options, maxDurationSeconds: selectedLimit };
-        await pushState();
-      });
+      // Choose the least-loaded account WITHOUT filtering by raw input duration.
+      // The raw longest input (e.g. 897s) may exceed every account's limit (e.g. 600s);
+      // filtering by it aborted the run before normalizeFile could split long audios.
+      // Instead, drive the split target from the MAX duration supported across all
+      // accounts so normalizeFile slices long inputs into chunks every qualifying
+      // account can accept, and per-unit dispatch (selectLeastLoadedAccount) succeeds.
+      const selected = await selectLeastLoadedAccount(0);
+      const splitTarget = Math.max(
+        Number(selected.availableMaximumSeconds || 0),
+        Number(selected.maxDurationSeconds || 0),
+        DEFAULT_MAX_DURATION_SECONDS,
+      );
+      runState.bulkContext = { accountId: selected.accountId, maxDurationSeconds: splitTarget, presetState: 'clean' };
+      runState.maxDurationSeconds = splitTarget;
+      payload.options = { ...payload.options, maxDurationSeconds: splitTarget };
+      await pushState();
     }
     const { queue, summary, consumedInputIds = [] } = runState.mode === 'bulk'
       ? await prepareBulkPlan(payload, runToken)
@@ -2535,26 +2758,14 @@ async function startRun(payload, admissionToken) {
     }
   } catch (error) {
     if (error.code === 'run_stopped') {
-      await finishRun('обработка остановлена пользователем');
+      await finishStoppedRun();
       return;
     }
 
-    await failRun(`ошибка движка: ${error.message}`, runState.mode === 'bulk' ? 'bulk_failure' : '');
+    if (runState.mode === 'bulk') await failBulkRun(error);
+    else await failRun(`ошибка движка: ${error.message}`);
   } finally {
     stopRequested = false;
-    if (runState.mode === 'bulk' && originalSession) {
-      await withBulkAccountLock(async () => {
-        await callBackground('dfSwitchAccount', { session: originalSession });
-        const restored = await capturePageSession();
-        if (Boolean(restored?.hasAuth) !== Boolean(originalSession.hasAuth)
-          || (originalSession.hasAuth && restored?.accountId !== originalSession.accountId)) {
-          throw new Error('failed to restore original DreamFace session after run');
-        }
-      }).catch((error) => {
-        runState.warnings = [...runState.warnings, error.message || String(error)];
-        pushState().catch(() => {});
-      });
-    }
     if (runState.phase === 'finished') {
       await clearInputFiles().catch(() => {});
     }
@@ -2596,10 +2807,9 @@ async function resumeRun(payload = {}, admissionToken) {
   runState.interruptionReason = '';
   setStatusText(`${ENGINE_STATUS_PREFIX} возобновление очереди`);
   await pushState();
-  const originalSession = await capturePageSession();
 
   try {
-    await withBulkAccountLock(() => restoreBulkPresetIfNeeded());
+    await restoreBulkPresetIfNeeded();
   } catch (error) {
     await failRun(`не удалось восстановить DreamFace preset: ${error.message}`, 'bulk_preset_restore_failed');
     releaseRunAdmission(admissionToken);
@@ -2608,32 +2818,20 @@ async function resumeRun(payload = {}, admissionToken) {
 
   const processor = runState.mode === 'bulk' ? processBulkQueue : processQueue;
   processor(runState.queuePlan, runToken, Number(runState.nextTaskIndex || 0)).catch(async (error) => {
-    if (error.code === 'run_stopped') await finishRun('обработка остановлена пользователем');
-    else await failRun(`ошибка движка: ${error.message}`, runState.mode === 'bulk' ? 'bulk_failure' : '');
-  }).finally(async () => {
-    try {
-      if (originalSession) {
-        await withBulkAccountLock(async () => {
-          await callBackground('dfSwitchAccount', { session: originalSession });
-          const restored = await capturePageSession();
-          if (Boolean(restored?.hasAuth) !== Boolean(originalSession.hasAuth)
-            || (originalSession.hasAuth && restored?.accountId !== originalSession.accountId)) {
-            throw new Error('failed to restore original DreamFace session after resume');
-          }
-        }).catch((error) => {
-          runState.warnings = [...runState.warnings, error.message || String(error)];
-          pushState().catch(() => {});
-        });
-      }
-    } finally {
-      releaseRunAdmission(admissionToken);
-    }
+    if (error.code === 'run_stopped') await finishStoppedRun();
+    else if (runState.mode === 'bulk') await failBulkRun(error);
+    else await failRun(`ошибка движка: ${error.message}`);
+  }).finally(() => {
+    releaseRunAdmission(admissionToken);
   });
 
   return { ok: true, state: cloneState() };
 }
 
 async function stopRun() {
+  if (!isBusyPhase(runState.phase)) {
+    return { ok: true, alreadyStopped: true, state: cloneState() };
+  }
   stopRequested = true;
   runState.phase = 'stopping';
   setStatusText('остановка...');
@@ -2906,7 +3104,13 @@ async function handleMuxOne(payload) {
     }
     const blob = new Blob([outBytes], { type: 'video/mp4' });
     const blobUrl = URL.createObjectURL(blob);
-    return { ok: true, blobUrl, bytes: outBytes.byteLength, chapters };
+    const blobLeaseId = crypto.randomUUID();
+    processedBlobLeases.set(blobLeaseId, {
+      blobUrl,
+      createdAt: Date.now(),
+      workId: String(payload?.workId || ''),
+    });
+    return { ok: true, blobUrl, blobLeaseId, bytes: outBytes.byteLength, chapters };
   } catch (err) {
     console.error('[offscreen] muxOne failed:', err.message);
     return { ok: false, error: err.message };
@@ -3108,10 +3312,28 @@ async function probeVideoDurationMs(inPath) {
 
 // Освободить blob:URL после того как chrome.downloads его подхватил.
 function handleRevokeBlob(payload) {
-  const blobUrl = payload?.blobUrl;
+  const blobLeaseId = String(payload?.blobLeaseId || '');
+  const lease = blobLeaseId ? processedBlobLeases.get(blobLeaseId) : null;
+  const blobUrl = lease?.blobUrl || payload?.blobUrl;
   if (!blobUrl) return { ok: false, error: 'no blobUrl' };
-  try { URL.revokeObjectURL(blobUrl); return { ok: true }; }
+  try {
+    URL.revokeObjectURL(blobUrl);
+    if (blobLeaseId) processedBlobLeases.delete(blobLeaseId);
+    return { ok: true };
+  }
   catch (err) { return { ok: false, error: err.message }; }
+}
+
+function handleReconcileBlobLeases(payload) {
+  const retained = new Set(Array.isArray(payload?.retainedLeaseIds) ? payload.retainedLeaseIds : []);
+  let revoked = 0;
+  for (const [blobLeaseId, lease] of processedBlobLeases) {
+    if (retained.has(blobLeaseId)) continue;
+    URL.revokeObjectURL(lease.blobUrl);
+    processedBlobLeases.delete(blobLeaseId);
+    revoked += 1;
+  }
+  return { ok: true, retained: retained.size, revoked };
 }
 
 // LEGACY: оставлен как shim для обратной совместимости. Реальная логика
@@ -3179,6 +3401,31 @@ async function restoreRunState() {
     normalization: { ...idle.normalization, ...(saved.normalization || {}) },
     downloadPlan: { ...idle.downloadPlan, ...(saved.downloadPlan || {}) },
   };
+  runState.bulkContext = runState.bulkContext ? {
+    ...runState.bulkContext,
+    presetState: runState.bulkContext.presetState
+      || (runState.bulkContext.presetDirty ? 'restore_required' : 'clean'),
+  } : null;
+  runState.queuePlan = runState.queuePlan.map((unit) => {
+    if (unit.submissionPhase !== 'dispatching' && unit.status !== 'submitting') return unit;
+    return {
+      ...unit,
+      status: 'submission_uncertain',
+      submissionPhase: 'submission_uncertain',
+      lastError: unit.lastError || 'Executor stopped after dispatch began; submission outcome is unknown',
+    };
+  });
+
+  const presetState = runState.bulkContext?.presetState || 'clean';
+  if (['dirty', 'restoring', 'restore_required'].includes(presetState)) {
+    try {
+      await restoreBulkPresetIfNeeded();
+    } catch (error) {
+      runState.warnings = [...runState.warnings, `startup preset restore failed: ${error.message || String(error)}`];
+      await pushState().catch(() => {});
+      throw error;
+    }
+  }
 
   if (['preparing', 'normalizing', 'ready', 'running', 'stopping'].includes(runState.phase)) {
     const remainingTasks = Math.max(0, runState.queuePlan.length - Number(runState.nextTaskIndex || 0));
@@ -3207,8 +3454,24 @@ async function restoreRunState() {
 
 const initializationPromise = restoreRunState().catch((error) => {
   console.error('[offscreen] run state restore failed:', error.message);
-  runState = createIdleRunState();
+  initializationError = error;
 });
+
+async function ensureInitialized() {
+  await initializationPromise;
+  if (!initializationError) return;
+  if (!initializationRetryPromise) {
+    initializationRetryPromise = restoreRunState().then(() => {
+      initializationError = null;
+    }).catch((error) => {
+      initializationError = error;
+      throw error;
+    }).finally(() => {
+      initializationRetryPromise = null;
+    });
+  }
+  await initializationRetryPromise;
+}
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request?.target !== 'offscreen') {
@@ -3224,6 +3487,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   (async () => {
     await initializationPromise;
+    if (request.action !== 'bulkWatcherTick' || !initializationError) {
+      await ensureInitialized();
+    }
     switch (request.action) {
       case 'prepareRun':
         if (isBusyPhase(runState.phase)) {
@@ -3278,6 +3544,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
       case 'revokeBlob':
         sendResponse(handleRevokeBlob(request.payload));
+        return;
+
+      case 'reconcileBlobLeases':
+        sendResponse(handleReconcileBlobLeases(request.payload));
         return;
 
       case 'resetRunState':

@@ -60,6 +60,7 @@ const stopBtn = document.getElementById('stopBtn');
 const backBtn = document.getElementById('backBtn');
 const resumeBtn = document.getElementById('resumeBtn');
 const retryDownloadsBtn = document.getElementById('retryDownloadsBtn');
+const stopNote = document.getElementById('stopNote');
 const monitorTitle = document.getElementById('monitorTitle');
 const monitorPreparation = document.getElementById('monitorPreparation');
 const monitorProgressLabel = document.getElementById('monitorProgressLabel');
@@ -95,6 +96,7 @@ const PHASE_LABEL = {
   running: 'отправляем в DreamFace',
   downloading: 'скачиваем результаты',
   stopping: 'останавливаем очередь',
+  stopped: 'отправка остановлена',
   finished: 'отправка завершена',
   failed: 'обработка прервалась',
 };
@@ -107,6 +109,7 @@ const KICKER_LABEL = {
   running: 'обработка',
   downloading: 'обработка',
   stopping: 'обработка',
+  stopped: 'остановлено',
   finished: 'готово',
   failed: 'остановлено',
 };
@@ -118,7 +121,24 @@ const PLACEHOLDER_REASONS = new Set([
   'запуск нормализации...',
 ]);
 
+function isUserStoppedRun(state) {
+  return Boolean(
+    state
+    && (state.phase === 'stopped'
+      || ['user_stopped', 'stopped_with_submission_uncertain'].includes(state.interruptionReason)
+      || /остановлен[ао]? пользователем|stopped by (?:the )?user/i.test(state.statusText || '')),
+  );
+}
+
+function isSubmissionUncertainRun(state) {
+  return ['bulk_submission_uncertain', 'completed_with_submission_uncertain', 'stopped_with_submission_uncertain']
+    .includes(state?.interruptionReason);
+}
+
 function getMonitorKickerLabel(state) {
+  if (isUserStoppedRun(state)) {
+    return KICKER_LABEL.stopped;
+  }
   if (state?.phase === 'failed' && state.recoverable && state.interrupted) {
     return 'пауза';
   }
@@ -128,6 +148,9 @@ function getMonitorKickerLabel(state) {
 function getMonitorPhaseLabel(state) {
   if (!state) {
     return PHASE_LABEL.idle;
+  }
+  if (isUserStoppedRun(state)) {
+    return PHASE_LABEL.stopped;
   }
   const base = PHASE_LABEL[state.phase] || state.phase || PHASE_LABEL.idle;
   if (state.phase === 'failed' && state.recoverable && state.interrupted) {
@@ -253,6 +276,12 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+function getConciseMessage(value, fallback = '', maxLength = 140) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return fallback;
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
 async function getSettings() {
@@ -1393,7 +1422,7 @@ function canUseCreations(state) {
 function canResumeRun(state) {
   return Boolean(
     state
-    && state.phase === 'failed'
+    && ['failed', 'finished'].includes(state.phase)
     && state.interrupted
     && state.recoverable
     && Array.isArray(state.queuePlan)
@@ -1627,8 +1656,10 @@ function renderSummary(state) {
 }
 
 const DM_FAILED_STATUSES = new Set(['failed', 'interrupted', 'missing']);
-const DM_ACTIVE_STATUSES = new Set(['queued', 'retry_wait', 'fetching', 'muxing', 'saving']);
-const WATCH_FAILED_STATUSES = new Set(['failed', 'submission_failed', 'submission_cancelled']);
+const DM_ACTIVE_STATUSES = new Set(['queued', 'retry_wait', 'fetching', 'muxing', 'dispatching', 'saving']);
+const DM_UNCERTAIN_STATUSES = new Set(['uncertain']);
+const WATCH_FAILED_STATUSES = new Set(['failed', 'submission_failed', 'submission_cancelled', 'rejected']);
+const WATCH_UNCERTAIN_STATUSES = new Set(['submission_uncertain', 'correlating']);
 
 function getAccountLabel(accountId) {
   const account = savedAccounts.find((item) => String(item.accountId) === String(accountId));
@@ -1645,6 +1676,8 @@ function deriveUnitStages(unit, dmByWorkId) {
   let downloaded = 0;
   let downloading = 0;
   let failed = new Set((unit.failedWorkIds || []).map(String)).size;
+  let uncertain = 0;
+  let requiresReview = 0;
   let dmReadyCount = 0;
 
   for (const workId of workIds) {
@@ -1654,6 +1687,7 @@ function deriveUnitStages(unit, dmByWorkId) {
     dmReadyCount += 1;
     if (entry.status === 'done') downloaded += 1;
     else if (DM_FAILED_STATUSES.has(entry.status)) failed += 1;
+    else if (DM_UNCERTAIN_STATUSES.has(entry.status)) uncertain += 1;
     else if (DM_ACTIVE_STATUSES.has(entry.status)) downloading += 1;
   }
 
@@ -1666,8 +1700,11 @@ function deriveUnitStages(unit, dmByWorkId) {
   downloading = Math.min(total - failed - downloaded, downloading);
   const readyReported = Math.max(0, Number(unit.watcherStats?.ready || 0));
   const ready = Math.min(total - failed - downloaded - downloading, Math.max(0, readyReported - dmReadyCount));
-  const processing = Math.max(0, total - failed - downloaded - downloading - ready);
-  return { total, processing, ready, downloading, downloaded, failed };
+  const unresolved = Math.max(0, total - failed - downloaded - downloading - ready);
+  if (WATCH_UNCERTAIN_STATUSES.has(unit.status)) uncertain = unresolved;
+  else if (unit.status === 'requires_review') requiresReview = unresolved;
+  const processing = Math.max(0, unresolved - uncertain - requiresReview);
+  return { total, processing, uncertain, requiresReview, ready, downloading, downloaded, failed };
 }
 
 function deriveCurrentRunModel() {
@@ -1679,26 +1716,41 @@ function deriveCurrentRunModel() {
   ));
   const dmByWorkId = new Map(currentDownloads.map((entry) => [String(entry.workId), entry]));
   const accounts = new Map();
-  const stages = { sent: 0, processing: 0, ready: 0, downloading: 0, downloaded: 0, failed: 0 };
+  const stages = {
+    sent: 0,
+    processing: 0,
+    uncertain: 0,
+    requiresReview: 0,
+    ready: 0,
+    downloading: 0,
+    downloaded: 0,
+    failed: 0,
+  };
 
   for (const unit of units) {
     const unitStages = deriveUnitStages(unit, dmByWorkId);
     stages.sent += unitStages.total;
     stages.processing += unitStages.processing;
+    stages.uncertain += unitStages.uncertain;
+    stages.requiresReview += unitStages.requiresReview;
     stages.ready += unitStages.ready;
     stages.downloading += unitStages.downloading;
     stages.downloaded += unitStages.downloaded;
     stages.failed += unitStages.failed;
     const key = String(unit.accountId || 'unknown');
-    const row = accounts.get(key) || { accountId: key, total: 0, downloaded: 0, failed: 0, errors: [] };
+    const row = accounts.get(key) || {
+      accountId: key,
+      total: 0,
+      downloaded: 0,
+      failed: 0,
+      uncertain: 0,
+      requiresReview: 0,
+    };
     row.total += unitStages.total;
     row.downloaded += unitStages.downloaded;
     row.failed += unitStages.failed;
-    if (unit.lastError) row.errors.push(unit.lastError);
-    for (const workId of unit.workIds || []) {
-      const error = dmByWorkId.get(String(workId))?.error;
-      if (error && !row.errors.includes(error)) row.errors.push(error);
-    }
+    row.uncertain += unitStages.uncertain;
+    row.requiresReview += unitStages.requiresReview;
     accounts.set(key, row);
   }
 
@@ -1706,7 +1758,8 @@ function deriveCurrentRunModel() {
   if (expected > stages.sent) {
     const unowned = expected - stages.sent;
     stages.sent = expected;
-    if (latestRunState?.phase === 'failed' && !latestRunState?.recoverable) stages.failed += unowned;
+    if (isSubmissionUncertainRun(latestRunState)) stages.uncertain += unowned;
+    else if (latestRunState?.phase === 'failed' && !latestRunState?.recoverable) stages.failed += unowned;
     else stages.processing += unowned;
   }
   stages.failed = Math.min(stages.sent, stages.failed);
@@ -1725,13 +1778,15 @@ function renderCurrentRunMonitor() {
   const labels = [
     ['sent', 'Всего'],
     ['processing', 'В обработке'],
+    ['uncertain', 'Уточняется'],
+    ['requiresReview', 'Нужна проверка'],
     ['ready', 'Готово'],
     ['downloading', 'Скачивается'],
     ['downloaded', 'Скачано'],
     ['failed', 'Ошибки'],
   ];
   monitorStages.innerHTML = labels.map(([key, label]) => `
-    <div class="stage-item${key === 'failed' && model.stages.failed ? ' is-error' : ''}">
+    <div class="stage-item${key === 'failed' && model.stages.failed ? ' is-error' : ''}${key === 'requiresReview' && model.stages.requiresReview ? ' is-review' : ''}${key === 'uncertain' && model.stages.uncertain ? ' is-uncertain' : ''}">
       <span class="stage-value">${model.stages[key]}</span>
       <span class="stage-label">${label}</span>
     </div>
@@ -1739,12 +1794,16 @@ function renderCurrentRunMonitor() {
 
   monitorAccounts.innerHTML = model.accounts.map((row) => {
     const remaining = Math.max(0, row.total - row.downloaded - row.failed);
-    const error = row.errors[0] || (row.failed ? `Ошибок: ${row.failed}` : '');
+    const states = [
+      row.uncertain ? `уточняется ${row.uncertain}` : '',
+      row.requiresReview ? `проверить ${row.requiresReview}` : '',
+      row.failed ? `ошибок ${row.failed}` : '',
+    ].filter(Boolean).join(' · ');
     return `
       <div class="account-progress-row">
         <span class="account-progress-name" title="${escapeHtml(getAccountLabel(row.accountId))}">${escapeHtml(getAccountLabel(row.accountId))}</span>
         <span class="account-progress-counts">${row.downloaded}/${row.total} · осталось ${remaining}</span>
-        ${error ? `<span class="account-progress-error" title="${escapeHtml(error)}">${escapeHtml(error)}</span>` : ''}
+        ${states ? `<span class="account-progress-state${row.failed ? ' has-error' : ''}">${escapeHtml(states)}</span>` : ''}
       </div>
     `;
   }).join('');
@@ -1752,15 +1811,46 @@ function renderCurrentRunMonitor() {
 
   const failedDownloads = model.currentDownloads.filter((entry) => DM_FAILED_STATUSES.has(entry.status));
   retryDownloadsBtn.hidden = failedDownloads.length === 0;
-  retryDownloadsBtn.textContent = failedDownloads.length ? `повторить ошибки (${failedDownloads.length})` : 'повторить ошибки';
+  retryDownloadsBtn.textContent = failedDownloads.length
+    ? `повторить скачивание (${failedDownloads.length})`
+    : 'повторить скачивание';
 
-  const errorText = latestRunState.phase === 'failed' ? latestRunState.statusText : '';
-  monitorError.innerHTML = errorText
-    ? `<div class="alert-row error" role="alert"><div class="alert-copy"><div class="alert-headline">${escapeHtml(errorText)}</div></div></div>`
+  const notices = [];
+  if (model.stages.uncertain > 0 || isSubmissionUncertainRun(latestRunState)) {
+    const count = model.stages.uncertain;
+    notices.push(`
+      <div class="alert-row warning" role="status">
+        ${ALERT_ICON.warning}
+        <div class="alert-copy">
+          <div class="alert-headline">${count ? `отправка уточняется: ${count}` : 'отправка не подтверждена'}</div>
+          <div class="alert-detail multi">DreamFace мог принять запрос. Он не будет отправлен повторно автоматически.</div>
+        </div>
+      </div>
+    `);
+  }
+  if (model.stages.requiresReview > 0) {
+    notices.push(`
+      <div class="alert-row warning" role="status">
+        ${ALERT_ICON.warning}
+        <div class="alert-copy">
+          <div class="alert-headline">нужна проверка: ${model.stages.requiresReview}</div>
+          <div class="alert-detail multi">DreamFace мог принять запрос. Проверьте Creations: повторной отправки не будет.</div>
+        </div>
+      </div>
+    `);
+  }
+  const errorText = latestRunState.phase === 'failed' && !isSubmissionUncertainRun(latestRunState)
+    ? getConciseMessage(latestRunState.statusText, 'Запуск завершился с ошибкой.')
     : '';
-  monitorError.classList.toggle('active', Boolean(errorText));
-  if (latestRunState.phase === 'stopped' || (latestRunState.phase === 'failed' && latestRunState.interrupted)) {
+  if (errorText) {
+    notices.push(`<div class="alert-row error" role="alert"><div class="alert-copy"><div class="alert-headline">${escapeHtml(errorText)}</div></div></div>`);
+  }
+  monitorError.innerHTML = notices.join('');
+  monitorError.classList.toggle('active', notices.length > 0);
+  if (isUserStoppedRun(latestRunState)) {
     monitorTitle.textContent = 'Запуск остановлен';
+  } else if (model.stages.requiresReview > 0) {
+    monitorTitle.textContent = 'Требуется проверка';
   } else if (latestRunState.phase === 'failed') {
     monitorTitle.textContent = 'Ошибка запуска';
   } else {
@@ -1795,9 +1885,10 @@ function renderRunState(state) {
   monitorFileName.textContent = fileLabel;
   monitorFileName.title = fileLabel;
   monitorPhase.textContent = getMonitorPhaseLabel(state);
-  monitorPhaseDot.dataset.phase = state.phase || 'idle';
+  monitorPhaseDot.dataset.phase = isUserStoppedRun(state) ? 'stopped' : (state.phase || 'idle');
   stopBtn.hidden = !isActiveRunPhase(state.phase);
   stopBtn.disabled = !isActiveRunPhase(state.phase);
+  if (stopNote) stopNote.hidden = !isActiveRunPhase(state.phase);
   backBtn.disabled = isActiveRunPhase(state.phase);
   updateResumeButton(state);
   renderCurrentRunMonitor();
@@ -1878,18 +1969,7 @@ captureAccountBtn?.addEventListener('click', async () => {
     captureAccountBtn.disabled = false;
     return;
   }
-  const capabilityResponse = await chrome.runtime.sendMessage({
-    action: 'dfBulkOp',
-    op: 'getAccountCapabilities',
-    payload: {},
-  }).catch(() => null);
-  if (!capabilityResponse?.data?.maxDurationSeconds) {
-    statusText.textContent = capabilityResponse?.error || 'не удалось получить тариф и audioLimit из DreamFace';
-    captureAccountBtn.disabled = false;
-    return;
-  }
-  const account = { ...captured, ...(capabilityResponse?.data || {}) };
-  const saved = await chrome.runtime.sendMessage({ action: 'dfSaveAccount', account }).catch((error) => ({ ok: false, error: error.message }));
+  const saved = await chrome.runtime.sendMessage({ action: 'dfSaveAccount', account: captured }).catch((error) => ({ ok: false, error: error.message }));
   statusText.textContent = saved?.ok ? 'аккаунт сохранён' : (saved?.error || 'не удалось сохранить аккаунт');
   if (saved?.ok) renderAccounts(saved.accounts);
   captureAccountBtn.disabled = false;

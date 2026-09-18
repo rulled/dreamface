@@ -30,8 +30,21 @@ const DREAMFACE_URL_PATTERNS = [
   'https://www.dreamfaceapp.com/*',
   'https://tools.dreamfaceapp.com/*',
 ];
+const OFFSCREEN_DOCUMENT_URL = chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH);
 
 let offscreenCreationPromise = null;
+let restartRecoveryPromise = null;
+let restartRecoveryStatus = {
+  state: 'not_started',
+  triggers: [],
+  startedAt: null,
+  finishedAt: null,
+  watcherCount: 0,
+  watcherAlarmEnabled: false,
+  offscreenRequiredReasons: [],
+  offscreenEnsured: false,
+  error: '',
+};
 let bulkRelayTabId = null;
 let bulkWatchMutationChain = Promise.resolve();
 const DREAMFACE_RELAY_PATH_RE = /\/(?:[a-z]{2}\/)?(?:avatar(?:-bulk)?|creation)(?:\/|\?|#|$)/i;
@@ -43,9 +56,16 @@ function withBulkWatchMutation(callback) {
 }
 let paddedVideoMarkerWrite = Promise.resolve();
 
+function parseStoredAccountSession(account) {
+  try {
+    return account?.sessionRaw ? JSON.parse(account.sessionRaw) : null;
+  } catch {
+    return null;
+  }
+}
+
 function getAccountIdentity(account) {
-  let session = null;
-  try { session = account?.sessionRaw ? JSON.parse(account.sessionRaw) : null; } catch {}
+  const session = parseStoredAccountSession(account);
   const thirdPlatform = String(session?.thirdPlatform || account?.thirdPlatform || '').trim();
   const thirdId = String(session?.thirdId || account?.thirdId || '').trim();
   const userId = String(session?.userId || account?.userId || '').trim();
@@ -57,8 +77,7 @@ function getAccountIdentity(account) {
 }
 
 function getStoredAccountAuth(account) {
-  let session = null;
-  try { session = account?.sessionRaw ? JSON.parse(account.sessionRaw) : null; } catch {}
+  const session = parseStoredAccountSession(account);
   const token = String(session?.token || account?.token || '');
   const userId = String(session?.userId || account?.userId || '');
   const accountId = String(session?.accountId || account?.accountId || '');
@@ -67,6 +86,43 @@ function getStoredAccountAuth(account) {
     throw new Error('account session is incomplete');
   }
   return { token, userId, accountId, clientId };
+}
+
+function validateCapturedAccount(account) {
+  if (!account || typeof account !== 'object' || Array.isArray(account)) {
+    throw new Error('captured account is invalid');
+  }
+  const sessionRaw = String(account.sessionRaw || '');
+  const clientId = String(account.clientId || '').trim();
+  if (!sessionRaw || !clientId) throw new Error('captured account session is incomplete');
+  let session;
+  try {
+    session = JSON.parse(sessionRaw);
+  } catch {
+    throw new Error('captured account session contains invalid JSON');
+  }
+  if (!session || typeof session !== 'object' || Array.isArray(session)) {
+    throw new Error('captured account session is invalid');
+  }
+  const token = String(session.token || '').trim();
+  const userId = String(session.userId || '').trim();
+  const accountId = String(session.accountId || '').trim();
+  if (!token || !userId || !accountId) throw new Error('captured account credentials are incomplete');
+  if (account.userId && String(account.userId).trim() !== userId) {
+    throw new Error('captured account userId does not match the session');
+  }
+  if (account.accountId && String(account.accountId).trim() !== accountId) {
+    throw new Error('captured account accountId does not match the session');
+  }
+  return {
+    ...account,
+    sessionRaw,
+    clientId,
+    token,
+    userId,
+    accountId,
+    ...getAccountIdentity({ ...account, sessionRaw, userId, accountId }),
+  };
 }
 
 async function diagnoseStoredAccount(account) {
@@ -155,6 +211,52 @@ function canonicalizeAccounts(accounts) {
     }
   }
   return [...byPrincipal.values()];
+}
+
+function redactStoredAccountCredential(account) {
+  const { sessionRaw, token, clientId, ...metadata } = account || {};
+  return metadata;
+}
+
+async function isTrustedOffscreenSender(sender) {
+  if (!sender || sender.id !== chrome.runtime.id || sender.tab) return false;
+
+  const senderUrls = [sender.documentUrl, sender.url].filter(Boolean);
+  if (senderUrls.length === 0 || senderUrls.some((url) => url !== OFFSCREEN_DOCUMENT_URL)) return false;
+  if (sender.contextType && sender.contextType !== 'OFFSCREEN_DOCUMENT') return false;
+
+  const offscreenUrl = new URL(OFFSCREEN_DOCUMENT_URL);
+  const extensionOrigin = `${offscreenUrl.protocol}//${offscreenUrl.host}`;
+  if (sender.origin && sender.origin !== extensionOrigin) return false;
+  return true;
+}
+
+async function getStoredAccountCredential(accountId, principalKey) {
+  const stored = await chrome.storage.local.get(DREAMFACE_ACCOUNTS_KEY);
+  const accounts = Array.isArray(stored[DREAMFACE_ACCOUNTS_KEY]) ? stored[DREAMFACE_ACCOUNTS_KEY] : [];
+  const normalizedAccountId = String(accountId || '').trim();
+  const normalizedPrincipalKey = String(principalKey || '').trim();
+  if (!normalizedAccountId && !normalizedPrincipalKey) return null;
+
+  const exact = normalizedAccountId
+    ? accounts.find((item) => getAccountIdentity(item).accountId === normalizedAccountId) || null
+    : null;
+  const targetPrincipalKey = exact ? getAccountIdentity(exact).principalKey : normalizedPrincipalKey;
+  const canonical = targetPrincipalKey
+    ? canonicalizeAccounts(accounts).find((item) => item.principalKey === targetPrincipalKey) || null
+    : null;
+  const account = canonical || exact;
+  if (!account) return null;
+  const auth = getStoredAccountAuth(account);
+  const toCredential = (source) => ({
+    ...redactStoredAccountCredential(source),
+    ...getAccountIdentity(source),
+    ...getStoredAccountAuth(source),
+  });
+  return {
+    account: { ...toCredential(account), ...auth },
+    canonicalAccount: canonical ? toCredential(canonical) : null,
+  };
 }
 
 function savePaddedVideoMarker(source, borderCropPx) {
@@ -365,6 +467,7 @@ const DM_PERSIST_THROTTLE_MS = 300;
 const DM_HEARTBEAT_ALARM = 'dm-heartbeat';
 const DM_RETRY_ALARM = 'dm-retry';
 const DM_RETRY_BACKOFF_BASE_MS = 1500;
+const DM_FINGERPRINT_VERSION = 1;
 
 // in-memory state: workId → entry
 const dmEntries = new Map();
@@ -375,7 +478,25 @@ let dmPersistPromise = Promise.resolve();
 let dmPersistTimer = null;
 let dmKeepAliveActive = false;
 const dmRecoveredDownloadIds = new Set();
-const dmPendingReenqueue = new Map();
+
+function dmNormalizeDuration(value) {
+  return Number.isFinite(value) ? Math.round(Number(value)) : null;
+}
+
+function dmBuildFingerprint(item) {
+  const workId = String(item?.workId || '').trim();
+  return JSON.stringify({
+    version: DM_FINGERPRINT_VERSION,
+    workId,
+    accountId: String(item?.accountId || ''),
+    fileName: sanitizeFileNameForDownload(
+      item?.audioFileName || item?.workName || item?.fileName || workId,
+    ),
+    hasChapters: Boolean(item?.hasChapters),
+    audioMs: dmNormalizeDuration(item?.audioMs),
+    videoMs: dmNormalizeDuration(item?.videoMs),
+  });
+}
 
 function dmCreateEntry(item) {
   const now = Date.now();
@@ -391,6 +512,9 @@ function dmCreateEntry(item) {
     audioMs: Number.isFinite(item.audioMs) ? Number(item.audioMs) : null,
     videoMs: Number.isFinite(item.videoMs) ? Number(item.videoMs) : null,
     hasChapters: Boolean(item.hasChapters),
+    fingerprint: dmBuildFingerprint(item),
+    fingerprintVersion: DM_FINGERPRINT_VERSION,
+    pendingReplacement: null,
     status: 'queued',
     error: '',
     attempts: 0,
@@ -401,53 +525,71 @@ function dmCreateEntry(item) {
     updatedAt: now,
     completedAt: null,
     nextRetryAt: null,
+    dispatchStartedAt: null,
+    blobLeaseId: '',
   };
 }
 
 function dmIsTerminal(status) {
-  return status === 'done' || status === 'failed' || status === 'missing' || status === 'interrupted';
+  return status === 'done' || status === 'failed' || status === 'missing'
+    || status === 'interrupted' || status === 'uncertain';
 }
 
 function dmIsActive(status) {
-  return status === 'fetching' || status === 'muxing' || status === 'saving'
+  return status === 'fetching' || status === 'muxing' || status === 'dispatching' || status === 'saving'
     || status === 'queued' || status === 'retry_wait';
 }
 
 async function dmLoad() {
   if (dmLoadPromise) return dmLoadPromise;
   dmLoadPromise = (async () => {
-    try {
-      const data = await chrome.storage.local.get(DOWNLOADS_STORAGE_KEY);
-      const byWorkId = (data?.[DOWNLOADS_STORAGE_KEY]?.byWorkId) || {};
-      const now = Date.now();
-      let restored = 0;
-      let interrupted = 0;
-      for (const [workId, entry] of Object.entries(byWorkId)) {
-        if (!entry || !workId) continue;
-        // TTL
-        if (entry.completedAt && now - entry.completedAt > DM_TTL_MS) continue;
-        if (!entry.completedAt && now - (entry.updatedAt || entry.createdAt || 0) > DM_TTL_MS) continue;
-        // saving с downloadId проверит recovery scan; остальные незавершённые операции прерваны.
-        if (entry.status === 'queued') {
-          entry.updatedAt = now;
-          if (!dmQueue.includes(String(workId))) dmQueue.push(String(workId));
-        } else if (entry.status === 'fetching' || entry.status === 'muxing'
-          || (entry.status === 'saving' && !entry.downloadId)) {
-          entry.status = 'interrupted';
-          entry.error = entry.error || 'SW restarted';
-          entry.updatedAt = now;
-          interrupted++;
-        }
-        dmEntries.set(String(workId), entry);
-        restored++;
-      }
-      if (restored > 0) {
-        console.log(`[dm] loaded ${restored} entries (${interrupted} marked interrupted)`);
-      }
-    } catch (err) {
-      console.warn('[dm] load failed:', err.message);
+    const data = await chrome.storage.local.get(DOWNLOADS_STORAGE_KEY);
+    const storedDownloads = data?.[DOWNLOADS_STORAGE_KEY];
+    const byWorkId = storedDownloads?.byWorkId || {};
+    if (!byWorkId || typeof byWorkId !== 'object' || Array.isArray(byWorkId)) {
+      throw new Error('stored download state is malformed');
     }
-  })();
+    const restoredEntries = new Map();
+    const restoredQueue = [];
+    const now = Date.now();
+    let restored = 0;
+    let requeued = 0;
+    for (const [workId, storedEntry] of Object.entries(byWorkId)) {
+      if (!storedEntry || typeof storedEntry !== 'object' || Array.isArray(storedEntry) || !workId) continue;
+      if (storedEntry.completedAt && now - storedEntry.completedAt > DM_TTL_MS) continue;
+      if (!storedEntry.completedAt && now - (storedEntry.updatedAt || storedEntry.createdAt || 0) > DM_TTL_MS) continue;
+      const entry = {
+        ...storedEntry,
+        workId: String(workId),
+        fingerprint: storedEntry.fingerprint || dmBuildFingerprint(storedEntry),
+        fingerprintVersion: DM_FINGERPRINT_VERSION,
+        pendingReplacement: storedEntry.pendingReplacement || null,
+        dispatchStartedAt: storedEntry.dispatchStartedAt || null,
+        blobLeaseId: storedEntry.blobLeaseId || '',
+      };
+      if (entry.status === 'queued' || entry.status === 'fetching' || entry.status === 'muxing') {
+        entry.status = 'queued';
+        entry.error = 'recovered before download dispatch';
+        entry.updatedAt = now;
+        restoredQueue.push(entry.workId);
+        requeued++;
+      } else if (entry.status === 'dispatching' || (entry.status === 'saving' && !entry.downloadId)) {
+        entry.status = 'uncertain';
+        entry.error = 'download dispatch outcome is unknown after service-worker restart';
+        entry.completedAt = now;
+        entry.updatedAt = now;
+      }
+      restoredEntries.set(entry.workId, entry);
+      restored++;
+    }
+    dmEntries.clear();
+    for (const [workId, entry] of restoredEntries) dmEntries.set(workId, entry);
+    dmQueue.splice(0, dmQueue.length, ...restoredQueue);
+    if (restored > 0) console.log(`[dm] loaded ${restored} entries (${requeued} safely requeued)`);
+  })().catch((error) => {
+    dmLoadPromise = null;
+    throw error;
+  });
   return dmLoadPromise;
 }
 
@@ -460,20 +602,21 @@ function dmPersistNow() {
   for (const [workId, entry] of dmEntries.entries()) {
     byWorkId[workId] = { ...entry };
   }
-  dmPersistPromise = dmPersistPromise.catch(() => {}).then(async () => {
+  const persist = dmPersistPromise.catch(() => {}).then(async () => {
     await chrome.storage.local.set({ [DOWNLOADS_STORAGE_KEY]: { byWorkId } });
     dmBroadcastNow();
-  }).catch((err) => {
-    console.warn('[dm] persist failed:', err.message);
   });
-  return dmPersistPromise;
+  dmPersistPromise = persist;
+  return persist;
 }
 
 function dmSchedulePersist() {
   if (dmPersistTimer) return;
   dmPersistTimer = setTimeout(() => {
     dmPersistTimer = null;
-    dmPersistNow();
+    dmPersistNow().catch((error) => {
+      console.error('[dm] persist failed:', error.message || String(error));
+    });
   }, DM_PERSIST_THROTTLE_MS);
 }
 
@@ -564,7 +707,12 @@ async function getBulkWatchUnitsFromStorage() {
 
 async function syncBulkWatchAlarm(units = null) {
   const currentUnits = units || await getBulkWatchUnitsFromStorage();
-  if (currentUnits.some((unit) => unit?.status === 'pending')) {
+  if (currentUnits.some((unit) => (
+    unit?.status === 'pending'
+    || unit?.status === 'submission_uncertain'
+    || unit?.status === 'correlating'
+    || (unit?.status === 'requires_review' && (unit?.workIds || []).some(Boolean))
+  ))) {
     const alarm = await chrome.alarms.get(BULK_WATCH_ALARM);
     if (!alarm) await chrome.alarms.create(BULK_WATCH_ALARM, { periodInMinutes: 1 });
     return true;
@@ -621,18 +769,20 @@ async function dmEnqueue(items) {
     const workId = String(item?.workId || '').trim();
     if (!workId) { skipped++; continue; }
     const existing = dmEntries.get(workId);
-    const processingChanged = existing && (
-      Boolean(existing.hasChapters) !== Boolean(item.hasChapters)
-    );
+    const fingerprint = dmBuildFingerprint(item);
+    const processingChanged = existing && existing.fingerprint !== fingerprint;
     if (existing && existing.status === 'done' && !processingChanged) {
-      // Идентичный результат уже скачан. Изменившийся chapter режим создаёт
-      // новый download того же workId с актуальной обработкой.
       skipped++;
       continue;
     }
     if (existing && dmIsActive(existing.status)) {
       if (processingChanged) {
-        dmPendingReenqueue.set(workId, { ...item, workId });
+        existing.pendingReplacement = {
+          item: { ...item, workId },
+          fingerprint,
+          requestedAt: Date.now(),
+        };
+        existing.updatedAt = Date.now();
         accepted++;
       } else {
         skipped++;
@@ -653,6 +803,9 @@ async function dmEnqueue(items) {
       if (Number.isFinite(item.audioMs)) entry.audioMs = Number(item.audioMs);
       if (Number.isFinite(item.videoMs)) entry.videoMs = Number(item.videoMs);
       entry.hasChapters = Boolean(item.hasChapters);
+      entry.fingerprint = fingerprint;
+      entry.fingerprintVersion = DM_FINGERPRINT_VERSION;
+      entry.pendingReplacement = null;
       entry.status = 'queued';
       entry.error = '';
       entry.attempts = 0;
@@ -661,6 +814,8 @@ async function dmEnqueue(items) {
       entry.bytes = 0;
       entry.completedAt = null;
       entry.nextRetryAt = null;
+      entry.dispatchStartedAt = null;
+      entry.blobLeaseId = '';
       entry.updatedAt = Date.now();
     } else {
       entry = dmCreateEntry(item);
@@ -670,10 +825,9 @@ async function dmEnqueue(items) {
     accepted++;
   }
 
-  dmSchedulePersist();
+  await dmPersistNow();
   dmUpdateKeepAlive();
   dmTick();
-  await dmPersistNow();
   return { ok: true, accepted, skipped };
 }
 
@@ -691,6 +845,8 @@ async function dmRetry(workId) {
       entry.bytes = 0;
       entry.completedAt = null;
       entry.nextRetryAt = null;
+      entry.dispatchStartedAt = null;
+      entry.blobLeaseId = '';
       entry.updatedAt = Date.now();
       dmQueue.push(entry.workId);
       retried = 1;
@@ -706,13 +862,15 @@ async function dmRetry(workId) {
         entry.bytes = 0;
         entry.completedAt = null;
         entry.nextRetryAt = null;
+        entry.dispatchStartedAt = null;
+        entry.blobLeaseId = '';
         entry.updatedAt = Date.now();
         dmQueue.push(entry.workId);
         retried++;
       }
     }
   }
-  dmSchedulePersist();
+  await dmPersistNow();
   dmUpdateKeepAlive();
   dmTick();
   return { ok: true, retried };
@@ -746,10 +904,12 @@ function dmTick() {
       console.error('[dm] process crashed for', workId, err);
     }).finally(() => {
       dmNetworkActive = Math.max(0, dmNetworkActive - 1);
-      const pending = dmPendingReenqueue.get(workId);
-      if (pending) {
-        dmPendingReenqueue.delete(workId);
-        dmEnqueue([pending]).catch((error) => {
+      const current = dmEntries.get(workId);
+      const pending = current?.pendingReplacement || null;
+      if (pending && dmIsTerminal(current.status)) {
+        current.pendingReplacement = null;
+        current.updatedAt = Date.now();
+        dmPersistNow().then(() => dmEnqueue([pending.item])).catch((error) => {
           dmLog('bg', 'error', 'pending re-enqueue failed', workId, error.message);
         });
       } else {
@@ -787,6 +947,7 @@ async function dmProcess(entry) {
   });
 
   let muxedBlobUrl = null;
+  let blobLeaseId = '';
   try {
     if (requiresProcessing) {
       // ===== processed path: fetch in SW → physical crop/chapter mux in offscreen → save =====
@@ -802,6 +963,7 @@ async function dmProcess(entry) {
           audioMs: entry.audioMs,
           videoMs: entry.videoMs,
           hasChapters: useChapters,
+          workId: entry.workId,
         },
       });
 
@@ -809,12 +971,19 @@ async function dmProcess(entry) {
         throw new Error('video processing failed: ' + (muxResp?.error || 'no blobUrl returned'));
       }
       muxedBlobUrl = muxResp.blobUrl;
+      blobLeaseId = String(muxResp.blobLeaseId || '');
       const finalBytes = muxResp.bytes || 0;
       const chaptersMade = muxResp.chapters || 0;
 
-      dmUpdateEntry(entry.workId, { status: 'saving', bytes: finalBytes });
-
       const fileName = dmComputeFileName(entry);
+      dmUpdateEntry(entry.workId, {
+        status: 'dispatching',
+        bytes: finalBytes,
+        blobLeaseId,
+        dispatchStartedAt: Date.now(),
+        savedAs: fileName,
+      });
+      await dmPersistNow();
       const downloadId = await dmStartDownload(muxedBlobUrl, fileName, /*forceFilename=*/true);
       dmUpdateEntry(entry.workId, { status: 'saving', downloadId });
       await dmPersistNow();
@@ -833,9 +1002,13 @@ async function dmProcess(entry) {
       });
     } else {
       // ===== direct path: отдаём прямой OSS URL в chrome.downloads =====
-      dmUpdateEntry(entry.workId, { status: 'saving' });
-
       const fileName = dmComputeFileName(entry);
+      dmUpdateEntry(entry.workId, {
+        status: 'dispatching',
+        dispatchStartedAt: Date.now(),
+        savedAs: fileName,
+      });
+      await dmPersistNow();
       const downloadId = await dmStartDownload(entry.url, fileName, /*forceFilename=*/true);
       dmUpdateEntry(entry.workId, { status: 'saving', downloadId });
       await dmPersistNow();
@@ -853,7 +1026,33 @@ async function dmProcess(entry) {
     const errMsg = err?.message || String(err);
     dmLog('bg', 'warn', 'dm.attempt', entry.attempts, 'failed for', entry.workId, errMsg);
     if (entry.downloadId) {
-      const [downloadItem] = await chrome.downloads.search({ id: entry.downloadId }).catch(() => []);
+      let downloadItem;
+      try {
+        [downloadItem] = await chrome.downloads.search({ id: entry.downloadId });
+      } catch (searchError) {
+        dmUpdateEntry(entry.workId, {
+          status: 'saving',
+          error: `download state unknown: ${searchError.message || String(searchError)}`,
+        });
+        const blobUrlToRevoke = muxedBlobUrl;
+        const leaseToRevoke = blobLeaseId;
+        muxedBlobUrl = null;
+        blobLeaseId = '';
+        dmWatchRecoveredDownload(entry, blobUrlToRevoke, leaseToRevoke);
+        return;
+      }
+      if (!downloadItem) {
+        dmUpdateEntry(entry.workId, {
+          status: 'saving',
+          error: 'download state unknown: Chrome returned no matching download',
+        });
+        const blobUrlToRevoke = muxedBlobUrl;
+        const leaseToRevoke = blobLeaseId;
+        muxedBlobUrl = null;
+        blobLeaseId = '';
+        dmWatchRecoveredDownload(entry, blobUrlToRevoke, leaseToRevoke);
+        return;
+      }
       if (downloadItem?.state === 'complete') {
         dmUpdateEntry(entry.workId, {
           status: 'done',
@@ -866,8 +1065,10 @@ async function dmProcess(entry) {
       if (downloadItem?.state === 'in_progress') {
         dmUpdateEntry(entry.workId, { status: 'saving', error: errMsg });
         const blobUrlToRevoke = muxedBlobUrl;
+        const leaseToRevoke = blobLeaseId;
         muxedBlobUrl = null;
-        dmWatchRecoveredDownload(entry, blobUrlToRevoke);
+        blobLeaseId = '';
+        dmWatchRecoveredDownload(entry, blobUrlToRevoke, leaseToRevoke);
         return;
       }
     }
@@ -897,7 +1098,7 @@ async function dmProcess(entry) {
   } finally {
     // освобождаем blob:URL в offscreen — chrome.downloads уже забрал данные
     if (muxedBlobUrl) {
-      forwardToOffscreen({ action: 'revokeBlob', payload: { blobUrl: muxedBlobUrl } }).catch(() => {});
+      forwardToOffscreen({ action: 'revokeBlob', payload: { blobUrl: muxedBlobUrl, blobLeaseId } }).catch(() => {});
     }
   }
 }
@@ -983,7 +1184,11 @@ async function dmRecoveryScan() {
           entry.completedAt = entry.completedAt || Date.now();
           entry.updatedAt = Date.now();
         } else if (entry.status === 'saving' && item?.state === 'in_progress') {
-          dmWatchRecoveredDownload(entry);
+          dmWatchRecoveredDownload(entry, '', entry.blobLeaseId || '');
+        } else if (!item && entry.status === 'saving') {
+          entry.error = 'download recovery state unknown: Chrome returned no matching download';
+          entry.updatedAt = Date.now();
+          dmWatchRecoveredDownload(entry, '', entry.blobLeaseId || '');
         } else if (!item || item.state === 'interrupted') {
           entry.status = entry.status === 'done' ? 'missing' : 'interrupted';
           entry.error = item?.error || 'file not found in chrome downloads';
@@ -991,32 +1196,91 @@ async function dmRecoveryScan() {
         }
       } catch (error) {
         if (entry.status === 'saving') {
-          entry.status = 'interrupted';
-          entry.error = `download recovery failed: ${error.message || String(error)}`;
+          entry.error = `download recovery state unknown: ${error.message || String(error)}`;
           entry.updatedAt = Date.now();
+          dmWatchRecoveredDownload(entry, '', entry.blobLeaseId || '');
         }
       }
     }
   }
+  const retainedLeaseIds = [...dmEntries.values()]
+    .filter((entry) => entry.blobLeaseId && (
+      entry.status === 'dispatching'
+      || entry.status === 'saving'
+      || entry.status === 'uncertain'
+    ))
+    .map((entry) => entry.blobLeaseId);
+  await forwardToOffscreen({
+    action: 'reconcileBlobLeases',
+    payload: { retainedLeaseIds },
+  }).catch((error) => {
+    console.warn('[dm] blob lease reconciliation failed:', error.message || String(error));
+  });
   dmSchedulePersist();
   dmUpdateKeepAlive();
   await dmRecoverRetries();
 }
 
-function dmWatchRecoveredDownload(entry, blobUrlToRevoke = '') {
+function dmWatchRecoveredDownload(entry, blobUrlToRevoke = '', blobLeaseId = '', recoveryAttempt = 0) {
   const downloadId = Number(entry?.downloadId);
   if (!Number.isInteger(downloadId) || dmRecoveredDownloadIds.has(downloadId)) return;
   dmRecoveredDownloadIds.add(downloadId);
+  let shouldRewatch = false;
   dmWaitForComplete(downloadId, DM_DOWNLOAD_WAIT_TIMEOUT_MS).then(() => {
     dmUpdateEntry(entry.workId, { status: 'done', completedAt: Date.now(), error: '' });
-  }).catch((error) => {
-    dmUpdateEntry(entry.workId, { status: 'interrupted', error: error.message });
+  }).catch(async (error) => {
+    try {
+      const [downloadItem] = await chrome.downloads.search({ id: downloadId });
+      if (downloadItem?.state === 'complete') {
+        dmUpdateEntry(entry.workId, { status: 'done', completedAt: Date.now(), error: '' });
+        return;
+      }
+      if (downloadItem?.state === 'interrupted') {
+        dmUpdateEntry(entry.workId, {
+          status: 'interrupted',
+          error: downloadItem.error || error.message,
+        });
+        return;
+      }
+      if (downloadItem?.state === 'in_progress') {
+        shouldRewatch = true;
+        recoveryAttempt = -1;
+        dmUpdateEntry(entry.workId, { status: 'saving', error: error.message });
+        return;
+      }
+    } catch (searchError) {
+      dmLog('bg', 'warn', 'recovered download state remains unknown', {
+        downloadId,
+        error: searchError.message || String(searchError),
+      });
+    }
+    if (recoveryAttempt >= 2) {
+      dmUpdateEntry(entry.workId, {
+        status: 'uncertain',
+        error: `download outcome remained unknown: ${error.message}`,
+      });
+      return;
+    }
+    shouldRewatch = true;
+    dmUpdateEntry(entry.workId, { status: 'saving', error: error.message });
   }).finally(() => {
-    if (blobUrlToRevoke) {
-      forwardToOffscreen({ action: 'revokeBlob', payload: { blobUrl: blobUrlToRevoke } }).catch(() => {});
+    if ((blobUrlToRevoke || blobLeaseId) && !shouldRewatch) {
+      forwardToOffscreen({
+        action: 'revokeBlob',
+        payload: { blobUrl: blobUrlToRevoke, blobLeaseId },
+      }).catch(() => {});
+      dmUpdateEntry(entry.workId, { blobLeaseId: '' });
     }
     dmRecoveredDownloadIds.delete(downloadId);
     dmUpdateKeepAlive();
+    if (shouldRewatch) {
+      setTimeout(() => dmWatchRecoveredDownload(
+        entry,
+        blobUrlToRevoke,
+        blobLeaseId,
+        recoveryAttempt + 1,
+      ), 1000);
+    }
   });
 }
 
@@ -1064,6 +1328,95 @@ async function forwardToOffscreen(message) {
       resolve(response);
     });
   });
+}
+
+function getRestartRecoveryStatus() {
+  return {
+    ...restartRecoveryStatus,
+    triggers: [...restartRecoveryStatus.triggers],
+    offscreenRequiredReasons: [...restartRecoveryStatus.offscreenRequiredReasons],
+  };
+}
+
+function getOffscreenRecoveryReasons(runState, watchUnits) {
+  const reasons = [];
+  const queuePlan = Array.isArray(runState?.queuePlan) ? runState.queuePlan : [];
+  const nextTaskIndex = Math.max(0, Number(runState?.nextTaskIndex || 0));
+  const hasRemainingBulkWork = runState?.mode === 'bulk' && nextTaskIndex < queuePlan.length;
+  const wasInterruptedLocally = ['preparing', 'normalizing', 'ready', 'running', 'stopping']
+    .includes(runState?.phase);
+
+  const presetState = runState?.bulkContext?.presetState
+    || (runState?.bulkContext?.presetDirty ? 'restore_required' : 'clean');
+  if (['dirty', 'restoring', 'restore_required'].includes(presetState)) reasons.push('preset_restore_required');
+  if (wasInterruptedLocally || (hasRemainingBulkWork && runState?.recoverable)) {
+    reasons.push('recoverable_local_run');
+  }
+  if (watchUnits.some((unit) => (
+    unit?.status === 'pending'
+    || unit?.status === 'submission_uncertain'
+    || unit?.status === 'correlating'
+    || (unit?.status === 'requires_review' && (unit?.workIds || []).some(Boolean))
+  ))) {
+    reasons.push('observable_watchers');
+  }
+  return reasons;
+}
+
+function recoverAfterRestart(trigger) {
+  if (!restartRecoveryStatus.triggers.includes(trigger)) {
+    restartRecoveryStatus.triggers = [...restartRecoveryStatus.triggers, trigger];
+  }
+  if (restartRecoveryPromise) return restartRecoveryPromise;
+
+  restartRecoveryStatus = {
+    ...restartRecoveryStatus,
+    state: 'running',
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    error: '',
+  };
+  restartRecoveryPromise = (async () => {
+    await dmLoad();
+    await dmRecoveryScan();
+
+    const [runState, watchUnits] = await Promise.all([
+      getStoredRunState(),
+      getBulkWatchUnitsFromStorage(),
+    ]);
+    const watcherAlarmEnabled = await syncBulkWatchAlarm(watchUnits);
+    const offscreenRequiredReasons = getOffscreenRecoveryReasons(runState, watchUnits);
+    if (offscreenRequiredReasons.length > 0) {
+      await ensureOffscreenDocument();
+      const initialization = await forwardToOffscreen({ action: 'ping' });
+      if (!initialization?.ok) throw new Error(initialization?.error || 'offscreen recovery initialization failed');
+    }
+
+    restartRecoveryStatus = {
+      ...restartRecoveryStatus,
+      state: 'complete',
+      finishedAt: new Date().toISOString(),
+      watcherCount: watchUnits.length,
+      watcherAlarmEnabled,
+      offscreenRequiredReasons,
+      offscreenEnsured: offscreenRequiredReasons.length > 0,
+      error: '',
+    };
+    console.log('[bg] restart recovery complete', getRestartRecoveryStatus());
+    return getRestartRecoveryStatus();
+  })().catch((error) => {
+    restartRecoveryStatus = {
+      ...restartRecoveryStatus,
+      state: 'failed',
+      finishedAt: new Date().toISOString(),
+      error: error.message || String(error),
+    };
+    console.error('[bg] restart recovery failed:', restartRecoveryStatus.error);
+    throw error;
+  }).finally(() => {
+    restartRecoveryPromise = null;
+  });
+  return restartRecoveryPromise;
 }
 
 // =========================================================================
@@ -1184,6 +1537,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
       case 'engine.getRunState':
         sendResponse({ ok: true, state: await getStoredRunState() });
+        return;
+
+      case 'engine.getRecoveryStatus':
+        sendResponse({ ok: true, recovery: getRestartRecoveryStatus() });
         return;
 
       case 'engine.prepareRun':
@@ -1309,9 +1666,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
 
       case 'dfSaveAccount': {
-        const account = { ...(request.account || {}), ...getAccountIdentity(request.account || {}) };
-        if (!account.accountId || !account.sessionRaw || !account.clientId) {
-          sendResponse({ ok: false, error: 'account session is incomplete' });
+        let account;
+        try {
+          const candidate = validateCapturedAccount(request.account);
+          const diagnostics = await diagnoseStoredAccount(candidate);
+          account = { ...candidate, ...diagnostics };
+        } catch (error) {
+          sendResponse({
+            ok: false,
+            code: 'invalid_or_unavailable_credentials',
+            error: `${error.message || String(error)}; existing saved account was not changed`,
+          });
           return;
         }
         const stored = await chrome.storage.local.get(DREAMFACE_ACCOUNTS_KEY);
@@ -1330,27 +1695,35 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           capturedAt: Date.now(),
         });
         await chrome.storage.local.set({ [DREAMFACE_ACCOUNTS_KEY]: next });
-        sendResponse({ ok: true, accounts: canonicalizeAccounts(next) });
+        const accountsForResponse = canonicalizeAccounts(next);
+        sendResponse({
+          ok: true,
+          accounts: await isTrustedOffscreenSender(sender)
+            ? accountsForResponse
+            : accountsForResponse.map(redactStoredAccountCredential),
+        });
         return;
       }
 
       case 'dfListAccounts': {
         const stored = await chrome.storage.local.get(DREAMFACE_ACCOUNTS_KEY);
-        sendResponse({ ok: true, accounts: canonicalizeAccounts(stored[DREAMFACE_ACCOUNTS_KEY]) });
+        const accounts = canonicalizeAccounts(stored[DREAMFACE_ACCOUNTS_KEY]);
+        sendResponse({
+          ok: true,
+          accounts: await isTrustedOffscreenSender(sender) ? accounts : accounts.map(redactStoredAccountCredential),
+        });
         return;
       }
 
+      case 'dfGetAccountCredential':
       case 'dfGetAccountSession': {
-        const stored = await chrome.storage.local.get(DREAMFACE_ACCOUNTS_KEY);
-        const accounts = Array.isArray(stored[DREAMFACE_ACCOUNTS_KEY]) ? stored[DREAMFACE_ACCOUNTS_KEY] : [];
-        const exact = accounts.find((item) => getAccountIdentity(item).accountId === request.accountId) || null;
-        const principalKey = exact ? getAccountIdentity(exact).principalKey : request.principalKey;
-        const canonical = principalKey
-          ? canonicalizeAccounts(accounts).find((item) => item.principalKey === principalKey)
-          : null;
-        const account = canonical || exact || null;
-        sendResponse(account
-          ? { ok: true, account: { ...account, ...getAccountIdentity(account) }, canonicalAccount: canonical || null }
+        if (!await isTrustedOffscreenSender(sender)) {
+          sendResponse({ ok: false, error: 'account credentials are available only to the offscreen document' });
+          return;
+        }
+        const credential = await getStoredAccountCredential(request.accountId, request.principalKey);
+        sendResponse(credential
+          ? { ok: true, ...credential }
           : { ok: false, error: 'account session not found' });
         return;
       }
@@ -1362,7 +1735,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           || getAccountIdentity(accounts.find((item) => item.accountId === request.accountId) || {}).principalKey;
         const next = accounts.filter((item) => getAccountIdentity(item).principalKey !== targetPrincipal);
         await chrome.storage.local.set({ [DREAMFACE_ACCOUNTS_KEY]: next });
-        sendResponse({ ok: true, accounts: canonicalizeAccounts(next) });
+        const accountsForResponse = canonicalizeAccounts(next);
+        sendResponse({
+          ok: true,
+          accounts: await isTrustedOffscreenSender(sender)
+            ? accountsForResponse
+            : accountsForResponse.map(redactStoredAccountCredential),
+        });
         return;
       }
 
@@ -1382,7 +1761,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           }
           : item);
         await chrome.storage.local.set({ [DREAMFACE_ACCOUNTS_KEY]: next });
-        sendResponse({ ok: true, accounts: canonicalizeAccounts(next) });
+        const accountsForResponse = canonicalizeAccounts(next);
+        sendResponse({
+          ok: true,
+          accounts: await isTrustedOffscreenSender(sender)
+            ? accountsForResponse
+            : accountsForResponse.map(redactStoredAccountCredential),
+        });
         return;
       }
 
@@ -1536,13 +1921,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return;
       }
 
-      case 'dfSwitchAccount': {
-        const tab = await findBulkTab();
-        if (!tab) { sendResponse({ ok: false, error: 'DreamFace avatar or creation tab not found' }); return; }
-        sendResponse(await sendPageAction(tab.id, 'dfSwitchAccount', { session: request.session }));
-        return;
-      }
-
       // ============ DOWNLOAD MANAGER actions ============
 
       case 'dm.enqueue': {
@@ -1648,19 +2026,12 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   if (details?.reason === 'install') {
     await persistRunState(createIdleRunState());
   }
-  await dmLoad();
-  await dmRecoveryScan();
-  await syncBulkWatchAlarm().catch(() => {});
+  await recoverAfterRestart(`onInstalled:${details?.reason || 'unknown'}`);
 });
 
 chrome.runtime.onStartup.addListener(async () => {
-  await dmLoad();
-  await dmRecoveryScan();
-  await syncBulkWatchAlarm().catch(() => {});
+  await recoverAfterRestart('onStartup');
 });
 
 // Eager recovery also covers service-worker restarts inside a Chrome session.
-dmLoad().then(async () => {
-  await dmRecoveryScan();
-  await syncBulkWatchAlarm();
-}).catch(() => {});
+recoverAfterRestart('top-level').catch(() => {});

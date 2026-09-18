@@ -10,6 +10,7 @@ $runtimeFiles = @(
     'manifest.json'
     'background.js'
     'content_script.js'
+    'dreamface-api.js'
     'injected.js'
     'media-transform.js'
     'offscreen.js'

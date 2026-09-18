@@ -1563,7 +1563,7 @@ function readPageAuthSession() {
     const principalKey = thirdPlatform && thirdId
       ? `${thirdPlatform.toLowerCase()}:${thirdId.toLowerCase()}`
       : (userId ? `user:${String(userId).toLowerCase()}` : `account:${accountId}`);
-    const hasAuth = Boolean(token && userId && accountId);
+    const hasAuth = Boolean(token && clientId && userId && accountId);
     return {
       ok: hasAuth,
       hasAuth,
@@ -4325,22 +4325,9 @@ function installHoverDownloadInterceptor() {
   dmLog('log', 'installing hover-download interceptor', { url: location.href });
   submitMetaHydrationPromise.finally(() => primeCreationsApiSnapshot());
 
-  function startNativeDownloadFallback(detail) {
-    try {
-      const a = document.createElement('a');
-      a.href = detail.href;
-      a.rel = 'noopener';
-      (document.body || document.documentElement).appendChild(a);
-      a.click();
-      a.remove();
-    } catch (err) {
-      dmLog('error', 'anchor-click native fallback failed', err.message);
-    }
-  }
-
   // Главный механизм: patched HTMLAnchorElement.click в injected.js шлёт
   // CustomEvent('DreamFaceAnchorClickIntercept') СИНХРОННО. Мы синхронно
-  // решаем — берём ли скачивание на себя. Если да: detail.handled=true и
+  // решаем — берём ли скачивание на себя. Если да: preventDefault() и
   // асинхронно делаем dm.enqueue. Если нет: сайт получит свой нативный click.
   window.addEventListener('DreamFaceAnchorClickIntercept', (event) => {
     let detail;
@@ -4393,13 +4380,10 @@ function installHoverDownloadInterceptor() {
       return;
     }
 
-    // помечаем что мы взяли перехват — injected НЕ вызовет оригинальный click
-    try {
-      detail.handled = true;
-      if (detail.handled !== true) return;
-    } catch {
-      return;
-    }
+    // После передачи DownloadManager нативный путь больше нельзя запускать:
+    // потерянный runtime-ответ не означает, что enqueue не был принят.
+    event.preventDefault();
+    if (!event.defaultPrevented) return;
     Promise.allSettled([processingSettingsHydrationPromise, submitMetaHydrationPromise]).then(() => {
       const workId = String(apiItem.id);
       const workName = apiItem.work_name;
@@ -4439,12 +4423,12 @@ function installHoverDownloadInterceptor() {
           showDmInterceptToast(`в очередь: ${items[0].workName}${tail}`);
         } else {
           showDmInterceptToast('ошибка постановки в очередь');
-          if (!items[0].hasChapters) startNativeDownloadFallback(safeDetail);
+          dmLog('error', 'dm.enqueue rejected', resp?.error || 'unknown error');
         }
       }).catch((err) => {
         console.error('[dreamface] dm.enqueue failed:', err);
         showDmInterceptToast('ошибка: ' + err.message);
-        if (!items[0].hasChapters) startNativeDownloadFallback(safeDetail);
+        dmLog('error', 'dm.enqueue outcome unknown; native fallback suppressed', err.message);
       });
     });
   });

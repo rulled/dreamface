@@ -785,6 +785,7 @@
     .phase-dot[data-phase="running"] { background: #2563eb; animation: phasePulse 1.4s ease-in-out infinite; }
     .phase-dot[data-phase="downloading"] { background: #2563eb; animation: phasePulse 1.4s ease-in-out infinite; }
     .phase-dot[data-phase="stopping"] { background: #f59e0b; }
+    .phase-dot[data-phase="stopped"] { background: var(--text-tertiary); }
     .phase-dot[data-phase="finished"] { background: #10b981; }
     .phase-dot[data-phase="failed"] { background: #dc2626; }
 
@@ -901,6 +902,7 @@
     .dl-status-dot.is-failed,
     .dl-status-dot.is-interrupted,
     .dl-status-dot.is-missing { background: #dc2626; }
+    .dl-status-dot.is-uncertain { background: #d97706; }
     @keyframes dlPulse {
       0%, 100% { opacity: 1; transform: scale(1); }
       50% { opacity: 0.5; transform: scale(0.75); }
@@ -1761,6 +1763,18 @@
       color: var(--error, #b3261e);
     }
 
+    .stage-item.is-review .stage-value,
+    .stage-item.is-uncertain .stage-value {
+      color: #9a6700;
+    }
+
+    .stop-note {
+      margin: 12px 2px 0;
+      color: var(--text-tertiary);
+      font-size: 10.5px;
+      line-height: 1.4;
+    }
+
     .account-progress {
       margin-top: 16px;
       border-top: 1px solid rgba(0, 0, 0, 0.07);
@@ -1790,14 +1804,18 @@
       white-space: nowrap;
     }
 
-    .account-progress-error {
+    .account-progress-state {
       grid-column: 1 / -1;
       overflow: hidden;
-      color: var(--error, #b3261e);
+      color: #7a5b00;
       font-size: 11px;
       line-height: 1.35;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+
+    .account-progress-state.has-error {
+      color: var(--error, #b3261e);
     }
 
     .monitor-actions-stack {
@@ -1970,14 +1988,15 @@
             <div id="monitorStages" class="stage-grid" aria-label="Этапы текущего запуска"></div>
             <div id="monitorAccounts" class="account-progress" aria-label="Прогресс по аккаунтам"></div>
             <div id="monitorError" class="monitor-alert" aria-live="polite"></div>
+            <p id="stopNote" class="stop-note" hidden>Остановка прекратит новые отправки. Наблюдение и скачивание уже отправленных работ продолжатся.</p>
             <div class="monitor-actions-stack">
-              <button id="stopBtn" class="btn btn-surface btn-block">
-                <svg class="solar-icon" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
+              <button id="stopBtn" class="btn btn-surface btn-block" type="button" aria-describedby="stopNote">
+                <svg class="solar-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
                 остановить
               </button>
-              <button id="resumeBtn" class="btn btn-surface btn-block" style="display:none;">возобновить</button>
-              <button id="retryDownloadsBtn" class="btn btn-surface btn-block" type="button" hidden>повторить ошибки</button>
-              <button id="backBtn" class="btn btn-ghost btn-block">новая очередь</button>
+              <button id="resumeBtn" class="btn btn-surface btn-block" type="button" style="display:none;">возобновить</button>
+              <button id="retryDownloadsBtn" class="btn btn-surface btn-block" type="button" aria-label="Повторить только неудачные скачивания" hidden>повторить скачивание</button>
+              <button id="backBtn" class="btn btn-ghost btn-block" type="button">новая очередь</button>
             </div>
           </section>
         </div>

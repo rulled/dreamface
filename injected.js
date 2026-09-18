@@ -1040,13 +1040,15 @@
         const detail = {
           href,
           download: downloadAttr,
-          handled: false,
           ossUuid,
           fileName: fileNameFromOss,
         };
-        const event = new CustomEvent('DreamFaceAnchorClickIntercept', { detail });
+        const event = new CustomEvent('DreamFaceAnchorClickIntercept', {
+          cancelable: true,
+          detail,
+        });
         window.dispatchEvent(event);
-        if (detail.handled) {
+        if (event.defaultPrevented) {
           return;
         }
       }
