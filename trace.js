@@ -1,10 +1,9 @@
 // Phase 0 trace recorder: read-only instrumentation for the bulk queue.
 // Nothing here changes scheduling behavior — it only observes and persists what happened.
 //
-// Storage: chrome.storage.local[TRACE_KEY] = { lines, dropped, seq, revision, updatedAt }
-//   `lines` holds one JSON string per event, i.e. the export format is exactly NDJSON.
-//   `revision` guards against an external clear (popup writes it): the writer re-reads
-//   storage before flushing whenever the revision it knows no longer matches.
+// Persistence goes through an IndexedDB-backed store (see trace-store.js): the offscreen
+// document has no chrome.storage, and the log must survive the offscreen document dying
+// mid-run. Export format is NDJSON, one event per line.
 //
 // Event envelope: { seq, ts, iso, runId?, mode?, type, ...payload }
 //
@@ -22,25 +21,15 @@
 //   work_status   workId, unitId, accountId, submittedAt, status
 //   run_end       phase, reason, recoverable, total, nextTaskIndex, uncertain, rejected
 
-export const TRACE_KEY = 'dreamfacePhase0Trace';
-export const TRACE_MAX_LINES = 2000;
-export const TRACE_BYTE_BUDGET = 5_000_000;
+import {
+  createTraceStore,
+  TRACE_BYTE_BUDGET,
+  TRACE_MAX_LINES,
+  TRACE_TRIM_INTERVAL,
+} from './trace-store.js';
+
 export const RAW_LIMIT_BYTES = 20_000;
 const DEDUPE_CAP = 20_000;
-
-export function appendLine(lines, line, options = {}) {
-  const maxLines = Number(options.maxLines) > 0 ? Number(options.maxLines) : TRACE_MAX_LINES;
-  const byteBudget = Number(options.byteBudget) > 0 ? Number(options.byteBudget) : TRACE_BYTE_BUDGET;
-  const next = [...(Array.isArray(lines) ? lines : []), line];
-  let bytes = next.reduce((sum, item) => sum + item.length + 1, 0);
-  let dropped = 0;
-  while (next.length > maxLines || (bytes > byteBudget && next.length > 1)) {
-    const removed = next.shift();
-    bytes -= removed.length + 1;
-    dropped += 1;
-  }
-  return { lines: next, dropped, bytes };
-}
 
 export function toJsonl(lines) {
   const list = Array.isArray(lines) ? lines : [];
@@ -60,67 +49,63 @@ export function compactRaw(value, limit = RAW_LIMIT_BYTES) {
   return { raw: text.slice(0, limit), rawBytes: text.length, rawTruncated: true };
 }
 
-function defaultStorage() {
-  return typeof chrome !== 'undefined' && chrome.storage ? chrome.storage.local : null;
-}
-
-function createRevision() {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
 export function createTraceWriter(options = {}) {
-  const store = options.storage || defaultStorage();
-  const key = options.key || TRACE_KEY;
+  const store = options.store || createTraceStore();
   const now = typeof options.now === 'function' ? options.now : Date.now;
   const maxLines = Number(options.maxLines) > 0 ? Number(options.maxLines) : TRACE_MAX_LINES;
   const byteBudget = Number(options.byteBudget) > 0 ? Number(options.byteBudget) : TRACE_BYTE_BUDGET;
+  const trimInterval = Number(options.trimInterval) > 0 ? Number(options.trimInterval) : TRACE_TRIM_INTERVAL;
 
-  let lines = [];
-  let dropped = 0;
-  let seq = 0;
-  let revision = '';
-  let synced = false;
   let enabled = options.enabled !== false;
   let context = {};
+  let seq = 0;
+  let seqLoaded = false;
+  let appended = 0;
+  let lastError = '';
   let chain = Promise.resolve();
   const pending = [];
   const seen = new Set();
 
-  async function syncFromStorage() {
-    if (!store) return;
-    const stored = await Promise.resolve(store.get(key)).catch(() => null);
-    const state = stored?.[key];
-    const storedRevision = String(state?.revision || '');
-    if (synced && storedRevision === revision) return;
-    lines = Array.isArray(state?.lines) ? state.lines : [];
-    dropped = Number(state?.dropped) || 0;
-    if (Number.isFinite(Number(state?.seq))) seq = Math.max(seq, Number(state.seq));
-    revision = storedRevision;
-    synced = true;
-  }
-
   async function drain() {
-    await syncFromStorage();
     if (pending.length === 0) return;
     const batch = pending.splice(0, pending.length);
+    if (!seqLoaded) {
+      try {
+        seq = (await store.readMeta()).seq;
+        seqLoaded = true;
+      } catch (error) {
+        lastError = error?.message || String(error);
+      }
+    }
     for (const item of batch) {
-      // seq is assigned here, after the stored counter was loaded, so it stays
-      // monotonic across offscreen restarts; ts stays the event time.
       const line = JSON.stringify({
         seq: ++seq,
         ts: item.ts,
         iso: new Date(item.ts).toISOString(),
         ...item.payload,
       });
-      const result = appendLine(lines, line, { maxLines, byteBudget });
-      lines = result.lines;
-      dropped += result.dropped;
+      try {
+        await store.append(line);
+        appended += 1;
+        if (lastError) {
+          lastError = '';
+          await store.saveMeta({ lastError: '' }).catch(() => {});
+        }
+      } catch (error) {
+        // never break a run because tracing failed; the popup surfaces lastError from meta
+        lastError = error?.message || String(error);
+        await store.saveMeta({ lastError }).catch(() => {});
+      }
     }
-    revision = createRevision();
-    if (!store) return;
-    await Promise.resolve(store.set({
-      [key]: { lines, dropped, seq, revision, updatedAt: now() },
-    })).catch(() => {});
+    try {
+      await store.saveMeta({ seq });
+      if (appended >= trimInterval) {
+        appended = 0;
+        await store.trim({ maxLines, byteBudget });
+      }
+    } catch (error) {
+      lastError = error?.message || String(error);
+    }
   }
 
   function record(event) {
@@ -151,47 +136,31 @@ export function createTraceWriter(options = {}) {
     isEnabled() {
       return enabled;
     },
+    getLastError() {
+      return lastError;
+    },
     async flush() {
       await chain;
     },
-    read() {
-      return { lines: [...lines], dropped, seq };
+    read(readOptions) {
+      return store.read(readOptions);
     },
     async clear() {
-      await syncFromStorage();
-      lines = [];
-      dropped = 0;
       seen.clear();
-      revision = createRevision();
-      if (!store) return;
-      await Promise.resolve(store.set({
-        [key]: { lines: [], dropped: 0, seq, revision, updatedAt: now() },
-      })).catch(() => {});
+      await store.clear();
     },
   };
 }
 
 export async function readTrace(options = {}) {
-  const store = options.storage || defaultStorage();
-  const key = options.key || TRACE_KEY;
-  if (!store) return { lines: [], dropped: 0, seq: 0, bytes: 0 };
-  const stored = await Promise.resolve(store.get(key)).catch(() => null);
-  const state = stored?.[key];
-  const lines = Array.isArray(state?.lines) ? state.lines : [];
-  return {
-    lines,
-    dropped: Number(state?.dropped) || 0,
-    seq: Number(state?.seq) || 0,
-    bytes: lines.reduce((sum, line) => sum + line.length + 1, 0),
-  };
+  const store = options.store || createTraceStore();
+  return store.read(options);
 }
 
 export async function clearTrace(options = {}) {
-  const store = options.storage || defaultStorage();
-  const key = options.key || TRACE_KEY;
-  if (!store) return false;
-  await Promise.resolve(store.set({
-    [key]: { lines: [], dropped: 0, seq: 0, revision: createRevision(), updatedAt: Date.now() },
-  })).catch(() => {});
+  const store = options.store || createTraceStore();
+  await store.clear();
   return true;
 }
+
+export { TRACE_MAX_LINES, TRACE_BYTE_BUDGET, TRACE_TRIM_INTERVAL };

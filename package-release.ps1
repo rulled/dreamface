@@ -18,6 +18,7 @@ $runtimeFiles = @(
     'popup.js'
     'popup-trace.js'
     'trace.js'
+    'trace-store.js'
     'offscreen.html'
     'popup.html'
 )

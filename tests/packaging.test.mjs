@@ -20,6 +20,7 @@ const SCRIPT_KINDS = {
   'dreamface-api.js': 'module',
   'media-transform.js': 'module',
   'trace.js': 'module',
+  'trace-store.js': 'module',
   'features.js': 'module',
   'popup-trace.js': 'module',
 };
