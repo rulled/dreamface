@@ -25,23 +25,23 @@ async function renderStatus() {
   try {
     const { lines, dropped, seq, bytes, lastError } = await readTrace();
     if (lines.length === 0 && !seq) {
-      renderText('трассировка фазы 0: пусто');
+      renderText('лог: пусто (запишется при запуске)');
       return;
     }
     const parts = [`${lines.length} записей`];
     if (dropped > 0) parts.push(`вытеснено ${dropped}`);
     parts.push(formatBytes(bytes));
     if (lastError) parts.push(`ошибка записи: ${lastError}`);
-    renderText(`трассировка фазы 0: ${parts.join(' · ')}`);
+    renderText(`лог: ${parts.join(' · ')}`);
   } catch (error) {
-    renderText(`трассировка фазы 0: ошибка чтения (${error?.message || String(error)})`);
+    renderText(`лог: ошибка чтения (${error?.message || String(error)})`);
   }
 }
 
 async function exportTrace() {
   const { lines } = await readTrace();
   if (lines.length === 0) {
-    renderText('трассировка фазы 0: нечего скачивать');
+    renderText('лог: нечего скачивать');
     return;
   }
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -56,7 +56,7 @@ async function exportTrace() {
 
 exportBtn?.addEventListener('click', () => {
   exportTrace().catch((error) => {
-    renderText(`трассировка фазы 0: ошибка выгрузки (${error?.message || String(error)})`);
+    renderText(`лог: ошибка выгрузки (${error?.message || String(error)})`);
   });
 });
 

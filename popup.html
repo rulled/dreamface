@@ -1884,12 +1884,9 @@
               <div class="toolbar-actions">
                 <button id="diagnoseAccountsBtn" type="button" class="mini-btn">проверить</button>
                 <button id="captureAccountBtn" type="button" class="mini-btn">сохранить текущий</button>
-                <button id="traceExportBtn" type="button" class="mini-btn">скачать лог</button>
-                <button id="traceClearBtn" type="button" class="mini-btn">очистить лог</button>
               </div>
             </div>
             <div id="accountsList" class="audio-list"><div class="empty-state">сохранённых аккаунтов нет — используется текущий вход</div></div>
-            <div id="traceStatus" class="surface-caption"></div>
           </section>
 
           <section class="surface groups-surface">
@@ -1992,6 +1989,11 @@
             <div id="monitorAccounts" class="account-progress" aria-label="Прогресс по аккаунтам"></div>
             <div id="monitorError" class="monitor-alert" aria-live="polite"></div>
             <p id="stopNote" class="stop-note" hidden>Остановка прекратит новые отправки. Наблюдение и скачивание уже отправленных работ продолжатся.</p>
+            <div class="monitor-actions-row">
+              <button id="traceExportBtn" type="button" class="mini-btn">скачать лог</button>
+              <button id="traceClearBtn" type="button" class="mini-btn">очистить лог</button>
+            </div>
+            <div id="traceStatus" class="surface-caption" aria-live="polite"></div>
             <div class="monitor-actions-stack">
               <button id="stopBtn" class="btn btn-surface btn-block" type="button" aria-describedby="stopNote">
                 <svg class="solar-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
