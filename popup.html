@@ -1884,9 +1884,12 @@
               <div class="toolbar-actions">
                 <button id="diagnoseAccountsBtn" type="button" class="mini-btn">проверить</button>
                 <button id="captureAccountBtn" type="button" class="mini-btn">сохранить текущий</button>
+                <button id="traceExportBtn" type="button" class="mini-btn">скачать лог</button>
+                <button id="traceClearBtn" type="button" class="mini-btn">очистить лог</button>
               </div>
             </div>
             <div id="accountsList" class="audio-list"><div class="empty-state">сохранённых аккаунтов нет — используется текущий вход</div></div>
+            <div id="traceStatus" class="surface-caption"></div>
           </section>
 
           <section class="surface groups-surface">
@@ -2005,5 +2008,6 @@
   </div>
 
   <script src="popup.js"></script>
+  <script type="module" src="popup-trace.js"></script>
 </body>
 </html>

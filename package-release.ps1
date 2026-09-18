@@ -11,10 +11,13 @@ $runtimeFiles = @(
     'background.js'
     'content_script.js'
     'dreamface-api.js'
+    'features.js'
     'injected.js'
     'media-transform.js'
     'offscreen.js'
     'popup.js'
+    'popup-trace.js'
+    'trace.js'
     'offscreen.html'
     'popup.html'
 )

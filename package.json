@@ -1,0 +1,10 @@
+{
+  "name": "dreamface-batch-assistant",
+  "version": "1.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Node test harness for the DreamFace Batch Assistant extension scripts (no runtime dependencies).",
+  "scripts": {
+    "test": "node --test tests/"
+  }
+}

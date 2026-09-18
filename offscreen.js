@@ -1,3 +1,6 @@
+import { compactRaw, createTraceWriter } from './trace.js';
+import { readFeatures } from './features.js';
+
 const RUN_DB_NAME = 'dreamface-run-db';
 const RUN_DB_VERSION = 4;
 const RUN_STORE_NAME = 'audioTasks';
@@ -25,6 +28,41 @@ let initializationRetryPromise = null;
 const accountMutationLocks = new Map();
 let runAdmissionToken = null;
 const processedBlobLeases = new Map();
+
+// Phase 0 instrumentation (read-only). The flag is persisted in chrome.storage;
+// tracing stays on until the stored flag explicitly says otherwise.
+const phase0 = createTraceWriter();
+void readFeatures()
+  .then((features) => { phase0.setEnabled(features.phase0Trace !== false); })
+  .catch(() => {});
+
+async function phase0ProbeRunning(accountId, phase, principalKey = '') {
+  if (!accountId) return;
+  try {
+    const binding = await getAccountBinding(accountId, principalKey);
+    const running = await binding.client.getRunningWorks();
+    const ids = Array.isArray(running?.workIds) ? running.workIds : [];
+    phase0.record({ type: 'running_probe', accountId, phase, count: ids.length, ids });
+  } catch (error) {
+    phase0.record({ type: 'running_probe', accountId, phase, error: error?.message || String(error) });
+  }
+}
+
+async function phase0RecordRunEnd(reason = '') {
+  phase0.record({
+    type: 'run_end',
+    phase: runState.phase,
+    reason: reason || runState.interruptionReason || '',
+    recoverable: Boolean(runState.recoverable),
+    total: Number(runState.total || 0),
+    nextTaskIndex: Number(runState.nextTaskIndex || 0),
+    uncertain: (runState.queuePlan || []).filter(isSubmissionUncertain).length,
+    rejected: (runState.queuePlan || []).filter((unit) => (
+      unit.submissionPhase === 'rejected_confirmed' && Number(unit.acceptedCount || 0) === 0
+    )).length,
+  });
+  await phase0.flush();
+}
 
 function acquireRunAdmission() {
   if (runAdmissionToken) return null;
@@ -1305,6 +1343,20 @@ async function selectLeastLoadedAccount(
         hasCachedAvatar,
         score: Math.max(0, Math.max(load, reservation.baselineLoad + reservation.assigned) - affinityBonus),
       };
+      phase0.record({
+        type: 'account_probe',
+        source: 'selection',
+        accountId: effectiveAccount.accountId,
+        runningWorks: load,
+        limitSec: Number(effectiveAccount.maxDurationSeconds || 0),
+        tier: effectiveAccount.tier || '',
+        planName: effectiveAccount.planName || '',
+        planned: reservation.assigned,
+        baselineLoad: reservation.baselineLoad,
+        requiredDurationSeconds,
+        score: candidate.score,
+        avatarCached: hasCachedAvatar,
+      });
       availableMaximumSeconds = Math.max(
         availableMaximumSeconds,
         Number(effectiveAccount.maxDurationSeconds || 0),
@@ -1692,6 +1744,22 @@ async function watchAccountUnits(accountId, units, allAccountUnits) {
     };
   }
 
+  for (const unit of units) {
+    for (const id of unit.workIds || []) {
+      if (!id) continue;
+      const status = statusById.get(String(id));
+      const statusKey = status === undefined || Number.isNaN(status) ? 'unknown' : String(status);
+      phase0.recordOnce(`work:${id}:${statusKey}`, {
+        type: 'work_status',
+        workId: id,
+        unitId: unit.id,
+        accountId: unit.accountId,
+        submittedAt: unit.submittedAt || '',
+        status: statusKey === 'unknown' ? 'unknown' : Number(status),
+      });
+    }
+  }
+
   if (readyIds.length > 0) {
     const downloadResult = await client.getDownloadUrls([...new Set(readyIds)]);
     const urlById = new Map((downloadResult?.urls || []).filter((item) => item?.id && item?.url).map((item) => [String(item.id), item.url]));
@@ -1931,6 +1999,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
     await pushState();
     throwIfStopped(runToken);
     if (!unit.video.videoUrl) throw new Error(`${unit.video.name || 'video'}: DreamFace video URL missing`);
+    const avatarStartedAt = Date.now();
     let avatarId = await getCachedAvatarId(unit.video.videoUrl, unit.accountId);
     throwIfStopped(runToken);
     let avatar;
@@ -1944,8 +2013,16 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       await setCachedAvatarId(unit.video.videoUrl, unit.accountId, avatar.avatarId);
       throwIfStopped(runToken);
     }
+    phase0.record({
+      type: 'avatar',
+      unitId: unit.id,
+      accountId: unit.accountId,
+      cached: usedCache,
+      latencyMs: Date.now() - avatarStartedAt,
+    });
 
     const scriptConfigs = [];
+    let uploadMsTotal = 0;
     for (let audioIndex = 0; audioIndex < unit.audios.length; audioIndex += 1) {
       throwIfStopped(runToken);
       const audio = unit.audios[audioIndex];
@@ -1955,7 +2032,18 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       setStatusText(`[${index + 1}/${queue.length}] аудио ${audioIndex + 1}/${unit.audios.length}: ${audio.fileName}`);
       await pushState();
       throwIfStopped(runToken);
+      const uploadStartedAt = Date.now();
       const uploaded = await client.uploadAudio(record.blob, audio.fileName);
+      const uploadMs = Date.now() - uploadStartedAt;
+      uploadMsTotal += uploadMs;
+      phase0.record({
+        type: 'upload',
+        unitId: unit.id,
+        accountId: unit.accountId,
+        fileName: audio.fileName,
+        bytes: Number(record.blob?.size || 0),
+        latencyMs: uploadMs,
+      });
       throwIfStopped(runToken);
       scriptConfigs.push({
         type: 'AUDIO',
@@ -1977,6 +2065,15 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       if (retryAfterAccountLimit) return;
       retryAfterAccountLimit = true;
       const failedAccountId = String(unit.accountId);
+      phase0.record({
+        type: 'limit_hit',
+        unitId: unit.id,
+        accountId: failedAccountId,
+        taskCount: unit.audios.length,
+        error: error?.message || String(error),
+        apiStatus: error?.apiStatus || '',
+      });
+      void phase0ProbeRunning(failedAccountId, 'limit_hit', selectedAccount?.principalKey || '');
       const reservation = plannedLoads.get(failedAccountId);
       if (reservation && typeof reservation === 'object') {
         reservation.assigned = Math.max(0, Number(reservation.assigned || 0) - unit.audios.length);
@@ -2001,6 +2098,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
         runState.bulkContext = { ...context, presetState: 'dirty' };
         await pushState();
         throwIfStopped(runToken);
+        const quotaBefore = await client.getBatchTimes().catch(() => null);
         await client.updateBatchConfig(context.batchConfigId, batchName, scriptConfigs);
         throwIfStopped(runToken);
         try {
@@ -2050,6 +2148,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
           await pushState();
           await patchWatchSubmissionPhase(watchUnit, 'dispatching', { status: 'pending', dispatchStartedAt: unit.dispatchStartedAt });
           dispatchStarted = true;
+          const submitStartedAt = Date.now();
           submitted = await client.animateImageBatch({
             avatarId: avatar.avatarId,
             videoUrl: unit.video.videoUrl,
@@ -2058,6 +2157,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
             name: batchName,
             templateId: context.templateId,
           });
+          const submitMs = Date.now() - submitStartedAt;
           if (submitted.successCount > 0) {
             const submissionPhase = submitted.successCount < scriptConfigs.length ? 'requires_review' : 'accepted';
             setQueueSubmissionPhase(index, unit, submissionPhase, {
@@ -2089,6 +2189,38 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
               runState.warnings = [...runState.warnings, `не удалось сразу сохранить watcher отказа: ${error.message || String(error)}`];
             });
           }
+          const quotaAfter = await client.getBatchTimes().catch(() => null);
+          const runningAfter = await client.getRunningWorks().catch(() => null);
+          const runningAfterIds = Array.isArray(runningAfter?.workIds) ? runningAfter.workIds : null;
+          phase0.record({
+            type: 'dispatch_ack',
+            unitId: unit.id,
+            accountId: unit.accountId,
+            accountPrincipal: selectedAccount.principalKey || '',
+            taskCount: scriptConfigs.length,
+            maxDurSec: Math.round(requiredDurationSeconds * 1000) / 1000,
+            uploadMs: uploadMsTotal,
+            submitMs,
+            avatarCached: usedCache,
+            quotaBefore,
+            quotaAfter,
+            successCount: submitted.successCount,
+            failCount: submitted.failCount,
+            runningAfter: runningAfterIds ? runningAfterIds.length : null,
+            ...compactRaw(submitted.raw),
+          });
+          if (runningAfterIds) {
+            phase0.record({
+              type: 'running_probe',
+              accountId: unit.accountId,
+              phase: 't+0',
+              count: runningAfterIds.length,
+              ids: runningAfterIds,
+            });
+          }
+          const probeAccountId = unit.accountId;
+          const probePrincipal = selectedAccount.principalKey || '';
+          setTimeout(() => { void phase0ProbeRunning(probeAccountId, 't+30', probePrincipal); }, 30000);
           await pushState().catch((error) => {
             runState.warnings = [...runState.warnings, `не удалось сразу сохранить результат отправки: ${error.message || String(error)}`];
           });
@@ -2203,6 +2335,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       lastMessage: `безопасная очередь завершена; групп для проверки: ${reviewCount}`,
     };
     setStatusText(runState.downloadPlan.lastMessage);
+    await phase0RecordRunEnd('requires_review');
     await pushState();
     return;
   }
@@ -2240,6 +2373,7 @@ async function failRun(message, interruptionReason = '') {
     };
   }
   setStatusText(message);
+  await phase0RecordRunEnd(interruptionReason || 'failed');
   await pushState();
 }
 
@@ -2250,6 +2384,7 @@ async function finishRun(message) {
   runState.interruptionReason = '';
   runState.finishedAt = new Date().toISOString();
   setStatusText(message);
+  await phase0RecordRunEnd('completed');
   await pushState();
 }
 
@@ -2272,6 +2407,7 @@ async function finishStoppedRun() {
       : 'обработка остановлена пользователем',
   };
   setStatusText(runState.downloadPlan.lastMessage);
+  await phase0RecordRunEnd(runState.interruptionReason);
   await pushState();
 }
 
@@ -2742,6 +2878,16 @@ async function startRun(payload, admissionToken) {
       payload.options = { ...payload.options, maxDurationSeconds: splitTarget };
       await pushState();
     }
+    phase0.setContext({ runId: runState.runId, mode: runState.mode });
+    phase0.record({
+      type: 'run_start',
+      batches: Array.isArray(payload.batches) ? payload.batches.length : 0,
+      audios: countInputFiles(payload.batches),
+      videos: (payload.batches || []).reduce((sum, batch) => sum + (batch.selectedAvatars || []).length, 0),
+      splitTarget: runState.maxDurationSeconds,
+      overlap: Boolean(runState.overlapEnabled),
+      autoNormalize: Boolean(runState.autoNormalize),
+    });
     const { queue, summary, consumedInputIds = [] } = runState.mode === 'bulk'
       ? await prepareBulkPlan(payload, runToken)
       : await prepareTasks(payload, runToken);
