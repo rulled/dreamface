@@ -52,6 +52,8 @@ const accountMutationLocks = new Map();
 let runAdmissionToken = null;
 // per-run cache of the account's template + SCRIPT preset (see the connect block in the attempt)
 const runConnectCache = new Map();
+// accounts whose zeroed subscription counter was already tested once in this run
+const quotaProbeAttempted = new Set();
 const processedBlobLeases = new Map();
 
 // Phase 0 instrumentation (read-only) plus the per-phase feature gates. Flags live in
@@ -495,6 +497,7 @@ async function resetRunStateInternal() {
   stopRequested = false;
   currentRunToken += 1;
   runConnectCache.clear();
+  quotaProbeAttempted.clear();
   await clearTaskBlobs().catch(() => {});
   await clearInputFiles().catch(() => {});
   runState = createIdleRunState();
@@ -1608,7 +1611,7 @@ async function selectLeastLoadedAccount(
     const { account: effectiveAccount, accountId, quota } = candidate;
     const limitSec = Number(effectiveAccount.maxDurationSeconds || 0);
     availableMaximumSeconds = Math.max(availableMaximumSeconds, limitSec);
-    if (quotaExhausted(quota)) {
+    if (quotaExhausted(quota) && !(featureEnabled('quotaProbe') && !quotaProbeAttempted.has(accountId))) {
       quotaBlocked.push({ accountId, tier: effectiveAccount.tier || '', quota });
       phase0.record({
         type: 'account_probe',
@@ -3316,6 +3319,7 @@ async function startRun(payload, admissionToken) {
 
   await clearTaskBlobs();
   runConnectCache.clear();
+  quotaProbeAttempted.clear();
 
   runState = createIdleRunState();
   runState.mode = payload.mode === 'bulk' ? 'bulk' : 'legacy';

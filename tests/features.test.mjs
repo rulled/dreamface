@@ -29,7 +29,7 @@ test('the validated dispatch path ships enabled, unvalidated phases stay off', (
   assert.equal(DEFAULT_FEATURES.phase0Trace, true);
   assert.equal(DEFAULT_FEATURES.accountHealth, true);
   assert.equal(DEFAULT_FEATURES.accountSnapshot, true);
-  for (const flag of ['ossUploadCache', 'workLedger', 'chunkedPlanning']) {
+  for (const flag of ['quotaProbe', 'ossUploadCache', 'workLedger', 'chunkedPlanning']) {
     assert.equal(DEFAULT_FEATURES[flag], false, `${flag} changes runtime behavior and must default off`);
   }
 });

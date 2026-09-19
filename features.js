@@ -21,6 +21,10 @@ export const DEFAULT_FEATURES = Object.freeze({
   accountHealth: true,
   accountSnapshot: true,
   lptOrder: false,
+  // Insurance for the subscription counter: with this on, an account whose
+  // get_batch_times reads 0 is submitted to once per run so the server, not the counter,
+  // decides. Off by default — a probe is exactly the rejected attempt the gate removes.
+  quotaProbe: false,
   ossUploadCache: false,
   workLedger: false,
   chunkedPlanning: false,
