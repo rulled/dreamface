@@ -1759,7 +1759,27 @@ async function selectLeastLoadedAccount(
     }
     const affinityBonus = candidate.hasCachedAvatar ? 2 : 0;
     const fits = limitSec >= requiredDurationSeconds;
-    const metered = !quotaUnlimited(quota);
+    // Metering follows the plan, exactly as in the snapshot mapping: a premium account whose
+    // counter read failed is still unlimited, while a Pro account whose read failed must not spend
+    // credits nobody can account for — so it is skipped rather than ranked last.
+    const metered = String(effectiveAccount.tier || '') !== 'premium';
+    if (metered && !quota) {
+      quotaBlocked.push({ accountId, tier: effectiveAccount.tier || '', quota });
+      phase0.record({
+        type: 'account_probe',
+        source,
+        accountId,
+        skipped: 'quota_unknown',
+        runningWorks: candidate.load,
+        limitSec,
+        tier: effectiveAccount.tier || '',
+        planName: effectiveAccount.planName || '',
+        quota,
+        requiredDurationSeconds,
+        avatarCached: candidate.hasCachedAvatar,
+      });
+      continue;
+    }
     const built = {
       account: effectiveAccount,
       accountId,
@@ -3602,6 +3622,15 @@ async function startRun(payload, admissionToken) {
     await pushState();
     if (runState.mode === 'bulk') {
       for (const id of consumedInputIds) await deleteInputFileRecord(id);
+    }
+    if (dispatchQueue.length === 0) {
+      // A run that never dispatches anything is a failure, not a finished submission: the operator
+      // would otherwise wait for results that were never requested. Seen live when every input
+      // failed to prepare (two "source file missing" failures reported as "Отправка завершена").
+      await failRun(runState.failures.length > 0
+        ? `нечего отправлять: не подготовлено ни одного файла (ошибок: ${runState.failures.length})`
+        : 'нечего отправлять: очередь пуста');
+      return;
     }
     if (runState.mode === 'bulk') {
       await processBulkQueue(dispatchQueue, runToken);

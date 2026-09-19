@@ -203,6 +203,29 @@ test('an unmeasured metered account is never used, an unmeasured premium one sti
   assert.deepEqual(rankCandidates([unknownPro, unknownPremium]).map((c) => c.accountId), ['premium-unknown', 'pro-unknown']);
 });
 
+test('the preview spreads units the way the live dispatch does', () => {
+  // The 15:37 run previewed "69a818:2" while the dispatch spread the two units over 69a818 and
+  // 69a821: mutating only `load` left the score, which actually orders the pool, untouched.
+  const pool = [account('first', { load: 0, score: 0 }), account('second', { load: 0, score: 0 })];
+  const units = [
+    { id: 'u1', audios: [{ fileName: 'a.mp3' }], video: { videoUrl: 'v1' } },
+    { id: 'u2', audios: [{ fileName: 'b.mp3' }], video: { videoUrl: 'v2' } },
+  ];
+  const plan = simulatePlan(units, pool, { tierEnabled: false });
+  assert.deepEqual(plan.assignments.map((a) => a.accountId), ['first', 'second']);
+});
+
+test('the preview gives a unit with a cached avatar the same head start the dispatch does', () => {
+  // The bonus only bites above the keep-alive floor, exactly as in the live selector, which
+  // clamps the score at zero.
+  const pool = [
+    account('cold', { load: 2, score: 0, hasCachedAvatar: false }),
+    account('warm', { load: 2, score: 0, hasCachedAvatar: true }),
+  ];
+  const plan = simulatePlan([{ id: 'u1', audios: [{ fileName: 'a.mp3' }], video: { videoUrl: 'v' } }], pool, { tierEnabled: false });
+  assert.deepEqual(plan.assignments.map((a) => a.accountId), ['warm']);
+});
+
 test('the tail forecast follows the observed turnaround of the assigned account', () => {
   const pool = [account('slow', { msPerWork: 150000, drainSamples: 3, load: 0 })];
   const plan = simulatePlan([unit('u1', [10]), unit('u2', [10])], pool);

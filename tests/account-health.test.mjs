@@ -25,7 +25,7 @@ import {
 
 const NOW = 1_700_000_000_000;
 const PRO = { total: 10, remaining: 4 };
-const SPENT = { total: 10, remaining: 0 };
+const SPENT = { total: 10, remaining: 0, at: 1 };
 const PREMIUM = { total: 1, remaining: 1 };
 
 test('garbage normalizes to an idle record and the premium sentinel is not a limit', () => {

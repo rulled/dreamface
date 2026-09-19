@@ -327,6 +327,8 @@ export function describeQuota(accounts, now = Date.now()) {
       remaining: quota.remaining,
       unlimited: quotaUnlimited(quota),
       exhausted: quotaExhausted(quota),
+      // No reading at all is not the same as a spent counter: say so instead of showing 0/0.
+      unknown: !quota.at,
       staleMs: quota.at ? Math.max(0, now - quota.at) : 0,
     };
   });
@@ -335,7 +337,7 @@ export function describeQuota(accounts, now = Date.now()) {
     rows,
     exhausted,
     text: rows
-      .map((row) => `${row.accountId.slice(0, 8)}:${row.unlimited ? 'unlimited' : `${row.remaining}/${row.total}`}`)
+      .map((row) => `${row.accountId.slice(0, 8)}:${row.unlimited ? 'unlimited' : (row.unknown ? '?:?' : `${row.remaining}/${row.total}`)}`)
       .join(', '),
   };
 }

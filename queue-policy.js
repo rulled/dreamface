@@ -173,10 +173,29 @@ export function simulatePlan(units, candidates, options = {}) {
   const assignments = [];
   const deferred = [];
   const byAccount = new Map();
+  // The live selector scores a candidate as max(probe load, reservation baseline + already assigned
+  // in this run) minus the avatar-cache affinity. The preview must use the same formula, or it
+  // stacks every unit on one account: the 15:37 run previewed "69a818:2" while the dispatch
+  // actually spread the two units over 69a818 and 69a821.
+  const reservations = new Map(pool.map((candidate) => [
+    candidate.accountId,
+    { baselineLoad: Number(candidate.load || 0), assigned: 0 },
+  ]));
+  const scorePool = () => {
+    for (const candidate of pool) {
+      const reservation = reservations.get(candidate.accountId);
+      const affinityBonus = candidate.hasCachedAvatar ? 2 : 0;
+      candidate.score = Math.max(0, Math.max(
+        Number(candidate.load || 0),
+        reservation.baselineLoad + reservation.assigned,
+      ) - affinityBonus);
+    }
+  };
 
   for (const unit of Array.isArray(units) ? units : []) {
     const requiredSeconds = unitRequiredSeconds(unit);
     const works = Math.max(1, (unit?.audios || []).length);
+    scorePool();
     const eligible = pool.filter((candidate) => candidateCanTake(candidate, requiredSeconds));
     if (eligible.length === 0) {
       deferred.push({
@@ -189,7 +208,8 @@ export function simulatePlan(units, candidates, options = {}) {
       continue;
     }
     const chosen = rankCandidates(eligible, context)[0];
-    chosen.load = Number(chosen.load || 0) + works;
+    const reservation = reservations.get(chosen.accountId);
+    reservation.assigned += works;
     chosen.tier = options.tierEnabled === false ? 1 : accountTier(chosen, context);
     if (chosen.metered) chosen.remaining = Math.max(0, Number(chosen.remaining || 0) - 1);
     assignments.push({ unitId: unit?.id || '', accountId: chosen.accountId, works, requiredSeconds });
@@ -206,7 +226,7 @@ export function simulatePlan(units, candidates, options = {}) {
     entry.units += 1;
     entry.works += works;
     if (chosen.metered) entry.creditsSpent += 1;
-    entry.loadEnd = chosen.load;
+    entry.loadEnd = Math.max(Number(chosen.load || 0), reservation.baselineLoad + reservation.assigned);
     entry.tierEnd = chosen.tier;
     byAccount.set(chosen.accountId, entry);
   }
