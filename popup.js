@@ -2056,11 +2056,20 @@ startBtn.addEventListener('click', async () => {
   await settingsSavePromise;
   const validBatches = batches
     .filter((batch) => batch.selectedIndices.length > 0 && batch.audioFiles.length > 0)
-    .map((batch) => ({
-      id: batch.id,
-      selectedAvatars: batch.selectedIndices.map((index) => foundVideos[index]).filter(Boolean),
-      audioFiles: [...batch.audioFiles],
-    }));
+    .map((batch) => {
+      // The page grid index travels with the avatar: the engine asks the page for that video's
+      // length, which is what decides whether the server ping-pongs it and whether the downloaded
+      // result needs forward/reverse chapter markers.
+      const picked = batch.selectedIndices
+        .map((index) => ({ index, video: foundVideos[index] }))
+        .filter((item) => item.video);
+      return {
+        id: batch.id,
+        selectedAvatars: picked.map((item) => item.video),
+        selectedIndices: picked.map((item) => item.index),
+        audioFiles: [...batch.audioFiles],
+      };
+    });
 
   if (validBatches.length === 0) {
     return;

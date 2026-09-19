@@ -1982,14 +1982,17 @@ async function prepareBulkPlan(payload, runToken) {
       if (videos.length > 0) assigned[audio.sourceIndex % videos.length].push(audio);
     }
 
-    for (let videoIndex = 0; videoIndex < videos.length; videoIndex += 1) {
-      if (assigned[videoIndex].length === 0) continue;
+    for (let slotIndex = 0; slotIndex < videos.length; slotIndex += 1) {
+      if (assigned[slotIndex].length === 0) continue;
+      const pageIndex = Number(batch.selectedIndices?.[slotIndex]);
       queue.push({
         id: `${runState.runId}-bulk-${String(queue.length + 1).padStart(3, '0')}`,
         batchId: batch.id,
         batchIndex,
-        video: videos[videoIndex],
-        audios: assigned[videoIndex],
+        video: videos[slotIndex],
+        // The index of this avatar in the page grid, so the download can learn the source length.
+        videoIndex: Number.isInteger(pageIndex) ? pageIndex : -1,
+        audios: assigned[slotIndex],
         workIds: [],
         submissionPhase: 'preparing',
       });
@@ -2082,6 +2085,40 @@ function reconcileDuplicateWatchClaims(units) {
       return '';
     });
   }
+}
+
+// The server fills audio longer than the source video by ping-ponging it (forward videoMs, then
+// reversed videoMs, and so on). Chapter markers are only useful when we know that source length,
+// so the page is asked once per run and per avatar slot: asking per unit would add one round trip
+// for every (audio, avatar) pair of a matrix batch.
+const sourceVideoMsByRun = new Map();
+
+async function readSourceVideoMs(videoIndex) {
+  const index = Number(videoIndex);
+  if (!runState.tabId || !Number.isInteger(index) || index < 0) {
+    return 0;
+  }
+  const cacheKey = `${runState.runId}:${index}`;
+  if (sourceVideoMsByRun.has(cacheKey)) {
+    return sourceVideoMsByRun.get(cacheKey);
+  }
+  let ms = 0;
+  try {
+    const resp = await callBackground('engine.pageAction', {
+      tabId: runState.tabId,
+      pageAction: 'getVideoSourceUrlByIndex',
+      payload: { videoIndex: index },
+    });
+    const data = resp?.response || {};
+    if (data.ok) {
+      ms = Math.max(0, Math.round(Number(data.durationMs) || 0));
+    }
+  } catch (_) {
+    // The grid may be gone (closed tab, changed page): chapters are then simply not marked.
+    ms = 0;
+  }
+  sourceVideoMsByRun.set(cacheKey, ms);
+  return ms;
 }
 
 async function addBulkWatchUnit(unit) {
@@ -2264,6 +2301,8 @@ async function watchAccountUnits(accountId, units, allAccountUnits) {
         const id = unit.workIds[index];
         const url = urlById.get(id);
         if (!id || !url || enqueued.has(id)) continue;
+        const audioMs = Math.max(0, Math.round(Number((unit.audioDurationsMs || [])[index] || 0)));
+        const videoMs = Math.max(0, Math.round(Number(unit.sourceVideoMs || 0)));
         queueItems.push({
           workId: id,
           runId: unit.runId || '',
@@ -2272,9 +2311,10 @@ async function watchAccountUnits(accountId, units, allAccountUnits) {
           workName: unit.expectedFileNames[index] || id,
           audioFileName: unit.expectedFileNames[index] || '',
           url,
-          audioMs: null,
-          videoMs: null,
-          hasChapters: false,
+          audioMs: audioMs || null,
+          videoMs: videoMs || null,
+          // Chapters describe a ping-pong that only exists when the audio outlasts the source.
+          hasChapters: Boolean(audioMs > 0 && videoMs > 0 && audioMs > videoMs),
         });
         queueRefs.push({ unit, id });
       }
@@ -2772,6 +2812,10 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
             accountId: unit.accountId,
             principalKey: selectedAccount.principalKey,
             expectedFileNames: unit.audios.map((audio) => audio.fileName),
+            // Per-work durations, in the same order as expectedFileNames: the results download
+            // needs them to mark where the server ping-pongs the source video.
+            audioDurationsMs: unit.audios.map((audio) => Math.max(0, Math.round(Number(audio.durationMs || 0)))),
+            sourceVideoMs: await readSourceVideoMs(unit.videoIndex),
             submittedAt: unit.submittedAt,
             correlationDeadline: unit.correlationDeadline,
             baselineWorkIds: unit.baselineWorkIds || [],
@@ -3531,6 +3575,7 @@ async function startRun(payload, admissionToken) {
   runRejections.length = 0;
   quotaWaitCount = 0;
 
+  sourceVideoMsByRun.clear();
   runState = createIdleRunState();
   runState.mode = payload.mode === 'bulk' ? 'bulk' : 'legacy';
   runState.phase = 'preparing';
