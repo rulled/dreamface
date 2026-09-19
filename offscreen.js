@@ -2744,6 +2744,10 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
     let watchUnit;
     let dispatchStarted = false;
     let retryAfterAccountLimit = false;
+    // Per-unit outcomes that must not end the queue: a refused submission is recorded and the run
+    // moves on, and a stale avatar registration gets the unit re-entered once with a fresh avatar.
+    let avatarRetry = false;
+    let unitSkipped = false;
     const prepareAccountLimitRetry = async (error) => {
       if (retryAfterAccountLimit) return;
       retryAfterAccountLimit = true;
@@ -3005,6 +3009,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
           });
         } catch (error) {
           if (submitted) throw error;
+          if (error.code === 'run_stopped') throw error;
           if (error.code === 'account_limit_reached') {
             await prepareAccountLimitRetry(error);
             return;
@@ -3016,9 +3021,25 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
             accountId: unit.accountId,
             error: error?.message || String(error),
           });
-          if (dispatchStarted && usedCache) {
+          const staleAvatar = dispatchStarted && usedCache;
+          if (staleAvatar) {
             await invalidateCachedAvatarId(unit.video.videoUrl, unit.accountId);
             runState.warnings = [...runState.warnings, `кэш аватара инвалидирован для ${unit.video.name} на ${unit.accountId}: ${error.message}`];
+          }
+          // A rejection carried in the response body is authoritative: DreamFace did not create the
+          // batch, so the unit is not uncertain and a retry cannot duplicate anything. A stale
+          // avatar registration is the case worth retrying, and the cache was just invalidated, so
+          // re-entering the unit registers a fresh one.
+          const rejectedInResponse = error.code === 'api_rejected';
+          if (rejectedInResponse && staleAvatar && Number(unit.avatarRetryCount || 0) < 1) {
+            unit.avatarRetryCount = Number(unit.avatarRetryCount || 0) + 1;
+            unit.lastError = error.message || String(error);
+            runState.queuePlan[index] = { ...unit };
+            runState.nextTaskIndex = index;
+            runState.warnings = [...runState.warnings, `${unit.video.name}: отправка отклонена (${error.message}); повтор с новым аватаром`];
+            await pushState().catch(() => {});
+            avatarRetry = true;
+            return;
           }
           if (watchUnit) {
             const stoppedBeforeDispatch = !dispatchStarted && error.code === 'run_stopped';
@@ -3042,7 +3063,14 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
               }),
             ]);
           }
-          throw error;
+          // One unit that DreamFace refused, or whose answer never arrived, must not end the run:
+          // the rest of the queue is unaffected and an uncertain unit stays tracked for review by
+          // the end-of-queue logic.
+          if (rejectedInResponse) {
+            runState.failures = [...runState.failures, `${unit.video.name}: DreamFace отклонил отправку (${error.message})`];
+          }
+          unitSkipped = true;
+          return;
         }
         throwIfStopped(runToken);
       } catch (error) {
@@ -3067,6 +3095,16 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
     });
     if (runState.bulkContext?.presetState === 'restore_required') {
       throw new Error('DreamFace preset restoration failed; run can be resumed after connection recovery');
+    }
+    if (avatarRetry) {
+      setStatusText(`[${index + 1}/${queue.length}] повтор отправки с новым аватаром`);
+      await pushState();
+      index -= 1;
+      continue;
+    }
+    if (unitSkipped) {
+      await pushState();
+      continue;
     }
     if (retryAfterAccountLimit) {
       setStatusText(`[${index + 1}/${queue.length}] лимит аккаунта, выбираем другой`);
