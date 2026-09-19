@@ -6,3 +6,7 @@ Thumbs.db
 *.log
 # release artifacts
 dist/
+
+# local trace dumps used for analysis
+.trace-*.jsonl
+.smoke/

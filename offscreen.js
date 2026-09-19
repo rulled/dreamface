@@ -27,6 +27,9 @@ const OVERLAP_SECONDS = 5;
 const TRANSIENT_TASK_RETRY_LIMIT = 2;
 const TRANSIENT_TASK_RETRY_BASE_DELAY_MS = 5000;
 const BULK_WATCH_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const TERMINAL_WATCH_STATUSES = new Set([
+  'complete', 'failed', 'cancelled', 'rejected', 'submission_failed', 'submission_cancelled',
+]);
 
 let ffmpeg = null;
 let ffmpegLoadPromise = null;
@@ -2154,13 +2157,15 @@ async function runBulkWatcher({ allowDuringRun = false } = {}) {
       unit.submissionPhase = 'submission_uncertain';
       unit.lastError ||= queueUnit.lastError || 'Submission outcome is unknown after executor restart';
     }
-    const pendingUnits = units.filter((unit) => (
-      unit.status === 'pending'
-      || unit.status === 'submission_uncertain'
-      || (unit.status === 'requires_review' && (unit.workIds || []).some(Boolean))
-      || ['dispatching', 'correlating', 'submission_uncertain'].includes(unit.submissionPhase)
-      || (unit.submissionPhase === 'requires_review' && (unit.workIds || []).some(Boolean))
-    ));
+    // `status` is the authority on whether a unit is still worth polling. A finished unit keeps
+    // the last submission phase it was given ('correlating'), so matching on the phase as well
+    // made every completed unit — including those of older runs — get re-scanned and
+    // re-statused on every tick: a finished queue of 73 units re-read 181 works per tick.
+    const pendingUnits = units.filter((unit) => {
+      if (TERMINAL_WATCH_STATUSES.has(unit.status)) return false;
+      if (unit.status === 'requires_review') return (unit.workIds || []).some(Boolean);
+      return unit.status === 'pending' || unit.status === 'submission_uncertain';
+    });
     reconcileDuplicateWatchClaims(pendingUnits);
     const byAccount = new Map();
     for (const unit of pendingUnits) {
