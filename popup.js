@@ -1983,10 +1983,21 @@ diagnoseAccountsBtn?.addEventListener('click', async () => {
     statusText.textContent = response?.error || 'диагностика аккаунтов не удалась';
   } else {
     const healthy = response.diagnostics.filter((item) => item.ok).length;
+    const describeAccountQuota = (quota) => {
+      const total = Number(quota?.total);
+      const remaining = Number(quota?.remaining);
+      if (!Number.isFinite(total) || !Number.isFinite(remaining)) return 'квота ?';
+      // Premium answers the counter with a 1/1 sentinel: batches are not metered there.
+      if (total <= 1) return 'квота без лимита';
+      return remaining <= 0 ? `квота исчерпана 0/${total}` : `квота ${remaining}/${total}`;
+    };
+    const exhausted = response.diagnostics.filter((item) => item.ok
+      && Number(item.quota?.total) > 1
+      && Number(item.quota?.remaining) <= 0).length;
     const summary = response.diagnostics.map((item) => item.ok
-      ? `${item.planName} ${item.maxDurationSeconds}s, active ${item.runningWorks}, batch ${item.quota?.remaining ?? '?'} / ${item.quota?.total ?? '?'}`
+      ? `${item.planName} ${item.maxDurationSeconds}s, активных ${item.runningWorks}, ${describeAccountQuota(item.quota)}`
       : `${item.error || 'invalid'}`).join(' | ');
-    statusText.textContent = `аккаунты: ${healthy}/${response.diagnostics.length} доступны. ${summary}`;
+    statusText.textContent = `аккаунты: ${healthy}/${response.diagnostics.length} доступны. ${summary}${exhausted > 0 ? `. без квоты: ${exhausted} (пропускаются до восстановления)` : ''}`;
   }
   diagnoseAccountsBtn.disabled = false;
 });

@@ -726,7 +726,8 @@ async function syncBulkWatchAlarm(units = null) {
     || (unit?.status === 'requires_review' && (unit?.workIds || []).some(Boolean))
   ))) {
     const alarm = await chrome.alarms.get(BULK_WATCH_ALARM);
-    if (!alarm) await chrome.alarms.create(BULK_WATCH_ALARM, { periodInMinutes: 1 });
+    // Chrome 120+ accepts 30s; older builds clamp to a minute, which is still correct.
+    if (!alarm) await chrome.alarms.create(BULK_WATCH_ALARM, { periodInMinutes: 0.5 });
     return true;
   }
   await chrome.alarms.clear(BULK_WATCH_ALARM);
@@ -1751,8 +1752,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return;
       }
 
-      // Offscreen documents only get chrome.runtime, so flags are read through here and
-      // merged against defaults by the caller.
+      // Offscreen documents only get chrome.runtime, so flags are read through here; the
+      // caller merges the defaults from features.js (a classic worker cannot import them).
       case 'dfGetFeatures': {
         const stored = await chrome.storage.local.get(FEATURES_KEY);
         sendResponse({ ok: true, features: stored[FEATURES_KEY] || {} });

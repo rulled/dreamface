@@ -1,18 +1,19 @@
 // Feature flags for the scheduler rework.
 //
-// Every behavior-changing phase ships behind a flag that defaults to OFF, so the
-// current (pre-rework) path stays the default until the phase is validated.
-// Phase 0 tracing is read-only instrumentation, hence ON by default.
+// Phase 0 tracing is read-only instrumentation. The scheduler phases ship behind flags so
+// a bad phase can be rolled back without a rebuild; accountHealth / accountSnapshot are ON
+// because they are the validated dispatch path (see PRODUCT notes and the phase 2 trace).
 
 export const FEATURES_KEY = 'dreamfaceFeatures';
 
-// Phase 0 measurements retired aimdSlots / weightedScore / dynamicSplit / avatarWarmup:
-// "Account Limit Reached" arrives with zero running works, remaining_times never moves,
-// and the encoder already emits ~100 kbps mono.
+// Phase 0 measurements retired aimdSlots / weightedScore / dynamicSplit / avatarWarmup.
+// They were replaced by the quota model measured in phase 2: "Account Limit Reached" is the
+// per-account submission quota (get_batch_times.remaining_times, pro = 10) reaching zero,
+// not concurrency (running_works stays 0) and not a permanent account flag.
 export const DEFAULT_FEATURES = Object.freeze({
   phase0Trace: true,
-  accountHealth: false,
-  accountSnapshot: false,
+  accountHealth: true,
+  accountSnapshot: true,
   ossUploadCache: false,
   workLedger: false,
   chunkedPlanning: false,

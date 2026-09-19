@@ -23,13 +23,14 @@ test('mergeFeatures fills in defaults and keeps stored overrides', () => {
   assert.equal(merged.phase0Trace, true);
 });
 
-test('only the read-only phase 0 tracing ships enabled', () => {
-  for (const [flag, value] of Object.entries(DEFAULT_FEATURES)) {
-    if (flag === 'phase0Trace') {
-      assert.equal(value, true, 'phase 0 tracing is read-only instrumentation');
-    } else {
-      assert.equal(value, false, `${flag} changes runtime behavior and must default off`);
-    }
+test('the validated dispatch path ships enabled, unvalidated phases stay off', () => {
+  // Phase 0 tracing is read-only; accountHealth and accountSnapshot are the dispatch path
+  // measured in the phase 2 trace. The remaining flags still change behavior unprovenly.
+  assert.equal(DEFAULT_FEATURES.phase0Trace, true);
+  assert.equal(DEFAULT_FEATURES.accountHealth, true);
+  assert.equal(DEFAULT_FEATURES.accountSnapshot, true);
+  for (const flag of ['ossUploadCache', 'workLedger', 'chunkedPlanning']) {
+    assert.equal(DEFAULT_FEATURES[flag], false, `${flag} changes runtime behavior and must default off`);
   }
 });
 

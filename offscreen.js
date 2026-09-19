@@ -1,15 +1,17 @@
 import { compactRaw, createTraceWriter } from './trace.js';
 import { DEFAULT_FEATURES, mergeFeatures } from './features.js';
 import {
-  blockedUntil,
   createAccountHealth,
   describeBlocked,
+  describeQuota,
   isBlocked,
   normalizeHealthMap,
+  noteQuota,
   pruneHealthMap,
+  quotaExhausted,
+  quotaUnlimited,
   recordBulkRejection,
   recordBulkSuccess,
-  syncHealthWithCapabilities,
 } from './account-health.js';
 
 const RUN_DB_NAME = 'dreamface-run-db';
@@ -24,7 +26,7 @@ const DEFAULT_MAX_DURATION_SECONDS = 180;
 const OVERLAP_SECONDS = 5;
 const TRANSIENT_TASK_RETRY_LIMIT = 2;
 const TRANSIENT_TASK_RETRY_BASE_DELAY_MS = 5000;
-const BULK_WATCH_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const BULK_WATCH_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 let ffmpeg = null;
 let ffmpegLoadPromise = null;
@@ -91,10 +93,10 @@ async function persistAccountHealth(accountId) {
   await callBackground('dfPatchAccountHealth', { accountId: String(accountId), health }).catch(() => {});
 }
 
-function noteAccountSuccess(accountId, tier = '') {
+function noteAccountSuccess(accountId, tier = '', quota = null) {
   if (!featureEnabled('accountHealth') || !accountId) return;
   const id = String(accountId);
-  accountHealthCache.set(id, recordBulkSuccess(accountHealthCache.get(id), { tier }));
+  accountHealthCache.set(id, recordBulkSuccess(accountHealthCache.get(id), { tier, quota }));
   void persistAccountHealth(id);
 }
 
@@ -107,13 +109,31 @@ async function noteAccountRejection(accountId, options = {}) {
   return health;
 }
 
-function noteAccountCapabilities(accountId, capabilities) {
-  if (!featureEnabled('accountHealth') || !accountId) return;
+// The submission quota is the only rejection signal phase 2 found actionable: "Account Limit
+// Reached" arrives exactly when get_batch_times reports remaining = 0, and the same account
+// accepts batches again once the counter recovers. Recording every reading makes the recovery
+// (an increase) its own trace event, which is how the quota period gets measured.
+function noteAccountQuota(accountId, quota) {
+  if (!featureEnabled('accountHealth') || !accountId || !quota) return null;
   const id = String(accountId);
-  const synced = syncHealthWithCapabilities(accountHealthCache.get(id), { tier: capabilities?.tier || '' });
-  if (synced.tier === getAccountHealth(id).tier) return;
-  accountHealthCache.set(id, synced);
-  void persistAccountHealth(id);
+  const { health, reset, previous } = noteQuota(accountHealthCache.get(id), quota);
+  accountHealthCache.set(id, health);
+  const changed = reset
+    || previous.total !== health.quota.total
+    || previous.remaining !== health.quota.remaining;
+  if (reset) {
+    phase0.record({
+      type: 'quota_reset',
+      accountId: id,
+      tier: health.tier,
+      from: Number(previous.remaining || 0),
+      to: Number(health.quota.remaining || 0),
+      total: Number(health.quota.total || 0),
+      sinceMs: previous.at ? Math.max(0, Date.now() - previous.at) : 0,
+    });
+  }
+  if (changed) void persistAccountHealth(id);
+  return health;
 }
 
 let autoResumeTimer = null;
@@ -141,9 +161,16 @@ async function phase0ProbeRunning(accountId, phase, principalKey = '') {
   if (!accountId) return;
   try {
     const binding = await getAccountBinding(accountId, principalKey);
-    const running = await binding.client.getRunningWorks();
-    const ids = Array.isArray(running?.workIds) ? running.workIds : [];
-    phase0.record({ type: 'running_probe', accountId, phase, count: ids.length, ids });
+    const [running, quota] = await Promise.all([
+      binding.client.getRunningWorks(),
+      binding.client.getBatchTimes().catch(() => null),
+    ]);
+    const ids = Array.isArray(running?.workIds) ? running.workIds.map(String) : [];
+    if (quota) {
+      noteAccountQuota(accountId, quota);
+      refreshProbeCache(accountId, { runningWorks: { workIds: ids }, quota });
+    }
+    phase0.record({ type: 'running_probe', accountId, phase, count: ids.length, ids, quota });
   } catch (error) {
     phase0.record({ type: 'running_probe', accountId, phase, error: error?.message || String(error) });
   }
@@ -1404,40 +1431,128 @@ async function invalidateCachedAvatarId(videoUrl, accountId) {
   }).catch(() => {});
 }
 
+// ------------------------------------------------------- account probing (phase 2)
+//
+// Every dispatch used to re-probe every account with getAccountCapabilities (rights +
+// template config) plus getRunningWorks — roughly eleven requests per attempt for four
+// accounts. Capabilities change on a subscription's timescale, so they are cached for
+// CAPABILITIES_TTL_MS; load and quota are cached for LOAD_PROBE_TTL_MS because dispatch is
+// sequential. One getBatchTimes per probe now feeds the quota gate, the trace and the health
+// model instead of being fetched again before every submit.
+const CAPABILITIES_TTL_MS = 45 * 1000;
+const LOAD_PROBE_TTL_MS = 8 * 1000;
+const accountProbeCache = new Map();
+
+function getProbeCacheEntry(accountId) {
+  const id = String(accountId);
+  if (!accountProbeCache.has(id)) accountProbeCache.set(id, { accountId: id });
+  return accountProbeCache.get(id);
+}
+
+// A probe older than LOAD_PROBE_TTL_MS does not yet contain our own accepted batches; applying
+// them locally keeps a failed post-submit refresh from advertising an idle account.
+function noteOwnDispatch(accountId, workCount) {
+  if (!featureEnabled('accountSnapshot')) return;
+  const entry = accountProbeCache.get(String(accountId));
+  if (!entry?.load) return;
+  const added = Math.max(0, Number(workCount) || 0);
+  entry.load = {
+    ...entry.load,
+    workIds: [...entry.load.workIds, ...Array(added).fill('self')],
+    quota: entry.load.quota && entry.load.quota.total > 1 && entry.load.quota.remaining > 0
+      ? { ...entry.load.quota, remaining: entry.load.quota.remaining - 1 }
+      : entry.load.quota,
+  };
+}
+
+function refreshProbeCache(accountId, { runningWorks, quota } = {}) {
+  const id = String(accountId);
+  const entry = getProbeCacheEntry(id);
+  const workIds = Array.isArray(runningWorks?.workIds) ? runningWorks.workIds.map(String) : null;
+  entry.load = {
+    at: Date.now(),
+    workIds: workIds || entry.load?.workIds || [],
+    quota: quota
+      ? { total: Number(quota.total) || 0, remaining: Number(quota.remaining) || 0 }
+      : entry.load?.quota || null,
+  };
+}
+
+async function probeAccount(binding, accountId) {
+  const entry = getProbeCacheEntry(accountId);
+  const now = Date.now();
+  const snapshotEnabled = featureEnabled('accountSnapshot');
+  const loadFresh = snapshotEnabled && entry.load && now - entry.load.at <= LOAD_PROBE_TTL_MS;
+  const capsFresh = snapshotEnabled && entry.capabilities && now - entry.capabilitiesAt <= CAPABILITIES_TTL_MS;
+  if (loadFresh && capsFresh) {
+    return { load: entry.load, capabilities: entry.capabilities, cached: true };
+  }
+
+  const [loadResult, capabilities] = await Promise.all([
+    loadFresh
+      ? Promise.resolve(entry.load)
+      : Promise.all([
+        binding.client.getRunningWorks(),
+        binding.client.getBatchTimes().catch(() => null),
+      ]).then(([running, quota]) => {
+        if (!Array.isArray(running?.workIds)) throw new Error('DreamFace running works unavailable');
+        return {
+          at: Date.now(),
+          workIds: running.workIds.map(String),
+          quota: quota
+            ? { total: Number(quota.total) || 0, remaining: Number(quota.remaining) || 0 }
+            : entry.load?.quota || null,
+        };
+      }),
+    capsFresh ? Promise.resolve(entry.capabilities) : binding.client.getAccountCapabilities(),
+  ]);
+
+  entry.load = loadResult;
+  if (!capsFresh) {
+    entry.capabilities = capabilities;
+    entry.capabilitiesAt = Date.now();
+  }
+  return { load: entry.load, capabilities: entry.capabilities, cached: false };
+}
+
 async function selectLeastLoadedAccount(
   requiredDurationSeconds = 0,
   plannedLoads = new Map(),
   sourceVideoUrl = '',
   excludedAccountIds = new Set(),
+  source = 'selection',
 ) {
   const listed = await callBackground('dfListAccounts');
   const accounts = Array.isArray(listed.accounts) ? listed.accounts.map(toAccountMetadata) : [];
   if (accounts.length === 0) throw new Error('DreamFace account is not authenticated');
   await loadAccountHealth(accounts);
 
-  let selected = null;
-  let availableMaximumSeconds = 0;
-  let unavailableAccountCount = 0;
-  let attemptedAccountCount = 0;
-  const healthBlocked = [];
-  const healthEnabled = featureEnabled('accountHealth');
   const now = Date.now();
-  for (const account of accounts) {
-    if (excludedAccountIds.has(String(account.accountId))) continue;
-    if (healthEnabled && isBlocked(getAccountHealth(account.accountId), now)) {
-      healthBlocked.push({ accountId: String(account.accountId), health: getAccountHealth(account.accountId) });
-      continue;
+  const healthEnabled = featureEnabled('accountHealth');
+  const healthBlocked = [];
+  const quotaBlocked = [];
+  let attemptedAccountCount = 0;
+  let unavailableAccountCount = 0;
+  let availableMaximumSeconds = 0;
+
+  const probed = await Promise.all(accounts.map(async (account) => {
+    const listedAccountId = String(account.accountId || '');
+    if (excludedAccountIds.has(listedAccountId)) return null;
+    if (healthEnabled && isBlocked(getAccountHealth(listedAccountId), now)) {
+      healthBlocked.push({ accountId: listedAccountId, health: getAccountHealth(listedAccountId) });
+      return null;
     }
     attemptedAccountCount += 1;
     try {
       const binding = await getAccountBinding(account.accountId, account.principalKey);
-      if (excludedAccountIds.has(String(binding.account.accountId))) continue;
-      const capabilities = await binding.client.getAccountCapabilities();
+      const accountId = String(binding.account.accountId || listedAccountId);
+      if (excludedAccountIds.has(accountId)) return null;
+      const { load, capabilities } = await probeAccount(binding, accountId);
       const effectiveAccount = { ...account, ...binding.account, ...capabilities };
-      noteAccountCapabilities(effectiveAccount.accountId, capabilities);
-      phase0.recordOnce(`caps:${runState.runId || ''}:${effectiveAccount.accountId}`, {
+      noteAccountQuota(accountId, load.quota);
+      phase0.recordOnce(`caps:${runState.runId || ''}:${accountId}`, {
         type: 'capabilities',
-        accountId: effectiveAccount.accountId,
+        accountId,
         tier: effectiveAccount.tier || '',
         planName: effectiveAccount.planName || '',
         limitSec: Number(effectiveAccount.maxDurationSeconds || 0),
@@ -1446,49 +1561,97 @@ async function selectLeastLoadedAccount(
         vipLevel: effectiveAccount.vipLevel || '',
         vipType: effectiveAccount.vipType || '',
         expiresDate: Number(effectiveAccount.expiresDate || 0),
+        quota: load.quota,
       });
-      const running = await binding.client.getRunningWorks();
-      const load = Array.isArray(running?.workIds) ? running.workIds.length : Number.MAX_SAFE_INTEGER;
-      let reservation = plannedLoads.get(effectiveAccount.accountId);
-      if (!reservation || typeof reservation !== 'object') {
-        reservation = { baselineLoad: load, assigned: Number(reservation || 0) };
-        plannedLoads.set(effectiveAccount.accountId, reservation);
-      }
       const hasCachedAvatar = sourceVideoUrl
-        ? Boolean(await getCachedAvatarId(sourceVideoUrl, effectiveAccount.accountId))
+        ? Boolean(await getCachedAvatarId(sourceVideoUrl, accountId))
         : false;
-      const affinityBonus = hasCachedAvatar ? 2 : 0;
-      const candidate = {
+      return {
         account: effectiveAccount,
-        load,
-        planned: reservation.assigned,
+        accountId,
+        load: load.workIds.length,
+        quota: load.quota,
         hasCachedAvatar,
-        score: Math.max(0, Math.max(load, reservation.baselineLoad + reservation.assigned) - affinityBonus),
       };
+    } catch (error) {
+      unavailableAccountCount += 1;
+      phase0.recordOnce(`probeerr:${runState.runId || ''}:${listedAccountId}`, {
+        type: 'probe_error',
+        source,
+        accountId: listedAccountId,
+        error: error?.message || String(error),
+      });
+      return null;
+    }
+  }));
+
+  // Deterministic reservation order: least loaded first, then by account id.
+  const candidates = probed.filter(Boolean)
+    .sort((a, b) => (a.load - b.load) || a.accountId.localeCompare(b.accountId));
+
+  let selected = null;
+  for (const candidate of candidates) {
+    const { account: effectiveAccount, accountId, quota } = candidate;
+    const limitSec = Number(effectiveAccount.maxDurationSeconds || 0);
+    availableMaximumSeconds = Math.max(availableMaximumSeconds, limitSec);
+    if (quotaExhausted(quota)) {
+      quotaBlocked.push({ accountId, tier: effectiveAccount.tier || '', quota });
       phase0.record({
         type: 'account_probe',
-        source: 'selection',
-        accountId: effectiveAccount.accountId,
-        runningWorks: load,
-        limitSec: Number(effectiveAccount.maxDurationSeconds || 0),
+        source,
+        accountId,
+        skipped: 'quota_exhausted',
+        runningWorks: candidate.load,
+        limitSec,
         tier: effectiveAccount.tier || '',
         planName: effectiveAccount.planName || '',
-        planned: reservation.assigned,
-        baselineLoad: reservation.baselineLoad,
+        quota,
         requiredDurationSeconds,
-        score: candidate.score,
-        avatarCached: hasCachedAvatar,
+        avatarCached: candidate.hasCachedAvatar,
       });
-      availableMaximumSeconds = Math.max(
-        availableMaximumSeconds,
-        Number(effectiveAccount.maxDurationSeconds || 0),
-      );
-      if (Number(effectiveAccount.maxDurationSeconds || 0) >= requiredDurationSeconds
-        && (!selected || candidate.score < selected.score)) {
-        selected = candidate;
-      }
-    } catch (_) {
-      unavailableAccountCount += 1;
+      continue;
+    }
+    let reservation = plannedLoads.get(accountId);
+    if (!reservation || typeof reservation !== 'object') {
+      reservation = { baselineLoad: candidate.load, assigned: Number(reservation) || 0 };
+      plannedLoads.set(accountId, reservation);
+    }
+    const affinityBonus = candidate.hasCachedAvatar ? 2 : 0;
+    const fits = limitSec >= requiredDurationSeconds;
+    const built = {
+      account: effectiveAccount,
+      accountId,
+      load: candidate.load,
+      planned: reservation.assigned,
+      quota,
+      // Premium answers the counter with a 1/1 sentinel, i.e. batches are not metered. Metered
+      // pro accounts hold 10 credits, so they are kept as overflow instead of being burned first.
+      quotaClass: quotaUnlimited(quota) ? 1 : 0,
+      hasCachedAvatar: candidate.hasCachedAvatar,
+      score: Math.max(0, Math.max(candidate.load, reservation.baselineLoad + reservation.assigned) - affinityBonus),
+    };
+    phase0.record({
+      type: 'account_probe',
+      source,
+      accountId,
+      runningWorks: built.load,
+      limitSec,
+      tier: effectiveAccount.tier || '',
+      planName: effectiveAccount.planName || '',
+      quota,
+      quotaClass: built.quotaClass,
+      planned: built.planned,
+      baselineLoad: reservation.baselineLoad,
+      requiredDurationSeconds,
+      score: built.score,
+      avatarCached: built.hasCachedAvatar,
+      fits,
+    });
+    if (!fits) continue;
+    if (!selected
+      || built.quotaClass > selected.quotaClass
+      || (built.quotaClass === selected.quotaClass && built.score < selected.score)) {
+      selected = built;
     }
   }
 
@@ -1496,9 +1659,13 @@ async function selectLeastLoadedAccount(
     const allRemainingAccountsUnavailable = attemptedAccountCount > 0
       && unavailableAccountCount === attemptedAccountCount;
     const blockedSummary = describeBlocked(healthBlocked, now);
+    const quotaSummary = describeQuota(quotaBlocked, now);
     let message = 'captured DreamFace accounts are unavailable or expired';
     let code = 'accounts_unavailable';
-    if (healthBlocked.length > 0 && attemptedAccountCount === 0) {
+    if (quotaBlocked.length > 0 && candidates.length === quotaBlocked.length) {
+      message = `все аккаунты без квоты отправок (${quotaSummary.text})`;
+      code = 'all_accounts_quota_exhausted';
+    } else if (healthBlocked.length > 0 && attemptedAccountCount === 0) {
       message = `all DreamFace accounts are paused: ${blockedSummary.text}`;
       code = 'all_accounts_quarantined';
     } else if (excludedAccountIds.size > 0 && !allRemainingAccountsUnavailable) {
@@ -1508,15 +1675,24 @@ async function selectLeastLoadedAccount(
       message = `no DreamFace account supports ${Math.ceil(requiredDurationSeconds)}s audio; maximum is ${availableMaximumSeconds}s`;
       code = 'no_account_supports_duration';
     }
+    if (quotaBlocked.length > 0 && code !== 'all_accounts_quota_exhausted') {
+      message = `${message} | без квоты: ${quotaSummary.text}`;
+    }
     const error = new Error(message);
     error.code = code;
+    error.quotaBlocked = quotaSummary.rows;
     if (blockedSummary.nextRetryAt > 0) {
       error.retryAt = blockedSummary.nextRetryAt;
       error.blocked = blockedSummary.entries;
     }
     throw error;
   }
-  return { ...selected.account, availableMaximumSeconds };
+  return {
+    ...selected.account,
+    availableMaximumSeconds,
+    quota: selected.quota,
+    quotaClass: selected.quotaClass,
+  };
 }
 
 async function activateAccount(accountId, principalKey = '') {
@@ -1686,6 +1862,20 @@ async function getBulkWatchUnits() {
     }
   }
   const now = Date.now();
+  for (const unit of units) {
+    // A unit that never finished correlating or downloading would otherwise keep the 1-minute
+    // watcher alarm alive forever, paying a creations + statuses round trip per tick.
+    if (unit.status === 'pending' || unit.status === 'submission_uncertain' || unit.status === 'requires_review') {
+      const age = now - Number(unit.submittedAt ? new Date(unit.submittedAt).getTime() : (unit.createdAt || 0));
+      if (Number.isFinite(age) && age > BULK_WATCH_MAX_AGE_MS) {
+        unit.status = 'failed';
+        unit.submissionPhase = unit.submissionPhase === 'requires_review' ? 'requires_review' : 'abandoned';
+        unit.lastError ||= 'наблюдение прекращено: истёк срок отслеживания';
+        unit.updatedAt = now;
+        await callBackground('dfPatchBulkWatchUnits', { units: [{ ...unit }] }).catch(() => {});
+      }
+    }
+  }
   const expiredTerminalUnits = units.filter((unit) => (
     unit.status !== 'pending'
     && unit.status !== 'submission_uncertain'
@@ -2056,8 +2246,10 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
     const attemptIndex = (unit.retryExcludedAccountIds || []).length + 1;
     const attemptStartedAt = Date.now();
     let probeMs = 0;
+    let connectMs = 0;
     let prepMs = 0;
     let submitMs = 0;
+    let ackMs = 0;
     const recordAttemptEnd = (outcome, patch = {}) => {
       phase0.record({
         type: 'attempt_end',
@@ -2068,9 +2260,11 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
         requiredDurationSeconds: Math.round(requiredDurationSeconds * 1000) / 1000,
         totalMs: Date.now() - attemptStartedAt,
         probeMs,
+        connectMs,
         prepMs,
         uploadMs: patch.uploadMs ?? 0,
         submitMs: patch.submitMs ?? submitMs,
+        ackMs,
         ...patch,
       });
     };
@@ -2095,10 +2289,10 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       runState.queuePlan[index] = { ...unit };
       await pushState();
       throwIfStopped(runToken);
-      const capabilities = await client.getAccountCapabilities();
+      const { capabilities, load } = await probeAccount(binding, selectedAccount.accountId);
       throwIfStopped(runToken);
-      selectedAccount = { ...selectedAccount, ...capabilities };
-      noteAccountCapabilities(selectedAccount.accountId, capabilities);
+      selectedAccount = { ...selectedAccount, ...capabilities, quota: load.quota };
+      noteAccountQuota(selectedAccount.accountId, load.quota);
     } else {
       try {
         selectedAccount = await selectLeastLoadedAccount(
@@ -2108,20 +2302,29 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
           excludedAccountIds,
         );
       } catch (error) {
-        const capacityCodes = ['all_accounts_at_limit', 'all_accounts_quarantined'];
+        const capacityCodes = ['all_accounts_at_limit', 'all_accounts_quarantined', 'all_accounts_quota_exhausted'];
         if (!capacityCodes.includes(error.code)) throw error;
         probeMs = Date.now() - selectionStartedAt;
         unit.retryExcludedAccountIds = [];
         unit.status = 'retry_wait';
-        unit.submissionPhase = 'account_limit_retry_pending';
+        unit.submissionPhase = error.code === 'all_accounts_quota_exhausted'
+          ? 'quota_wait_pending'
+          : 'account_limit_retry_pending';
         unit.lastError = error.message;
         runState.queuePlan[index] = { ...unit };
         runState.nextTaskIndex = index;
         await pushState();
-        const waitMs = Number(error.retryAt) > Date.now() ? Number(error.retryAt) - Date.now() + 2000 : 60000;
+        // A spent quota does not come back within a minute, so the default wait is longer than
+        // the active-work case; the resumed run re-reads every quota before dispatching.
+        const waitMs = Number(error.retryAt) > Date.now()
+          ? Number(error.retryAt) - Date.now() + 2000
+          : (error.code === 'all_accounts_quota_exhausted' ? 15 * 60 * 1000 : 60000);
         const scheduledSec = Math.round(scheduleAutoResume(waitMs) / 1000);
-        recordAttemptEnd(error.code === 'all_accounts_quarantined' ? 'accounts_paused' : 'accounts_at_limit', {
+        recordAttemptEnd(error.code === 'all_accounts_quota_exhausted'
+          ? 'quota_exhausted'
+          : error.code === 'all_accounts_quarantined' ? 'accounts_paused' : 'accounts_at_limit', {
           error: error.message,
+          quotaBlocked: error.quotaBlocked || null,
         });
         const hint = scheduledSec > 0
           ? `авто-возобновление через ${scheduledSec} с или нажмите «возобновить»`
@@ -2145,7 +2348,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       throwIfStopped(runToken);
     }
     probeMs = Date.now() - selectionStartedAt;
-    const prepStartedAt = Date.now();
+    const connectStartedAt = Date.now();
     if (!client) ({ client } = await activateAccount(unit.accountId, selectedAccount.principalKey));
     throwIfStopped(runToken);
     const template = await client.getPtVideoInfo();
@@ -2156,6 +2359,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
     if (!batchConfig?.id) throw new Error(`DreamFace SCRIPT batch preset not found for ${unit.accountId}`);
     const detailResult = await client.getBatchConfigDetail(batchConfig.id);
     throwIfStopped(runToken);
+    connectMs = Date.now() - connectStartedAt;
     const originalConfig = detailResult?.config || {};
     const context = {
       accountId: unit.accountId,
@@ -2194,7 +2398,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       cached: usedCache,
       latencyMs: Date.now() - avatarStartedAt,
     });
-    prepMs = Date.now() - prepStartedAt;
+    prepMs = Date.now() - avatarStartedAt;
 
     const scriptConfigs = [];
     let uploadMsTotal = 0;
@@ -2248,21 +2452,30 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
         error: error?.message || String(error),
         apiStatus: error?.apiStatus || '',
       });
-      // A rejection with zero running works proves the account is not concurrency-limited;
-      // that is the signal the health state machine needs.
-      const runningAtReject = await client.getRunningWorks().catch(() => null);
-      const runningIds = Array.isArray(runningAtReject?.workIds) ? runningAtReject.workIds : null;
-      if (runningIds) {
+      // Phase 2: "Account Limit Reached" is the submit quota running out, not concurrency —
+      // the counter read here is what tells the two apart. A rejection with remaining = 0 is
+      // not the account's fault and must not put it on a cooldown; a rejection with quota left
+      // while works are already running is load, which earns only a short backoff.
+      const [runningAtReject, quotaAtReject] = await Promise.all([
+        client.getRunningWorks().catch(() => null),
+        client.getBatchTimes().catch(() => null),
+      ]);
+      const runningIds = Array.isArray(runningAtReject?.workIds) ? runningAtReject.workIds.map(String) : null;
+      if (runningIds || quotaAtReject) {
         phase0.record({
           type: 'running_probe',
           accountId: failedAccountId,
           phase: 'limit_hit',
-          count: runningIds.length,
-          ids: runningIds,
+          count: runningIds ? runningIds.length : null,
+          ids: runningIds || [],
+          quota: quotaAtReject,
         });
       }
+      if (quotaAtReject) noteAccountQuota(failedAccountId, quotaAtReject);
+      const quotaSpent = quotaExhausted(quotaAtReject);
       await noteAccountRejection(failedAccountId, {
         runningWorkIds: runningIds,
+        quota: quotaAtReject,
         sampleError: error?.apiStatus || error?.message || '',
         tier: selectedAccount?.tier || '',
       });
@@ -2271,6 +2484,8 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
         uploadMs: uploadMsTotal,
         submitMs,
         runningWorksAtReject: runningIds ? runningIds.length : null,
+        quotaAtReject,
+        rejectReason: quotaSpent ? 'quota_exhausted' : (runningIds && runningIds.length > 0 ? 'bulk_rejected_under_load' : 'bulk_rejected'),
       });
       const reservation = plannedLoads.get(failedAccountId);
       if (reservation && typeof reservation === 'object') {
@@ -2283,11 +2498,15 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       unit.submissionPhase = 'account_limit_retry_pending';
       unit.acceptedCount = 0;
       unit.targetCount = unit.audios.length;
-      unit.lastError = `Account ${failedAccountId} reached its active-work limit; retrying this group on another account`;
+      unit.lastError = quotaSpent
+        ? `Account ${failedAccountId}: submit quota exhausted (${quotaAtReject.remaining}/${quotaAtReject.total}); retrying this group on another account`
+        : `Account ${failedAccountId} reached its active-work limit; retrying this group on another account`;
       delete unit.dispatchStartedAt;
       delete unit.submissionResult;
       runState.queuePlan[index] = { ...unit };
-      runState.warnings = [...runState.warnings, `${unit.video.name}: лимит активных работ на ${failedAccountId}, группа перенаправляется`];
+      runState.warnings = [...runState.warnings, quotaSpent
+        ? `${unit.video.name}: квота отправок исчерпана на ${failedAccountId}, группа перенаправляется`
+        : `${unit.video.name}: лимит активных работ на ${failedAccountId}, группа перенаправляется`];
       await pushState();
       if (watchUnit) await removeBulkWatchUnit(watchUnit.id);
     };
@@ -2296,7 +2515,9 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
         runState.bulkContext = { ...context, presetState: 'dirty' };
         await pushState();
         throwIfStopped(runToken);
-        const quotaBefore = await client.getBatchTimes().catch(() => null);
+        // The quota read by the selection probe (adjusted by our own dispatches) is the value
+        // before this submit; re-reading it here would be a third request per attempt.
+        const quotaBefore = getProbeCacheEntry(unit.accountId).load?.quota || null;
         await client.updateBatchConfig(context.batchConfigId, batchName, scriptConfigs);
         throwIfStopped(runToken);
         try {
@@ -2387,9 +2608,13 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
               runState.warnings = [...runState.warnings, `не удалось сразу сохранить watcher отказа: ${error.message || String(error)}`];
             });
           }
-          const quotaAfter = await client.getBatchTimes().catch(() => null);
-          const runningAfter = await client.getRunningWorks().catch(() => null);
-          const runningAfterIds = Array.isArray(runningAfter?.workIds) ? runningAfter.workIds : null;
+          // One combined read replaces the separate quotaAfter + runningAfter calls: it feeds the
+          // ack trace, the health model and the probe cache used by the next selection.
+          const [runningAfter, quotaAfter] = await Promise.all([
+            client.getRunningWorks().catch(() => null),
+            client.getBatchTimes().catch(() => null),
+          ]);
+          const runningAfterIds = Array.isArray(runningAfter?.workIds) ? runningAfter.workIds.map(String) : null;
           phase0.record({
             type: 'dispatch_ack',
             unitId: unit.id,
@@ -2416,9 +2641,14 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
               ids: runningAfterIds,
             });
           }
-          if (submitted.successCount > 0) noteAccountSuccess(unit.accountId, selectedAccount.tier);
+          // Own delta first: even if the refresh below failed, the cached load still reflects
+          // the batch we just accepted instead of advertising an idle account.
+          noteOwnDispatch(unit.accountId, submitted.successCount);
+          refreshProbeCache(unit.accountId, { runningWorks: runningAfter, quota: quotaAfter });
+          if (submitted.successCount > 0) noteAccountSuccess(unit.accountId, selectedAccount.tier, quotaAfter);
           const probeAccountId = unit.accountId;
           const probePrincipal = selectedAccount.principalKey || '';
+          ackMs = Date.now() - submitStartedAt - submitMs;
           recordAttemptEnd('accepted', {
             accountId: unit.accountId,
             uploadMs: uploadMsTotal,
@@ -3074,6 +3304,7 @@ async function startRun(payload, admissionToken) {
   await pushState();
 
   try {
+    phase0.setContext({ runId: runState.runId, mode: runState.mode });
     if (runState.mode === 'bulk') {
       // Choose the least-loaded account WITHOUT filtering by raw input duration.
       // The raw longest input (e.g. 897s) may exceed every account's limit (e.g. 600s);
@@ -3081,7 +3312,7 @@ async function startRun(payload, admissionToken) {
       // Instead, drive the split target from the MAX duration supported across all
       // accounts so normalizeFile slices long inputs into chunks every qualifying
       // account can accept, and per-unit dispatch (selectLeastLoadedAccount) succeeds.
-      const selected = await selectLeastLoadedAccount(0);
+      const selected = await selectLeastLoadedAccount(0, new Map(), '', new Set(), 'preflight');
       const splitTarget = Math.max(
         Number(selected.availableMaximumSeconds || 0),
         Number(selected.maxDurationSeconds || 0),
@@ -3092,7 +3323,6 @@ async function startRun(payload, admissionToken) {
       payload.options = { ...payload.options, maxDurationSeconds: splitTarget };
       await pushState();
     }
-    phase0.setContext({ runId: runState.runId, mode: runState.mode });
     phase0.record({
       type: 'run_start',
       batches: Array.isArray(payload.batches) ? payload.batches.length : 0,
