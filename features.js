@@ -6,14 +6,21 @@
 
 export const FEATURES_KEY = 'dreamfaceFeatures';
 
-// Phase 0 measurements retired aimdSlots / weightedScore / dynamicSplit / avatarWarmup.
-// They were replaced by the quota model measured in phase 2: "Account Limit Reached" is the
-// per-account submission quota (get_batch_times.remaining_times, pro = 10) reaching zero,
-// not concurrency (running_works stays 0) and not a permanent account flag.
+// Retired in phase 0 as unmeasurable or counter-productive: aimdSlots, weightedScore,
+// dynamicSplit, avatarWarmup — they are gone from the code, not just switched off.
+//
+// Read once per offscreen document at startup (see the loader at the top of offscreen.js), so a
+// flag change needs the extension reloaded to take effect.
+//
+// The remaining flags were decided by measurement: accountHealth / accountSnapshot are the
+// validated dispatch path (phase 2 trace: 18 attempts for 18 units, 0 rejections, 57 -> 16.9 MiB),
+// lptOrder shortens the render tail, and chunkedPlanning / ossUploadCache / workLedger are still
+// unproven — chunking additionally multiplies the submit count on quota-metered accounts.
 export const DEFAULT_FEATURES = Object.freeze({
   phase0Trace: true,
   accountHealth: true,
   accountSnapshot: true,
+  lptOrder: false,
   ossUploadCache: false,
   workLedger: false,
   chunkedPlanning: false,

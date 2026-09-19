@@ -22,6 +22,7 @@ const SCRIPT_KINDS = {
   'trace.js': 'module',
   'trace-store.js': 'module',
   'account-health.js': 'module',
+  'queue-policy.js': 'module',
   'features.js': 'module',
   'popup-trace.js': 'module',
 };

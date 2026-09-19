@@ -1,6 +1,13 @@
 import { compactRaw, createTraceWriter } from './trace.js';
 import { DEFAULT_FEATURES, mergeFeatures } from './features.js';
 import {
+  ACCOUNT_RETRY_DELAY_MS,
+  AUTO_RESUME_MAX_DELAY_MS,
+  autoResumeDelayMs,
+  orderUnitsForDispatch,
+  shouldAutoResume,
+} from './queue-policy.js';
+import {
   createAccountHealth,
   describeBlocked,
   describeQuota,
@@ -43,6 +50,8 @@ let initializationError = null;
 let initializationRetryPromise = null;
 const accountMutationLocks = new Map();
 let runAdmissionToken = null;
+// per-run cache of the account's template + SCRIPT preset (see the connect block in the attempt)
+const runConnectCache = new Map();
 const processedBlobLeases = new Map();
 
 // Phase 0 instrumentation (read-only) plus the per-phase feature gates. Flags live in
@@ -147,11 +156,12 @@ function scheduleAutoResume(delayMs) {
     clearTimeout(autoResumeTimer);
     autoResumeTimer = null;
   }
-  const delay = Math.max(5000, Math.min(Number(delayMs) || 60000, 60 * 60 * 1000));
+  const delay = Math.max(5000, Math.min(Number(delayMs) || ACCOUNT_RETRY_DELAY_MS, AUTO_RESUME_MAX_DELAY_MS));
   autoResumeTimer = setTimeout(() => {
     autoResumeTimer = null;
-    if (stopRequested || isBusyPhase(runState.phase)) return;
-    if (Number(runState.nextTaskIndex || 0) >= (runState.queuePlan || []).length) return;
+    if (isBusyPhase(runState.phase)) return;
+    // A timer must not resurrect a queue the operator stopped, nor a legacy one.
+    if (!shouldAutoResume(runState, { stopRequested })) return;
     const token = acquireRunAdmission();
     if (!token) return;
     runState.warnings = [...runState.warnings, `авто-возобновление очереди через ${Math.round(delay / 1000)} с`];
@@ -484,6 +494,7 @@ async function clearInputFiles() {
 async function resetRunStateInternal() {
   stopRequested = false;
   currentRunToken += 1;
+  runConnectCache.clear();
   await clearTaskBlobs().catch(() => {});
   await clearInputFiles().catch(() => {});
   runState = createIdleRunState();
@@ -2319,11 +2330,10 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
         runState.queuePlan[index] = { ...unit };
         runState.nextTaskIndex = index;
         await pushState();
-        // A spent quota does not come back within a minute, so the default wait is longer than
-        // the active-work case; the resumed run re-reads every quota before dispatching.
-        const waitMs = Number(error.retryAt) > Date.now()
-          ? Number(error.retryAt) - Date.now() + 2000
-          : (error.code === 'all_accounts_quota_exhausted' ? 15 * 60 * 1000 : 60000);
+        // A spent quota has no cooldown to wait for, so it gets its own fallback window; a live
+        // cooldown yields its exact expiry.
+        const quotaOnly = error.code === 'all_accounts_quota_exhausted';
+        const waitMs = autoResumeDelayMs({ retryAt: error.retryAt, quotaOnly });
         const scheduledSec = Math.round(scheduleAutoResume(waitMs) / 1000);
         recordAttemptEnd(error.code === 'all_accounts_quota_exhausted'
           ? 'quota_exhausted'
@@ -2356,25 +2366,38 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
     const connectStartedAt = Date.now();
     if (!client) ({ client } = await activateAccount(unit.accountId, selectedAccount.principalKey));
     throwIfStopped(runToken);
-    const template = await client.getPtVideoInfo();
-    throwIfStopped(runToken);
-    const configResult = await client.listBatchConfigs('SCRIPT');
-    throwIfStopped(runToken);
-    const batchConfig = configResult?.configs?.[0];
-    if (!batchConfig?.id) throw new Error(`DreamFace SCRIPT batch preset not found for ${unit.accountId}`);
-    const detailResult = await client.getBatchConfigDetail(batchConfig.id);
-    throwIfStopped(runToken);
-    connectMs = Date.now() - connectStartedAt;
-    const originalConfig = detailResult?.config || {};
+    // The template and the SCRIPT batch preset do not change inside a run (the preset is written
+    // and restored around every dispatch), so they are read once per account instead of ~1.1s of
+    // three requests on every attempt.
+    let connect = runConnectCache.get(unit.accountId);
+    if (!connect) {
+      const template = await client.getPtVideoInfo();
+      throwIfStopped(runToken);
+      const configResult = await client.listBatchConfigs('SCRIPT');
+      throwIfStopped(runToken);
+      const batchConfig = configResult?.configs?.[0];
+      if (!batchConfig?.id) throw new Error(`DreamFace SCRIPT batch preset not found for ${unit.accountId}`);
+      const detailResult = await client.getBatchConfigDetail(batchConfig.id);
+      throwIfStopped(runToken);
+      const originalConfig = detailResult?.config || {};
+      connect = {
+        templateId: template.templateId,
+        batchConfigId: batchConfig.id,
+        batchName: batchConfig.name || 'Bulk Batch',
+        originalScriptConfigs: Array.isArray(originalConfig.script_configs) ? originalConfig.script_configs : [],
+      };
+      runConnectCache.set(unit.accountId, connect);
+    }
     const context = {
       accountId: unit.accountId,
       principalKey: selectedAccount.principalKey,
-      templateId: template.templateId,
-      batchConfigId: batchConfig.id,
-      batchName: batchConfig.name || 'Bulk Batch',
-      originalScriptConfigs: Array.isArray(originalConfig.script_configs) ? originalConfig.script_configs : [],
+      templateId: connect.templateId,
+      batchConfigId: connect.batchConfigId,
+      batchName: connect.batchName,
+      originalScriptConfigs: connect.originalScriptConfigs,
       presetState: 'clean',
     };
+    connectMs = Date.now() - connectStartedAt;
     setQueueSubmissionPhase(index, unit, 'preparing');
     runState.bulkContext = context;
     runState.currentTaskName = unit.video.name;
@@ -2671,6 +2694,9 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
             await prepareAccountLimitRetry(error);
             return;
           }
+          // A failed attempt may mean the preset or the session moved under us, so the cached
+          // connect context is dropped and read again on the retry.
+          runConnectCache.delete(unit.accountId);
           recordAttemptEnd(error.code === 'run_stopped' ? 'stopped' : 'error', {
             accountId: unit.accountId,
             error: error?.message || String(error),
@@ -3289,6 +3315,7 @@ async function startRun(payload, admissionToken) {
   stopRequested = false;
 
   await clearTaskBlobs();
+  runConnectCache.clear();
 
   runState = createIdleRunState();
   runState.mode = payload.mode === 'bulk' ? 'bulk' : 'legacy';
@@ -3340,16 +3367,21 @@ async function startRun(payload, admissionToken) {
     const { queue, summary, consumedInputIds = [] } = runState.mode === 'bulk'
       ? await prepareBulkPlan(payload, runToken)
       : await prepareTasks(payload, runToken);
+    // LPT is a dispatch-order decision, not a display one: `sourceIndex` keeps the operator's
+    // order available to the monitor while the queue itself runs longest-first.
+    const dispatchQueue = runState.mode === 'bulk' && featureEnabled('lptOrder')
+      ? orderUnitsForDispatch(queue)
+      : queue;
     runState.summary = summary;
-    runState.queuePlan = queue.map((item) => ({ ...item }));
+    runState.queuePlan = dispatchQueue.map((item) => ({ ...item }));
     await pushState();
     if (runState.mode === 'bulk') {
       for (const id of consumedInputIds) await deleteInputFileRecord(id);
     }
     if (runState.mode === 'bulk') {
-      await processBulkQueue(queue, runToken);
+      await processBulkQueue(dispatchQueue, runToken);
     } else {
-      await processQueue(queue, runToken);
+      await processQueue(dispatchQueue, runToken);
     }
   } catch (error) {
     if (error.code === 'run_stopped') {

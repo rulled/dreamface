@@ -20,6 +20,12 @@ export const LOAD_BACKOFF_MS = 60 * 1000;
 export const COOLDOWN_JITTER_RATIO = 0.15;
 export const HEALTH_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
+// A quota increase is only evidence of a server-side roll-over when it is not explained by our
+// own accepted batches. Inside this window after a dispatch the reading is never treated as a
+// reset: the counter is read again moments after a submit, and the server may still report the
+// pre-submit value.
+export const QUOTA_RESET_GUARD_MS = 10 * 60 * 1000;
+
 // Premium accounts answer get_batch_times with total = 1 / remaining = 1 while accepting any
 // number of batches, i.e. the counter does not apply to them.
 export const QUOTA_SENTINEL_TOTAL = 1;
@@ -42,6 +48,8 @@ export function createAccountHealth(patch = {}) {
     sampleError: '',
     tier: '',
     quota: { total: 0, remaining: 0, at: 0 },
+    dispatchesSinceQuota: 0,
+    lastDispatchAt: 0,
     updatedAt: 0,
     ...patch,
   };
@@ -67,6 +75,8 @@ export function normalizeHealth(raw) {
     sampleError: String(raw.sampleError || '').slice(0, 200),
     tier: String(raw.tier || ''),
     quota: normalizeQuota(raw.quota),
+    dispatchesSinceQuota: Math.max(0, Number(raw.dispatchesSinceQuota) || 0),
+    lastDispatchAt: Math.max(0, Number(raw.lastDispatchAt) || 0),
     updatedAt: Math.max(0, Number(raw.updatedAt) || 0),
   };
 }
@@ -100,20 +110,33 @@ export function isBlocked(health, now = Date.now()) {
   return blockedUntil(health) > now;
 }
 
-// Records the last observed quota and reports an increase, which is the only observable
-// signal that the account's quota window rolled over.
+// Records the last observed quota and reports an increase that our own accepted batches do not
+// explain — the only observable signal that the account's quota window rolled over.
 export function noteQuota(health, options = {}) {
   const now = Number(options.now) || Date.now();
   const current = normalizeHealth(health);
   const previous = current.quota;
   const next = normalizeQuota({ total: options.total, remaining: options.remaining, at: now });
   if (next.total === 0 && next.remaining === 0) return { health: current, reset: false, previous };
-  const reset = previous.total > 0
-    && next.total > 0
-    && (next.remaining > previous.remaining
-      || (quotaExhausted(previous) && !quotaExhausted(next)));
+  const metered = next.total > QUOTA_SENTINEL_TOTAL && previous.total > QUOTA_SENTINEL_TOTAL;
+  const withinDispatchWindow = current.lastDispatchAt > 0
+    && now - current.lastDispatchAt <= QUOTA_RESET_GUARD_MS;
+  // Our own batches are missing from an older reading, so they are added back before comparing:
+  // an account at 5 that we submitted one batch to is expected to read 4, not 5. The delta is a
+  // filter, not a detector — an increase is still required, or under-consumption would look like
+  // a roll-over.
+  const expectedRemaining = Math.max(0, previous.remaining - current.dispatchesSinceQuota);
+  const reset = metered
+    && !withinDispatchWindow
+    && next.remaining > previous.remaining
+    && next.remaining > expectedRemaining;
   return {
-    health: { ...current, quota: next, updatedAt: now },
+    health: {
+      ...current,
+      quota: next,
+      dispatchesSinceQuota: metered ? 0 : current.dispatchesSinceQuota,
+      updatedAt: now,
+    },
     reset,
     previous,
     delta: next.remaining - previous.remaining,
@@ -132,6 +155,9 @@ export function recordBulkSuccess(health, options = {}) {
     reason: '',
     sampleError: '',
     tier: String(options.tier || current.tier || ''),
+    // Our own consumption has to be remembered: the next quota reading may predate this batch.
+    dispatchesSinceQuota: (options.quota ? noted.dispatchesSinceQuota : current.dispatchesSinceQuota) + 1,
+    lastDispatchAt: now,
     updatedAt: now,
   });
 }

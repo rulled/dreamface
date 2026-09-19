@@ -9,6 +9,7 @@ $manifestPath = Join-Path $repoRoot 'manifest.json'
 $runtimeFiles = @(
     'manifest.json'
     'account-health.js'
+    'queue-policy.js'
     'background.js'
     'content_script.js'
     'dreamface-api.js'
