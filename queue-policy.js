@@ -21,8 +21,10 @@ export const CREDIT_RESERVE = 2;
 // Estimation constants for the plan preview (measured: 67 s of spans + 27 s of gaps for 18
 // units, ~5.7 s per foreign work drained, ~60 s of status detection).
 export const ESTIMATE = Object.freeze({
-  perUnitMs: 4000,
-  perGapMs: 1500,
+  // Calibrated on 19.09: 99 s of spans + 42 s of gaps over 18 units on an 11-account pool, with
+  // 13 cold avatar registrations costing ~24 s.
+  perUnitMs: 4500,
+  perGapMs: 2500,
   avatarRegistrationMs: 2000,
   detectionMs: 60000,
   drainPerWorkSec: 5.7,
@@ -86,8 +88,29 @@ export function orderUnitsForDispatch(units) {
 // The ranking is shared by the live selector and by the plan simulation, so a preview and a run
 // can never disagree about who would be picked.
 
-export function accountTier(load) {
-  return Number(load) > BACKLOG_TIER2_WORKS ? 2 : 1;
+// An account is "slow tier" when its queue is deep, or when it turns work around much slower
+// than the fastest account in the pool — measured, not guessed (19.09: 157-209 s per work on one
+// premium account against 12-36 s on five others, and that one account produced a 347 s tail).
+export const DRAIN_SLOW_FACTOR = 2.5;
+export const DRAIN_MIN_SAMPLES = 2;
+
+export function accountTier(candidate, options = {}) {
+  if (Number(candidate?.load || 0) > BACKLOG_TIER2_WORKS) return 2;
+  const rate = Number(candidate?.msPerWork || 0);
+  const samples = Number(candidate?.drainSamples || 0);
+  const fastest = Number(options.fastestMsPerWork || 0);
+  if (rate > 0 && samples >= DRAIN_MIN_SAMPLES && fastest > 0 && rate > fastest * DRAIN_SLOW_FACTOR) return 2;
+  return 1;
+}
+
+// The comparison baseline is the pool itself: the best observed turnaround among candidates that
+// have enough samples to be judged.
+export function fastestMsPerWork(candidates) {
+  const rates = (Array.isArray(candidates) ? candidates : [])
+    .filter((candidate) => Number(candidate?.drainSamples || 0) >= DRAIN_MIN_SAMPLES)
+    .map((candidate) => Number(candidate.msPerWork || 0))
+    .filter((rate) => rate > 0);
+  return rates.length > 0 ? Math.min(...rates) : 0;
 }
 
 // For a metered account this is the state *after* the hypothetical submit: spending the last
@@ -100,9 +123,9 @@ export function creditClass(candidate) {
 // Order: fresh accounts before backlogged ones (a foreign queue is what delays our tail), then
 // unlimited quota before metered credits, then credits with headroom before the reserve, then the
 // least loaded.
-export function compareCandidates(a, b) {
-  const tierA = a.tier || accountTier(a.load);
-  const tierB = b.tier || accountTier(b.load);
+export function compareCandidates(a, b, options = {}) {
+  const tierA = options.tierEnabled === false ? 1 : (Number.isFinite(a.tier) ? a.tier : accountTier(a, options));
+  const tierB = options.tierEnabled === false ? 1 : (Number.isFinite(b.tier) ? b.tier : accountTier(b, options));
   if (tierA !== tierB) return tierA - tierB;
   // Derived, not assumed: a caller that forgets to carry quotaClass must not silently rank a
   // metered account like an unlimited one (that is how a plan preview once disagreed with a run).
@@ -118,8 +141,10 @@ export function compareCandidates(a, b) {
   return String(a.accountId).localeCompare(String(b.accountId));
 }
 
-export function rankCandidates(candidates) {
-  return (Array.isArray(candidates) ? candidates : []).filter(Boolean).sort(compareCandidates);
+export function rankCandidates(candidates, options = {}) {
+  const pool = (Array.isArray(candidates) ? candidates : []).filter(Boolean);
+  const context = { ...options, fastestMsPerWork: options.fastestMsPerWork || fastestMsPerWork(pool) };
+  return [...pool].sort((a, b) => compareCandidates(a, b, context));
 }
 
 function candidateCanTake(candidate, requiredSeconds) {
@@ -151,9 +176,9 @@ export function simulatePlan(units, candidates, options = {}) {
       });
       continue;
     }
-    const chosen = rankCandidates(eligible)[0];
+    const chosen = rankCandidates(eligible, options)[0];
     chosen.load = Number(chosen.load || 0) + works;
-    chosen.tier = accountTier(chosen.load);
+    chosen.tier = options.tierEnabled === false ? 1 : accountTier(chosen, options);
     if (chosen.metered) chosen.remaining = Math.max(0, Number(chosen.remaining || 0) - 1);
     assignments.push({ unitId: unit?.id || '', accountId: chosen.accountId, works, requiredSeconds });
     const entry = byAccount.get(chosen.accountId) || {
@@ -174,17 +199,15 @@ export function simulatePlan(units, candidates, options = {}) {
     byAccount.set(chosen.accountId, entry);
   }
 
+  return finishPlan({ assignments, deferred, byAccount, pool, options });
+}
+
+function finishPlan({ assignments, deferred, byAccount, pool, options = {} }) {
   const accounts = [...byAccount.values()];
   const creditsSpent = accounts.reduce((sum, entry) => sum + (entry.metered ? entry.creditsSpent : 0), 0);
   const creditsLeft = Object.fromEntries(pool
     .filter((candidate) => candidate.metered)
     .map((candidate) => [candidate.accountId, Number(candidate.remaining || 0)]));
-  // Backlogged accounts are the whole tail story: their queue drains before our render starts.
-  const backlogged = accounts
-    .filter((entry) => entry.tierEnd === 2 || accountTier(entry.loadStart) === 2)
-    .map((entry) => Math.max(entry.loadStart, entry.loadEnd));
-  const worstBacklog = backlogged.length > 0 ? Math.max(...backlogged) : 0;
-  const coldAvatarPairs = Number(options.coldAvatarPairs || 0);
   const observedLoads = pool.map((candidate) => Number(candidate.load || 0));
   return {
     assignments,
@@ -193,14 +216,34 @@ export function simulatePlan(units, candidates, options = {}) {
     creditsSpent,
     creditsLeft,
     estimates: {
-      dispatchSec: Math.round((assignments.length * (ESTIMATE.perUnitMs + ESTIMATE.perGapMs)
-        + coldAvatarPairs * ESTIMATE.avatarRegistrationMs) / 1000),
-      tailSec: Math.round(ESTIMATE.detectionMs / 1000 + worstBacklog * ESTIMATE.drainPerWorkSec),
-      backloggedAccounts: backlogged.length,
+      backloggedAccounts: accounts.filter((entry) => entry.tierEnd === 2).length,
       // The worst queue seen in the pool, whether or not it was used: the operator should know a
       // backlog was side-stepped.
       maxObservedLoad: observedLoads.length > 0 ? Math.max(...observedLoads) : 0,
+      ...estimatePlan({ assignments, accounts, pool }, options),
     },
+  };
+}
+
+// Dispatch and tail forecasts, kept separate so the engine can recompute them once it knows how
+// many avatar pairs are cold (that lookup needs storage, the ranking does not).
+export function estimatePlan(plan, options = {}) {
+  const coldAvatarPairs = Number(options.coldAvatarPairs || 0);
+  const assignments = Array.isArray(plan?.assignments) ? plan.assignments : [];
+  const accounts = Array.isArray(plan?.accounts) ? plan.accounts : [];
+  const pool = Array.isArray(plan?.pool) ? plan.pool : [];
+  const rateFor = (accountId) => {
+    const candidate = pool.find((entry) => entry.accountId === accountId);
+    const rate = Number(candidate?.msPerWork || 0);
+    return rate > 0 ? rate / 1000 : ESTIMATE.drainPerWorkSec;
+  };
+  // The tail is whichever account finishes last: its assigned works at its own observed rate.
+  const perAccountSec = accounts.map((entry) => entry.works * rateFor(entry.accountId));
+  const worstDrainSec = perAccountSec.length > 0 ? Math.max(...perAccountSec) : 0;
+  return {
+    dispatchSec: Math.round((assignments.length * (ESTIMATE.perUnitMs + ESTIMATE.perGapMs)
+      + coldAvatarPairs * ESTIMATE.avatarRegistrationMs) / 1000),
+    tailSec: Math.round(ESTIMATE.detectionMs / 1000 + worstDrainSec),
   };
 }
 

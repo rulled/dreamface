@@ -51,9 +51,45 @@ export function createAccountHealth(patch = {}) {
     dispatchesSinceQuota: 0,
     lastDispatchAt: 0,
     quotaUnreliable: false,
+    // Observed turnaround: how long this account takes per work, measured from submit to
+    // download. It is the signal that separates a fast account from a slow one when both report
+    // an empty queue (69.09: 12-36 s/work for five premium accounts, 157-209 s/work for one).
+    drain: { samples: 0, msPerWork: 0, updatedAt: 0 },
     updatedAt: 0,
     ...patch,
   };
+}
+
+export const DRAIN_SAMPLE_LIMIT = 20;
+
+export function normalizeDrain(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { samples: 0, msPerWork: 0, updatedAt: 0 };
+  return {
+    samples: Math.max(0, Number(raw.samples) || 0),
+    msPerWork: Math.max(0, Number(raw.msPerWork) || 0),
+    updatedAt: Math.max(0, Number(raw.updatedAt) || 0),
+  };
+}
+
+// Exponentially smoothed so a single slow download does not condemn an account, and a genuinely
+// slow one is recognised after a couple of samples.
+export function noteDrain(health, options = {}) {
+  const now = Number(options.now) || Date.now();
+  const current = normalizeHealth(health);
+  const works = Math.max(1, Number(options.works) || 1);
+  const elapsedMs = Math.max(0, Number(options.elapsedMs) || 0);
+  if (!elapsedMs) return current;
+  const sample = elapsedMs / works;
+  const previous = current.drain;
+  const samples = Math.min(DRAIN_SAMPLE_LIMIT, previous.samples + 1);
+  const msPerWork = previous.samples === 0
+    ? sample
+    : Math.round((previous.msPerWork * previous.samples + sample) / (previous.samples + 1));
+  return normalizeHealth({
+    ...current,
+    drain: { samples, msPerWork, updatedAt: now },
+    updatedAt: now,
+  });
 }
 
 export function normalizeQuota(raw) {
@@ -79,6 +115,7 @@ export function normalizeHealth(raw) {
     dispatchesSinceQuota: Math.max(0, Number(raw.dispatchesSinceQuota) || 0),
     lastDispatchAt: Math.max(0, Number(raw.lastDispatchAt) || 0),
     quotaUnreliable: raw.quotaUnreliable === true,
+    drain: normalizeDrain(raw.drain),
     updatedAt: Math.max(0, Number(raw.updatedAt) || 0),
   };
 }

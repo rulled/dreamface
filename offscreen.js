@@ -6,6 +6,8 @@ import {
   accountTier,
   autoResumeDelayMs,
   compareCandidates,
+  estimatePlan,
+  fastestMsPerWork,
   ipBackoffTriggered,
   orderUnitsForDispatch,
   rankCandidates,
@@ -20,6 +22,7 @@ import {
   isBlocked,
   ledgerQuota,
   markQuotaUnreliable,
+  noteDrain,
   normalizeHealthMap,
   noteQuota,
   pruneHealthMap,
@@ -120,6 +123,15 @@ async function persistAccountHealth(accountId) {
   const health = accountHealthCache.get(String(accountId));
   if (!health) return;
   await callBackground('dfPatchAccountHealth', { accountId: String(accountId), health }).catch(() => {});
+}
+
+function noteAccountDrain(accountId, options = {}) {
+  if (!featureEnabled('accountHealth') || !accountId) return null;
+  const id = String(accountId);
+  const health = noteDrain(accountHealthCache.get(id), options);
+  accountHealthCache.set(id, health);
+  void persistAccountHealth(id);
+  return health;
 }
 
 function noteAccountSuccess(accountId, tier = '', quota = null) {
@@ -1636,14 +1648,20 @@ async function selectLeastLoadedAccount(
 
   // The ranking itself lives in queue-policy.js so the plan preview and the live selector can
   // never disagree: backlog tier, then unlimited quota, then credit headroom, then load.
-  const candidates = rankCandidates(probed.filter(Boolean).map((candidate) => ({
-    ...candidate,
-    metered: !quotaUnlimited(candidate.quota),
-    remaining: Number(candidate.quota?.remaining || 0),
-    tier: featureEnabled('backlogTier') ? accountTier(candidate.load) : 1,
-    // Base score for the ordering; the reservation and avatar affinity are applied per unit below.
-    score: candidate.load,
-  })));
+  const candidates = rankCandidates(probed.filter(Boolean).map((candidate) => {
+    const health = getAccountHealth(candidate.accountId);
+    return {
+      ...candidate,
+      metered: !quotaUnlimited(candidate.quota),
+      remaining: Number(candidate.quota?.remaining || 0),
+      // The tier is left to the comparator: it compares each account against the fastest in this
+      // pool, so a slow account is recognised even when its queue looks empty.
+      msPerWork: Number(health.drain?.msPerWork || 0),
+      drainSamples: Number(health.drain?.samples || 0),
+      // Base score for the ordering; the reservation and avatar affinity are applied per unit.
+      score: candidate.load,
+    };
+  }), { tierEnabled: featureEnabled('backlogTier') });
   lastProbeSnapshot = candidates.map((candidate) => ({
     accountId: candidate.accountId,
     limitSec: Number(candidate.account.maxDurationSeconds || 0),
@@ -1655,6 +1673,8 @@ async function selectLeastLoadedAccount(
     // Every field compareCandidates uses must be here, or the plan would pick differently from
     // the live selector (the first validation run sent the whole batch to a Pro account).
     quotaClass: candidate.metered ? 0 : 1,
+    msPerWork: candidate.msPerWork,
+    drainSamples: candidate.drainSamples,
     hasCachedAvatar: candidate.hasCachedAvatar,
     score: candidate.score,
   }));
@@ -1701,6 +1721,8 @@ async function selectLeastLoadedAccount(
       tier: candidate.tier,
       metered,
       remaining: Number(quota?.remaining || 0),
+      msPerWork: candidate.msPerWork,
+      drainSamples: candidate.drainSamples,
       hasCachedAvatar: candidate.hasCachedAvatar,
       score: Math.max(0, Math.max(candidate.load, reservation.baselineLoad + reservation.assigned) - affinityBonus),
     };
@@ -1715,7 +1737,9 @@ async function selectLeastLoadedAccount(
       quota,
       quotaSource: candidate.quotaSource || 'read',
       quotaClass: built.quotaClass,
-      tier: built.tier,
+      msPerWork: built.msPerWork,
+      drainSamples: built.drainSamples,
+      tier: Number.isFinite(built.tier) ? built.tier : accountTier(built, { fastestMsPerWork: fastestMsPerWork(candidates) }),
       planned: built.planned,
       baselineLoad: reservation.baselineLoad,
       requiredDurationSeconds,
@@ -2203,14 +2227,20 @@ async function watchAccountUnits(accountId, units, allAccountUnits) {
     if (doneIds.length >= targetCount) {
       if (unit.status !== 'complete') {
         const submittedMs = Date.parse(unit.submittedAt || '');
+        const elapsedMs = Number.isFinite(submittedMs) ? Date.now() - submittedMs : 0;
         phase0.recordOnce(`drain:${unit.id}`, {
           type: 'drain_sample',
           unitId: unit.id,
           accountId: unit.accountId,
           probeLoad: Number(unit.probeLoad || 0),
           works: doneIds.length,
-          elapsedMs: Number.isFinite(submittedMs) ? Date.now() - submittedMs : null,
+          elapsedMs: elapsedMs || null,
         });
+        // Trains the ranking: the measured turnaround is what separates a fast account from a slow
+        // one whose queue merely looks empty.
+        if (elapsedMs && unit.accountId) {
+          void noteAccountDrain(unit.accountId, { elapsedMs, works: doneIds.length });
+        }
       }
       unit.status = 'complete';
     }
@@ -3488,7 +3518,21 @@ async function startRun(payload, admissionToken) {
     // just took, so the shipments are known before the first upload — and so the estimate of
     // credits and tail is part of the log.
     if (runState.mode === 'bulk' && featureEnabled('planPreview') && lastProbeSnapshot.length > 0) {
-      runState.plan = simulatePlan(dispatchQueue, lastProbeSnapshot);
+      const tierEnabled = featureEnabled('backlogTier');
+      runState.plan = simulatePlan(dispatchQueue, lastProbeSnapshot, { tierEnabled });
+      // The forecast needs the avatar cache, which only the engine can read: 13 of 18 registrations
+      // were cold on the 15:30 run and cost ~24 s of the dispatch.
+      const unitById = new Map(dispatchQueue.map((item) => [item.id, item]));
+      const coldPairs = (await Promise.all(runState.plan.assignments.map(async (assignment) => {
+        const videoUrl = unitById.get(assignment.unitId)?.video?.videoUrl;
+        if (!videoUrl) return false;
+        return !await getCachedAvatarId(videoUrl, assignment.accountId);
+      }))).filter(Boolean).length;
+      runState.plan.estimates = estimatePlan(
+        { ...runState.plan, pool: lastProbeSnapshot },
+        { coldAvatarPairs: coldPairs },
+      );
+      runState.plan.estimates.coldAvatarPairs = coldPairs;
       runState.planSummary = summarizePlan(runState.plan);
       phase0.record({
         type: 'run_plan',

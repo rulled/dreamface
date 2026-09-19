@@ -154,8 +154,32 @@ test('the plan escalates to the metered account when the unlimited one is backlo
   assert.equal(plan.assignments[0].accountId, 'pro-a');
   assert.equal(plan.creditsSpent, 1);
   assert.equal(plan.estimates.backloggedAccounts, 0, 'nothing was assigned to the backlogged account');
-  assert.equal(plan.estimates.tailSec, 60, 'the estimation floor: detection only');
+  // detection plus this unit's own turnaround at the fallback rate (5.7 s/work)
+  assert.equal(plan.estimates.tailSec, 66);
   assert.equal(plan.estimates.maxObservedLoad, 40, 'the side-stepped backlog stays visible');
+});
+
+test('an account that turns work around much slower than its peers drops to tier 2', () => {
+  const pool = [
+    account('fast-a', { msPerWork: 15000, drainSamples: 3, load: 0 }),
+    account('fast-b', { msPerWork: 20000, drainSamples: 3, load: 0 }),
+    account('slow', { msPerWork: 180000, drainSamples: 3, load: 0 }),
+  ];
+  assert.deepEqual(rankCandidates(pool).map((c) => c.accountId), ['fast-a', 'fast-b', 'slow']);
+  // A single sample is not enough to condemn an account, and the rule needs a baseline.
+  const unproven = [account('unknown', { msPerWork: 180000, drainSamples: 1, load: 0 }), account('known', { msPerWork: 15000, drainSamples: 3, load: 0 })];
+  assert.deepEqual(rankCandidates(unproven).map((c) => c.accountId), ['known', 'unknown']);
+  assert.equal(rankCandidates([account('lonely', { msPerWork: 180000, drainSamples: 3, load: 0 })]).length, 1);
+});
+
+test('the tail forecast follows the observed turnaround of the assigned account', () => {
+  const pool = [account('slow', { msPerWork: 150000, drainSamples: 3, load: 0 })];
+  const plan = simulatePlan([unit('u1', [10]), unit('u2', [10])], pool);
+  assert.equal(plan.assignments.length, 2);
+  assert.equal(plan.estimates.tailSec, 60 + 2 * 150, 'two works at the account rate plus detection');
+  // With no measurements the fallback rate applies, so the forecast is never silently optimistic.
+  const unknown = simulatePlan([unit('u1', [10])], [account('fresh', { load: 0 })]);
+  assert.equal(unknown.estimates.tailSec, Math.round(60 + 5.7));
 });
 
 test('the shared-IP pause needs rejections on different accounts inside the window', () => {
