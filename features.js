@@ -20,11 +20,12 @@ export const DEFAULT_FEATURES = Object.freeze({
   phase0Trace: true,
   accountHealth: true,
   accountSnapshot: true,
-  lptOrder: false,
-  // Insurance for the subscription counter: with this on, an account whose
-  // get_batch_times reads 0 is submitted to once per run so the server, not the counter,
-  // decides. Off by default — a probe is exactly the rejected attempt the gate removes.
-  quotaProbe: false,
+  // Validated by the 19.09 control run: longest audio first, cheapest connect per account,
+  // quota-gated dispatch, and a plan computed before the first upload.
+  lptOrder: true,
+  quotaLedger: true,
+  backlogTier: true,
+  planPreview: true,
   ossUploadCache: false,
   workLedger: false,
   chunkedPlanning: false,

@@ -1845,6 +1845,17 @@ function renderCurrentRunMonitor() {
   if (errorText) {
     notices.push(`<div class="alert-row error" role="alert"><div class="alert-copy"><div class="alert-headline">${escapeHtml(errorText)}</div></div></div>`);
   }
+  // The dispatch plan computed at start: which account takes what, how many metered credits it
+  // costs and what the tail is expected to be. Informational — the run never waits for a click.
+  if (latestRunState.planSummary && !errorText) {
+    notices.push(`
+      <div class="alert-row note" role="status">
+        <div class="alert-copy">
+          <div class="alert-detail multi">${escapeHtml(latestRunState.planSummary)}</div>
+        </div>
+      </div>
+    `);
+  }
   monitorError.innerHTML = notices.join('');
   monitorError.classList.toggle('active', notices.length > 0);
   if (isUserStoppedRun(latestRunState)) {

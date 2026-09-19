@@ -3,19 +3,28 @@ import { DEFAULT_FEATURES, mergeFeatures } from './features.js';
 import {
   ACCOUNT_RETRY_DELAY_MS,
   AUTO_RESUME_MAX_DELAY_MS,
+  accountTier,
   autoResumeDelayMs,
+  compareCandidates,
+  ipBackoffTriggered,
   orderUnitsForDispatch,
+  rankCandidates,
   shouldAutoResume,
+  simulatePlan,
+  summarizePlan,
 } from './queue-policy.js';
 import {
   createAccountHealth,
   describeBlocked,
   describeQuota,
   isBlocked,
+  ledgerQuota,
+  markQuotaUnreliable,
   normalizeHealthMap,
   noteQuota,
   pruneHealthMap,
   quotaExhausted,
+  quotaLedgerUsable,
   quotaUnlimited,
   recordBulkRejection,
   recordBulkSuccess,
@@ -52,8 +61,14 @@ const accountMutationLocks = new Map();
 let runAdmissionToken = null;
 // per-run cache of the account's template + SCRIPT preset (see the connect block in the attempt)
 const runConnectCache = new Map();
-// accounts whose zeroed subscription counter was already tested once in this run
-const quotaProbeAttempted = new Set();
+// accounts whose subscription counter proved wrong during this run (rejection it cannot explain)
+const runUntrusted = new Set();
+// rejections seen this run, for the shared-IP pause
+const runRejections = [];
+// how many quota-only waits this run already scheduled (30 min, then hourly)
+let quotaWaitCount = 0;
+// accounts measured by the last probe round, used to preview the plan without new calls
+let lastProbeSnapshot = [];
 const processedBlobLeases = new Map();
 
 // Phase 0 instrumentation (read-only) plus the per-phase feature gates. Flags live in
@@ -273,6 +288,8 @@ function createIdleRunState() {
     recoverable: false,
     interruptionReason: '',
     queuePlan: [],
+    plan: null,
+    planSummary: '',
     bulkContext: null,
     nextTaskIndex: 0,
     downloadPlan: {
@@ -497,7 +514,9 @@ async function resetRunStateInternal() {
   stopRequested = false;
   currentRunToken += 1;
   runConnectCache.clear();
-  quotaProbeAttempted.clear();
+  runUntrusted.clear();
+  runRejections.length = 0;
+  quotaWaitCount = 0;
   await clearTaskBlobs().catch(() => {});
   await clearInputFiles().catch(() => {});
   runState = createIdleRunState();
@@ -1501,35 +1520,36 @@ async function probeAccount(binding, accountId) {
   const snapshotEnabled = featureEnabled('accountSnapshot');
   const loadFresh = snapshotEnabled && entry.load && now - entry.load.at <= LOAD_PROBE_TTL_MS;
   const capsFresh = snapshotEnabled && entry.capabilities && now - entry.capabilitiesAt <= CAPABILITIES_TTL_MS;
-  if (loadFresh && capsFresh) {
-    return { load: entry.load, capabilities: entry.capabilities, cached: true };
+  // The ledger covers the counter between readings: get_batch_times is the slowest call in a
+  // selection round (0.6-0.9 s for the whole pool), and our own acks keep it accurate.
+  const health = getAccountHealth(accountId);
+  const ledger = featureEnabled('quotaLedger') && quotaLedgerUsable(health, now) ? ledgerQuota(health) : null;
+  if (loadFresh && capsFresh && (ledger || entry.load?.quota)) {
+    return { load: { ...entry.load, quota: ledger || entry.load.quota }, capabilities: entry.capabilities, cached: true, quotaRead: false };
   }
 
-  const [loadResult, capabilities] = await Promise.all([
-    loadFresh
-      ? Promise.resolve(entry.load)
-      : Promise.all([
-        binding.client.getRunningWorks(),
-        binding.client.getBatchTimes().catch(() => null),
-      ]).then(([running, quota]) => {
-        if (!Array.isArray(running?.workIds)) throw new Error('DreamFace running works unavailable');
-        return {
-          at: Date.now(),
-          workIds: running.workIds.map(String),
-          quota: quota
-            ? { total: Number(quota.total) || 0, remaining: Number(quota.remaining) || 0 }
-            : entry.load?.quota || null,
-        };
-      }),
-    capsFresh ? Promise.resolve(entry.capabilities) : binding.client.getAccountCapabilities(),
-  ]);
+  const loadPromise = loadFresh
+    ? Promise.resolve(entry.load)
+    : binding.client.getRunningWorks().then((running) => {
+      if (!Array.isArray(running?.workIds)) throw new Error('DreamFace running works unavailable');
+      return { at: Date.now(), workIds: running.workIds.map(String), quota: null };
+    });
+  const quotaPromise = ledger ? Promise.resolve(null) : binding.client.getBatchTimes().catch(() => null);
+  const capsPromise = capsFresh ? Promise.resolve(entry.capabilities) : binding.client.getAccountCapabilities();
 
-  entry.load = loadResult;
+  const [load, freshQuota, capabilities] = await Promise.all([loadPromise, quotaPromise, capsPromise]);
+  entry.load = {
+    at: load.at,
+    workIds: load.workIds,
+    quota: freshQuota
+      ? { total: Number(freshQuota.total) || 0, remaining: Number(freshQuota.remaining) || 0 }
+      : (ledger || load.quota || entry.load?.quota || null),
+  };
   if (!capsFresh) {
     entry.capabilities = capabilities;
     entry.capabilitiesAt = Date.now();
   }
-  return { load: entry.load, capabilities: entry.capabilities, cached: false };
+  return { load: entry.load, capabilities: entry.capabilities, cached: false, quotaRead: Boolean(freshQuota) };
 }
 
 async function selectLeastLoadedAccount(
@@ -1555,6 +1575,16 @@ async function selectLeastLoadedAccount(
   const probed = await Promise.all(accounts.map(async (account) => {
     const listedAccountId = String(account.accountId || '');
     if (excludedAccountIds.has(listedAccountId)) return null;
+    if (runUntrusted.has(listedAccountId)) {
+      phase0.recordOnce(`untrusted:${runState.runId || ''}:${listedAccountId}`, {
+        type: 'account_probe',
+        source,
+        accountId: listedAccountId,
+        skipped: 'quota_unreliable',
+        requiredDurationSeconds,
+      });
+      return null;
+    }
     if (healthEnabled && isBlocked(getAccountHealth(listedAccountId), now)) {
       healthBlocked.push({ accountId: listedAccountId, health: getAccountHealth(listedAccountId) });
       return null;
@@ -1564,7 +1594,7 @@ async function selectLeastLoadedAccount(
       const binding = await getAccountBinding(account.accountId, account.principalKey);
       const accountId = String(binding.account.accountId || listedAccountId);
       if (excludedAccountIds.has(accountId)) return null;
-      const { load, capabilities } = await probeAccount(binding, accountId);
+      const { load, capabilities, quotaRead, cached } = await probeAccount(binding, accountId);
       const effectiveAccount = { ...account, ...binding.account, ...capabilities };
       noteAccountQuota(accountId, load.quota);
       phase0.recordOnce(`caps:${runState.runId || ''}:${accountId}`, {
@@ -1588,6 +1618,8 @@ async function selectLeastLoadedAccount(
         accountId,
         load: load.workIds.length,
         quota: load.quota,
+        // read = the site was asked for the counter, ledger/cache = the ledger covered it
+        quotaSource: quotaRead ? 'read' : (cached ? 'cache' : 'ledger'),
         hasCachedAvatar,
       };
     } catch (error) {
@@ -1602,16 +1634,37 @@ async function selectLeastLoadedAccount(
     }
   }));
 
-  // Deterministic reservation order: least loaded first, then by account id.
-  const candidates = probed.filter(Boolean)
-    .sort((a, b) => (a.load - b.load) || a.accountId.localeCompare(b.accountId));
+  // The ranking itself lives in queue-policy.js so the plan preview and the live selector can
+  // never disagree: backlog tier, then unlimited quota, then credit headroom, then load.
+  const candidates = rankCandidates(probed.filter(Boolean).map((candidate) => ({
+    ...candidate,
+    metered: !quotaUnlimited(candidate.quota),
+    remaining: Number(candidate.quota?.remaining || 0),
+    tier: featureEnabled('backlogTier') ? accountTier(candidate.load) : 1,
+    // Base score for the ordering; the reservation and avatar affinity are applied per unit below.
+    score: candidate.load,
+  })));
+  lastProbeSnapshot = candidates.map((candidate) => ({
+    accountId: candidate.accountId,
+    limitSec: Number(candidate.account.maxDurationSeconds || 0),
+    tier: candidate.tier,
+    load: candidate.load,
+    quota: candidate.quota,
+    metered: candidate.metered,
+    remaining: candidate.remaining,
+    // Every field compareCandidates uses must be here, or the plan would pick differently from
+    // the live selector (the first validation run sent the whole batch to a Pro account).
+    quotaClass: candidate.metered ? 0 : 1,
+    hasCachedAvatar: candidate.hasCachedAvatar,
+    score: candidate.score,
+  }));
 
   let selected = null;
   for (const candidate of candidates) {
     const { account: effectiveAccount, accountId, quota } = candidate;
     const limitSec = Number(effectiveAccount.maxDurationSeconds || 0);
     availableMaximumSeconds = Math.max(availableMaximumSeconds, limitSec);
-    if (quotaExhausted(quota) && !(featureEnabled('quotaProbe') && !quotaProbeAttempted.has(accountId))) {
+    if (quotaExhausted(quota)) {
       quotaBlocked.push({ accountId, tier: effectiveAccount.tier || '', quota });
       phase0.record({
         type: 'account_probe',
@@ -1635,6 +1688,7 @@ async function selectLeastLoadedAccount(
     }
     const affinityBonus = candidate.hasCachedAvatar ? 2 : 0;
     const fits = limitSec >= requiredDurationSeconds;
+    const metered = !quotaUnlimited(quota);
     const built = {
       account: effectiveAccount,
       accountId,
@@ -1642,8 +1696,11 @@ async function selectLeastLoadedAccount(
       planned: reservation.assigned,
       quota,
       // Premium answers the counter with a 1/1 sentinel, i.e. batches are not metered. Metered
-      // pro accounts hold 10 credits, so they are kept as overflow instead of being burned first.
-      quotaClass: quotaUnlimited(quota) ? 1 : 0,
+      // pro accounts hold 10 credits, so they are only used when nobody else can take the unit.
+      quotaClass: metered ? 0 : 1,
+      tier: candidate.tier,
+      metered,
+      remaining: Number(quota?.remaining || 0),
       hasCachedAvatar: candidate.hasCachedAvatar,
       score: Math.max(0, Math.max(candidate.load, reservation.baselineLoad + reservation.assigned) - affinityBonus),
     };
@@ -1656,7 +1713,9 @@ async function selectLeastLoadedAccount(
       tier: effectiveAccount.tier || '',
       planName: effectiveAccount.planName || '',
       quota,
+      quotaSource: candidate.quotaSource || 'read',
       quotaClass: built.quotaClass,
+      tier: built.tier,
       planned: built.planned,
       baselineLoad: reservation.baselineLoad,
       requiredDurationSeconds,
@@ -1665,11 +1724,7 @@ async function selectLeastLoadedAccount(
       fits,
     });
     if (!fits) continue;
-    if (!selected
-      || built.quotaClass > selected.quotaClass
-      || (built.quotaClass === selected.quotaClass && built.score < selected.score)) {
-      selected = built;
-    }
+    if (!selected || compareCandidates(built, selected) < 0) selected = built;
   }
 
   if (!selected) {
@@ -1709,6 +1764,8 @@ async function selectLeastLoadedAccount(
     availableMaximumSeconds,
     quota: selected.quota,
     quotaClass: selected.quotaClass,
+    probeLoad: selected.load,
+    probeTier: selected.tier,
   };
 }
 
@@ -2143,7 +2200,20 @@ async function watchAccountUnits(accountId, units, allAccountUnits) {
     const downloadFailedIds = (unit.workIds || []).filter((id) => terminalDownloadFailures.has(dmStatusById.get(String(id))));
     const targetCount = Number(unit.targetCount || unit.expectedFileNames.length);
     const hasAllWorkIds = (unit.workIds || []).filter(Boolean).length >= targetCount;
-    if (doneIds.length >= targetCount) unit.status = 'complete';
+    if (doneIds.length >= targetCount) {
+      if (unit.status !== 'complete') {
+        const submittedMs = Date.parse(unit.submittedAt || '');
+        phase0.recordOnce(`drain:${unit.id}`, {
+          type: 'drain_sample',
+          unitId: unit.id,
+          accountId: unit.accountId,
+          probeLoad: Number(unit.probeLoad || 0),
+          works: doneIds.length,
+          elapsedMs: Number.isFinite(submittedMs) ? Date.now() - submittedMs : null,
+        });
+      }
+      unit.status = 'complete';
+    }
     else if (!wasSubmissionUncertain
       && doneIds.length + (unit.failedWorkIds || []).length + downloadFailedIds.length >= targetCount) unit.status = 'failed';
     else if (!hasAllWorkIds && unit.correlationDeadline && Date.now() > new Date(unit.correlationDeadline).getTime()) {
@@ -2321,7 +2391,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
           excludedAccountIds,
         );
       } catch (error) {
-        const capacityCodes = ['all_accounts_at_limit', 'all_accounts_quarantined', 'all_accounts_quota_exhausted'];
+        const capacityCodes = ['all_accounts_at_limit', 'all_accounts_quarantined', 'all_accounts_quota_exhausted', 'ip_backoff'];
         if (!capacityCodes.includes(error.code)) throw error;
         probeMs = Date.now() - selectionStartedAt;
         unit.retryExcludedAccountIds = [];
@@ -2336,7 +2406,8 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
         // A spent quota has no cooldown to wait for, so it gets its own fallback window; a live
         // cooldown yields its exact expiry.
         const quotaOnly = error.code === 'all_accounts_quota_exhausted';
-        const waitMs = autoResumeDelayMs({ retryAt: error.retryAt, quotaOnly });
+        if (quotaOnly) quotaWaitCount += 1;
+        const waitMs = autoResumeDelayMs({ retryAt: error.retryAt, quotaOnly, quotaWaitAttempt: quotaWaitCount });
         const scheduledSec = Math.round(scheduleAutoResume(waitMs) / 1000);
         recordAttemptEnd(error.code === 'all_accounts_quota_exhausted'
           ? 'quota_exhausted'
@@ -2504,12 +2575,25 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       }
       if (quotaAtReject) noteAccountQuota(failedAccountId, quotaAtReject);
       const quotaSpent = quotaExhausted(quotaAtReject);
+      // A rejection the counter cannot explain means the counter is not the whole story: the
+      // account is dropped for the rest of the run and its quota is read for real from now on,
+      // instead of probing it with submissions that burn credits.
+      if (!quotaSpent) {
+        runUntrusted.add(failedAccountId);
+        phase0.record({
+          type: 'quota_unreliable',
+          accountId: failedAccountId,
+          quota: quotaAtReject,
+          error: error?.apiStatus || error?.message || '',
+        });
+      }
       await noteAccountRejection(failedAccountId, {
         runningWorkIds: runningIds,
         quota: quotaAtReject,
         sampleError: error?.apiStatus || error?.message || '',
         tier: selectedAccount?.tier || '',
       });
+      runRejections.push({ at: Date.now(), accountId: failedAccountId });
       recordAttemptEnd('limit_rejected', {
         accountId: failedAccountId,
         uploadMs: uploadMsTotal,
@@ -2538,6 +2622,22 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       runState.warnings = [...runState.warnings, quotaSpent
         ? `${unit.video.name}: квота отправок исчерпана на ${failedAccountId}, группа перенаправляется`
         : `${unit.video.name}: лимит активных работ на ${failedAccountId}, группа перенаправляется`];
+      // Several rejections on different accounts inside a minute look like a per-IP rate limit:
+      // pausing beats hammering.
+      const ip = ipBackoffTriggered(runRejections);
+      if (ip.triggered) {
+        phase0.record({ type: 'ip_backoff', pauseMs: ip.pauseMs, accounts: ip.accounts, rejections: ip.recent });
+        const scheduledSec = Math.round(scheduleAutoResume(ip.pauseMs) / 1000);
+        runState.warnings = [...runState.warnings,
+          `отказы на ${ip.accounts.length} аккаунтах за минуту — пауза ${Math.round(ip.pauseMs / 1000)} с`];
+        await pushState();
+        if (watchUnit) await removeBulkWatchUnit(watchUnit.id);
+        const pauseError = new Error(`отказы на нескольких аккаунтах подряд: пауза ${Math.round(ip.pauseMs / 1000)} с`
+          + (scheduledSec > 0 ? `, авто-возобновление через ${scheduledSec} с` : ''));
+        pauseError.code = 'ip_backoff';
+        pauseError.retryAt = Date.now() + ip.pauseMs;
+        throw pauseError;
+      }
       await pushState();
       if (watchUnit) await removeBulkWatchUnit(watchUnit.id);
     };
@@ -2573,6 +2673,9 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
             submittedAt: unit.submittedAt,
             correlationDeadline: unit.correlationDeadline,
             baselineWorkIds: unit.baselineWorkIds || [],
+            // the account's queue depth when this work joined it: the drain telemetry compares
+            // it with the completion time to calibrate the backlog threshold
+            probeLoad: Number(selectedAccount?.probeLoad || 0),
             targetCount: unit.audios.length,
             status: 'pending',
             submissionPhase: 'ready_to_dispatch',
@@ -2676,7 +2779,10 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
           // the batch we just accepted instead of advertising an idle account.
           noteOwnDispatch(unit.accountId, submitted.successCount);
           refreshProbeCache(unit.accountId, { runningWorks: runningAfter, quota: quotaAfter });
-          if (submitted.successCount > 0) noteAccountSuccess(unit.accountId, selectedAccount.tier, quotaAfter);
+          if (submitted.successCount > 0) {
+            noteAccountSuccess(unit.accountId, selectedAccount.tier, quotaAfter);
+            quotaWaitCount = 0;
+          }
           const probeAccountId = unit.accountId;
           const probePrincipal = selectedAccount.principalKey || '';
           ackMs = Date.now() - submitStartedAt - submitMs;
@@ -3319,7 +3425,9 @@ async function startRun(payload, admissionToken) {
 
   await clearTaskBlobs();
   runConnectCache.clear();
-  quotaProbeAttempted.clear();
+  runUntrusted.clear();
+  runRejections.length = 0;
+  quotaWaitCount = 0;
 
   runState = createIdleRunState();
   runState.mode = payload.mode === 'bulk' ? 'bulk' : 'legacy';
@@ -3376,6 +3484,23 @@ async function startRun(payload, admissionToken) {
     const dispatchQueue = runState.mode === 'bulk' && featureEnabled('lptOrder')
       ? orderUnitsForDispatch(queue)
       : queue;
+    // Plan preview: the same ranking, run over the whole queue against the snapshot the preflight
+    // just took, so the shipments are known before the first upload — and so the estimate of
+    // credits and tail is part of the log.
+    if (runState.mode === 'bulk' && featureEnabled('planPreview') && lastProbeSnapshot.length > 0) {
+      runState.plan = simulatePlan(dispatchQueue, lastProbeSnapshot);
+      runState.planSummary = summarizePlan(runState.plan);
+      phase0.record({
+        type: 'run_plan',
+        creditsSpent: runState.plan.creditsSpent,
+        creditsLeft: runState.plan.creditsLeft,
+        accounts: runState.plan.accounts,
+        deferred: runState.plan.deferred,
+        estimates: runState.plan.estimates,
+        assignments: runState.plan.assignments.slice(0, 60),
+      });
+      setStatusText(runState.planSummary);
+    }
     runState.summary = summary;
     runState.queuePlan = dispatchQueue.map((item) => ({ ...item }));
     await pushState();

@@ -24,12 +24,12 @@ test('mergeFeatures fills in defaults and keeps stored overrides', () => {
 });
 
 test('the validated dispatch path ships enabled, unvalidated phases stay off', () => {
-  // Phase 0 tracing is read-only; accountHealth and accountSnapshot are the dispatch path
-  // measured in the phase 2 trace. The remaining flags still change behavior unprovenly.
-  assert.equal(DEFAULT_FEATURES.phase0Trace, true);
-  assert.equal(DEFAULT_FEATURES.accountHealth, true);
-  assert.equal(DEFAULT_FEATURES.accountSnapshot, true);
-  for (const flag of ['quotaProbe', 'ossUploadCache', 'workLedger', 'chunkedPlanning']) {
+  // Phase 0 tracing is read-only; everything that the 19.09 runs validated ships on: the health
+  // gate, the probe snapshot, the quota ledger, the backlog tier, LPT order and the plan preview.
+  for (const flag of ['phase0Trace', 'accountHealth', 'accountSnapshot', 'lptOrder', 'quotaLedger', 'backlogTier', 'planPreview']) {
+    assert.equal(DEFAULT_FEATURES[flag], true, `${flag} is part of the validated dispatch path`);
+  }
+  for (const flag of ['ossUploadCache', 'workLedger', 'chunkedPlanning']) {
     assert.equal(DEFAULT_FEATURES[flag], false, `${flag} changes runtime behavior and must default off`);
   }
 });

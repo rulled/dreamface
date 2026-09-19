@@ -50,6 +50,7 @@ export function createAccountHealth(patch = {}) {
     quota: { total: 0, remaining: 0, at: 0 },
     dispatchesSinceQuota: 0,
     lastDispatchAt: 0,
+    quotaUnreliable: false,
     updatedAt: 0,
     ...patch,
   };
@@ -77,6 +78,7 @@ export function normalizeHealth(raw) {
     quota: normalizeQuota(raw.quota),
     dispatchesSinceQuota: Math.max(0, Number(raw.dispatchesSinceQuota) || 0),
     lastDispatchAt: Math.max(0, Number(raw.lastDispatchAt) || 0),
+    quotaUnreliable: raw.quotaUnreliable === true,
     updatedAt: Math.max(0, Number(raw.updatedAt) || 0),
   };
 }
@@ -100,6 +102,43 @@ export function quotaUnlimited(quota) {
 export function quotaExhausted(quota) {
   const normalized = normalizeQuota(quota);
   return normalized.total > QUOTA_SENTINEL_TOTAL && normalized.remaining <= 0;
+}
+
+// The ledger: between two readings the only thing that moves a metered counter is our own
+// accepted batches, so the usable value is the last reading minus what we submitted since. The
+// reading itself is refreshed on dispatch acks and rejections, so in steady state the selector
+// stops asking the site for quotas at all.
+export const QUOTA_LEDGER_TTL_MS = 15 * 60 * 1000;
+
+export function quotaLedgerUsable(health, now = Date.now()) {
+  const normalized = normalizeHealth(health);
+  if (!normalized.quota.at) return false;
+  if (normalized.quotaUnreliable) return false;
+  return now - normalized.quota.at <= QUOTA_LEDGER_TTL_MS;
+}
+
+export function ledgerQuota(health) {
+  const normalized = normalizeHealth(health);
+  if (!normalized.quota.total) return null;
+  if (quotaUnlimited(normalized.quota)) return { ...normalized.quota };
+  return {
+    ...normalized.quota,
+    remaining: Math.max(0, normalized.quota.remaining - normalized.dispatchesSinceQuota),
+  };
+}
+
+// A rejection that the counter cannot explain: the account stops being trusted for this run and
+// gets a real reading before the next decision.
+export function markQuotaUnreliable(health, options = {}) {
+  const now = Number(options.now) || Date.now();
+  const current = normalizeHealth(health);
+  return normalizeHealth({
+    ...current,
+    quotaUnreliable: true,
+    reason: 'quota_unreliable',
+    sampleError: String(options.sampleError || current.sampleError || '').slice(0, 200),
+    updatedAt: now,
+  });
 }
 
 export function blockedUntil(health) {
@@ -155,6 +194,8 @@ export function recordBulkSuccess(health, options = {}) {
     reason: '',
     sampleError: '',
     tier: String(options.tier || current.tier || ''),
+    // A successful submit proves the counter is usable again.
+    quotaUnreliable: false,
     // Our own consumption has to be remembered: the next quota reading may predate this batch.
     dispatchesSinceQuota: (options.quota ? noted.dispatchesSinceQuota : current.dispatchesSinceQuota) + 1,
     lastDispatchAt: now,

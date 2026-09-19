@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   LOAD_BACKOFF_MS,
   MAX_COOLDOWN_MS,
+  QUOTA_LEDGER_TTL_MS,
   QUOTA_RESET_GUARD_MS,
   REJECT_COOLDOWN_MS,
   blockedUntil,
@@ -10,10 +11,13 @@ import {
   describeBlocked,
   describeQuota,
   isBlocked,
+  ledgerQuota,
+  markQuotaUnreliable,
   normalizeHealth,
   noteQuota,
   pruneHealthMap,
   quotaExhausted,
+  quotaLedgerUsable,
   quotaUnlimited,
   recordBulkRejection,
   recordBulkSuccess,
@@ -140,4 +144,30 @@ test('pruning, blocked summaries and quota summaries describe real state', () =>
   ], NOW);
   assert.equal(quotas.exhausted.length, 1);
   assert.equal(quotas.text, 'pro:0/10, premium:unlimited');
+});
+
+test('the ledger subtracts our own dispatches from the last reading', () => {
+  const base = { ...createAccountHealth({ tier: 'pro' }), quota: { total: 10, remaining: 6, at: NOW }, updatedAt: NOW };
+  assert.equal(ledgerQuota(base).remaining, 6);
+  const afterTwo = { ...base, dispatchesSinceQuota: 2 };
+  assert.equal(ledgerQuota(afterTwo).remaining, 4);
+  assert.equal(ledgerQuota({ ...base, dispatchesSinceQuota: 9 }).remaining, 0, 'never negative');
+  // The premium sentinel never moves, so our own batches do not change what it reports.
+  const premium = { ...createAccountHealth({ tier: 'premium' }), quota: { total: 1, remaining: 1, at: NOW }, dispatchesSinceQuota: 40 };
+  assert.equal(ledgerQuota(premium).remaining, 1);
+  assert.equal(ledgerQuota(createAccountHealth()), null, 'no reading yet means no ledger');
+});
+
+test('a stale or distrusted ledger forces a real reading', () => {
+  const fresh = { ...createAccountHealth(), quota: { total: 10, remaining: 4, at: NOW } };
+  assert.equal(quotaLedgerUsable(fresh, NOW + 1000), true);
+  assert.equal(quotaLedgerUsable(fresh, NOW + QUOTA_LEDGER_TTL_MS + 1), false, 'stale reading');
+  assert.equal(quotaLedgerUsable(createAccountHealth(), NOW), false, 'never read');
+  const distrusted = markQuotaUnreliable(fresh, { now: NOW });
+  assert.equal(distrusted.quotaUnreliable, true);
+  assert.equal(distrusted.reason, 'quota_unreliable');
+  assert.equal(quotaLedgerUsable(distrusted, NOW + 1000), false);
+  assert.equal(ledgerQuota(distrusted).remaining, 4, 'the reading is still reported, just not trusted');
+  // A later accepted submit proves the counter works again.
+  assert.equal(recordBulkSuccess(distrusted, { now: NOW + 5000 }).quotaUnreliable, false);
 });
