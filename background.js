@@ -3,6 +3,8 @@ const RUN_STATE_KEY = 'dreamfaceRunState';
 const DOWNLOADS_STORAGE_KEY = 'dreamfaceDownloads';
 const PADDED_VIDEO_MARKERS_KEY = 'dreamfacePaddedVideoMarkers';
 const DREAMFACE_ACCOUNTS_KEY = 'dreamfaceAccounts';
+const ACCOUNT_HEALTH_KEY = 'dreamfaceAccountHealth';
+const FEATURES_KEY = 'dreamfaceFeatures';
 const AVATAR_CACHE_KEY = 'dreamfaceAvatarCache';
 const AVATAR_CACHE_LIMIT = 2000;
 const BULK_WATCH_ALARM = 'bulk-watch';
@@ -197,6 +199,16 @@ async function diagnoseStoredAccount(account) {
       premium: Number(audioLimit.premium || 0),
     },
   };
+}
+
+// Account health updates arrive from the offscreen document while a run is in flight;
+// serializing them keeps read-modify-write from dropping a concurrent update.
+let accountHealthChain = Promise.resolve();
+
+function withAccountHealthMutation(callback) {
+  const run = accountHealthChain.then(callback, callback);
+  accountHealthChain = run.catch(() => {});
+  return run;
 }
 
 function canonicalizeAccounts(accounts) {
@@ -1712,6 +1724,38 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           ok: true,
           accounts: await isTrustedOffscreenSender(sender) ? accounts : accounts.map(redactStoredAccountCredential),
         });
+        return;
+      }
+
+      case 'dfGetAccountHealth': {
+        const stored = await chrome.storage.local.get(ACCOUNT_HEALTH_KEY);
+        sendResponse({ ok: true, health: stored[ACCOUNT_HEALTH_KEY] || {} });
+        return;
+      }
+
+      case 'dfPatchAccountHealth': {
+        if (!request.accountId) {
+          sendResponse({ ok: false, error: 'accountId is required' });
+          return;
+        }
+        const health = await withAccountHealthMutation(async () => {
+          const stored = await chrome.storage.local.get(ACCOUNT_HEALTH_KEY);
+          const current = stored[ACCOUNT_HEALTH_KEY] && typeof stored[ACCOUNT_HEALTH_KEY] === 'object'
+            ? stored[ACCOUNT_HEALTH_KEY]
+            : {};
+          const next = { ...current, [request.accountId]: request.health };
+          await chrome.storage.local.set({ [ACCOUNT_HEALTH_KEY]: next });
+          return next;
+        });
+        sendResponse({ ok: true, health });
+        return;
+      }
+
+      // Offscreen documents only get chrome.runtime, so flags are read through here and
+      // merged against defaults by the caller.
+      case 'dfGetFeatures': {
+        const stored = await chrome.storage.local.get(FEATURES_KEY);
+        sendResponse({ ok: true, features: stored[FEATURES_KEY] || {} });
         return;
       }
 

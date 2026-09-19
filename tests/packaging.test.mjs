@@ -21,6 +21,7 @@ const SCRIPT_KINDS = {
   'media-transform.js': 'module',
   'trace.js': 'module',
   'trace-store.js': 'module',
+  'account-health.js': 'module',
   'features.js': 'module',
   'popup-trace.js': 'module',
 };

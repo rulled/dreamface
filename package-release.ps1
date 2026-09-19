@@ -8,6 +8,7 @@ $repoRoot = $PSScriptRoot
 $manifestPath = Join-Path $repoRoot 'manifest.json'
 $runtimeFiles = @(
     'manifest.json'
+    'account-health.js'
     'background.js'
     'content_script.js'
     'dreamface-api.js'

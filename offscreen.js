@@ -1,5 +1,16 @@
 import { compactRaw, createTraceWriter } from './trace.js';
-import { readFeatures } from './features.js';
+import { DEFAULT_FEATURES, mergeFeatures } from './features.js';
+import {
+  blockedUntil,
+  createAccountHealth,
+  describeBlocked,
+  isBlocked,
+  normalizeHealthMap,
+  pruneHealthMap,
+  recordBulkRejection,
+  recordBulkSuccess,
+  syncHealthWithCapabilities,
+} from './account-health.js';
 
 const RUN_DB_NAME = 'dreamface-run-db';
 const RUN_DB_VERSION = 4;
@@ -29,12 +40,102 @@ const accountMutationLocks = new Map();
 let runAdmissionToken = null;
 const processedBlobLeases = new Map();
 
-// Phase 0 instrumentation (read-only). The flag is persisted in chrome.storage;
-// tracing stays on until the stored flag explicitly says otherwise.
+// Phase 0 instrumentation (read-only) plus the per-phase feature gates. Flags live in
+// chrome.storage, which offscreen documents cannot reach, so they are read through the
+// background and merged against defaults here.
 const phase0 = createTraceWriter();
-void readFeatures()
-  .then((features) => { phase0.setEnabled(features.phase0Trace !== false); })
-  .catch(() => {});
+let featureFlags = { ...DEFAULT_FEATURES };
+
+function featureEnabled(name) {
+  return featureFlags[name] === true;
+}
+
+void (async () => {
+  try {
+    const response = await callBackground('dfGetFeatures');
+    featureFlags = mergeFeatures(response?.features);
+  } catch (_) {
+    featureFlags = { ...DEFAULT_FEATURES };
+  }
+  phase0.setEnabled(featureFlags.phase0Trace !== false);
+  phase0.record({ type: 'features', ...featureFlags });
+})();
+
+// ---------------------------------------------------------------- account health (phase 1)
+const accountHealthCache = new Map();
+let accountHealthLoaded = false;
+
+function getAccountHealth(accountId) {
+  return accountHealthCache.get(String(accountId)) || createAccountHealth();
+}
+
+async function loadAccountHealth(accounts = []) {
+  if (!featureEnabled('accountHealth') || accountHealthLoaded) return;
+  accountHealthLoaded = true;
+  try {
+    const response = await callBackground('dfGetAccountHealth');
+    const pruned = pruneHealthMap(normalizeHealthMap(response?.health), {
+      accountIds: accounts.map((item) => String(item?.accountId || '')).filter(Boolean),
+    });
+    accountHealthCache.clear();
+    for (const [accountId, health] of Object.entries(pruned)) accountHealthCache.set(accountId, health);
+  } catch (_) {
+    // health is an optimization: never block a run because it could not be loaded
+  }
+}
+
+async function persistAccountHealth(accountId) {
+  if (!featureEnabled('accountHealth')) return;
+  const health = accountHealthCache.get(String(accountId));
+  if (!health) return;
+  await callBackground('dfPatchAccountHealth', { accountId: String(accountId), health }).catch(() => {});
+}
+
+function noteAccountSuccess(accountId, tier = '') {
+  if (!featureEnabled('accountHealth') || !accountId) return;
+  const id = String(accountId);
+  accountHealthCache.set(id, recordBulkSuccess(accountHealthCache.get(id), { tier }));
+  void persistAccountHealth(id);
+}
+
+async function noteAccountRejection(accountId, options = {}) {
+  if (!featureEnabled('accountHealth') || !accountId) return null;
+  const id = String(accountId);
+  const health = recordBulkRejection(accountHealthCache.get(id), options);
+  accountHealthCache.set(id, health);
+  await persistAccountHealth(id);
+  return health;
+}
+
+function noteAccountCapabilities(accountId, capabilities) {
+  if (!featureEnabled('accountHealth') || !accountId) return;
+  const id = String(accountId);
+  const synced = syncHealthWithCapabilities(accountHealthCache.get(id), { tier: capabilities?.tier || '' });
+  if (synced.tier === getAccountHealth(id).tier) return;
+  accountHealthCache.set(id, synced);
+  void persistAccountHealth(id);
+}
+
+let autoResumeTimer = null;
+
+function scheduleAutoResume(delayMs) {
+  if (!featureEnabled('accountHealth')) return 0;
+  if (autoResumeTimer) {
+    clearTimeout(autoResumeTimer);
+    autoResumeTimer = null;
+  }
+  const delay = Math.max(5000, Math.min(Number(delayMs) || 60000, 60 * 60 * 1000));
+  autoResumeTimer = setTimeout(() => {
+    autoResumeTimer = null;
+    if (stopRequested || isBusyPhase(runState.phase)) return;
+    if (Number(runState.nextTaskIndex || 0) >= (runState.queuePlan || []).length) return;
+    const token = acquireRunAdmission();
+    if (!token) return;
+    runState.warnings = [...runState.warnings, `авто-возобновление очереди через ${Math.round(delay / 1000)} с`];
+    void resumeRun({}, token).catch(() => releaseRunAdmission(token));
+  }, delay);
+  return delay;
+}
 
 async function phase0ProbeRunning(accountId, phase, principalKey = '') {
   if (!accountId) return;
@@ -1312,19 +1413,40 @@ async function selectLeastLoadedAccount(
   const listed = await callBackground('dfListAccounts');
   const accounts = Array.isArray(listed.accounts) ? listed.accounts.map(toAccountMetadata) : [];
   if (accounts.length === 0) throw new Error('DreamFace account is not authenticated');
+  await loadAccountHealth(accounts);
 
   let selected = null;
   let availableMaximumSeconds = 0;
   let unavailableAccountCount = 0;
   let attemptedAccountCount = 0;
+  const healthBlocked = [];
+  const healthEnabled = featureEnabled('accountHealth');
+  const now = Date.now();
   for (const account of accounts) {
     if (excludedAccountIds.has(String(account.accountId))) continue;
+    if (healthEnabled && isBlocked(getAccountHealth(account.accountId), now)) {
+      healthBlocked.push({ accountId: String(account.accountId), health: getAccountHealth(account.accountId) });
+      continue;
+    }
     attemptedAccountCount += 1;
     try {
       const binding = await getAccountBinding(account.accountId, account.principalKey);
       if (excludedAccountIds.has(String(binding.account.accountId))) continue;
       const capabilities = await binding.client.getAccountCapabilities();
       const effectiveAccount = { ...account, ...binding.account, ...capabilities };
+      noteAccountCapabilities(effectiveAccount.accountId, capabilities);
+      phase0.recordOnce(`caps:${runState.runId || ''}:${effectiveAccount.accountId}`, {
+        type: 'capabilities',
+        accountId: effectiveAccount.accountId,
+        tier: effectiveAccount.tier || '',
+        planName: effectiveAccount.planName || '',
+        limitSec: Number(effectiveAccount.maxDurationSeconds || 0),
+        audioLimit: effectiveAccount.audioLimit || null,
+        vipLabel: Boolean(effectiveAccount.vipLabel),
+        vipLevel: effectiveAccount.vipLevel || '',
+        vipType: effectiveAccount.vipType || '',
+        expiresDate: Number(effectiveAccount.expiresDate || 0),
+      });
       const running = await binding.client.getRunningWorks();
       const load = Array.isArray(running?.workIds) ? running.workIds.length : Number.MAX_SAFE_INTEGER;
       let reservation = plannedLoads.get(effectiveAccount.accountId);
@@ -1373,9 +1495,13 @@ async function selectLeastLoadedAccount(
   if (!selected) {
     const allRemainingAccountsUnavailable = attemptedAccountCount > 0
       && unavailableAccountCount === attemptedAccountCount;
+    const blockedSummary = describeBlocked(healthBlocked, now);
     let message = 'captured DreamFace accounts are unavailable or expired';
     let code = 'accounts_unavailable';
-    if (excludedAccountIds.size > 0 && !allRemainingAccountsUnavailable) {
+    if (healthBlocked.length > 0 && attemptedAccountCount === 0) {
+      message = `all DreamFace accounts are paused: ${blockedSummary.text}`;
+      code = 'all_accounts_quarantined';
+    } else if (excludedAccountIds.size > 0 && !allRemainingAccountsUnavailable) {
       message = 'all DreamFace accounts reached their active-work limit for this group';
       code = 'all_accounts_at_limit';
     } else if (availableMaximumSeconds > 0 && availableMaximumSeconds < requiredDurationSeconds) {
@@ -1384,6 +1510,10 @@ async function selectLeastLoadedAccount(
     }
     const error = new Error(message);
     error.code = code;
+    if (blockedSummary.nextRetryAt > 0) {
+      error.retryAt = blockedSummary.nextRetryAt;
+      error.blocked = blockedSummary.entries;
+    }
     throw error;
   }
   return { ...selected.account, availableMaximumSeconds };
@@ -1923,8 +2053,39 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
 
     const requiredDurationSeconds = unit.audios.reduce((max, audio) => Math.max(max, Number(audio.durationMs || 0) / 1000), 0);
     const excludedAccountIds = new Set((unit.retryExcludedAccountIds || []).map(String));
+    const attemptIndex = (unit.retryExcludedAccountIds || []).length + 1;
+    const attemptStartedAt = Date.now();
+    let probeMs = 0;
+    let prepMs = 0;
+    let submitMs = 0;
+    const recordAttemptEnd = (outcome, patch = {}) => {
+      phase0.record({
+        type: 'attempt_end',
+        unitId: unit.id,
+        attemptIndex,
+        outcome,
+        accountId: patch.accountId || unit.accountId || '',
+        requiredDurationSeconds: Math.round(requiredDurationSeconds * 1000) / 1000,
+        totalMs: Date.now() - attemptStartedAt,
+        probeMs,
+        prepMs,
+        uploadMs: patch.uploadMs ?? 0,
+        submitMs: patch.submitMs ?? submitMs,
+        ...patch,
+      });
+    };
+    phase0.record({
+      type: 'attempt_start',
+      unitId: unit.id,
+      attemptIndex,
+      requiredDurationSeconds: Math.round(requiredDurationSeconds * 1000) / 1000,
+      audios: unit.audios.length,
+      excludedCount: excludedAccountIds.size,
+      presetAccountId: unit.accountId || '',
+    });
     let selectedAccount;
     let client;
+    const selectionStartedAt = Date.now();
     if (unit.accountId) {
       const binding = await activateAccount(unit.accountId, unit.principalKey || '');
       selectedAccount = binding.account;
@@ -1937,6 +2098,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       const capabilities = await client.getAccountCapabilities();
       throwIfStopped(runToken);
       selectedAccount = { ...selectedAccount, ...capabilities };
+      noteAccountCapabilities(selectedAccount.accountId, capabilities);
     } else {
       try {
         selectedAccount = await selectLeastLoadedAccount(
@@ -1946,16 +2108,26 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
           excludedAccountIds,
         );
       } catch (error) {
-        if (error.code !== 'all_accounts_at_limit') throw error;
+        const capacityCodes = ['all_accounts_at_limit', 'all_accounts_quarantined'];
+        if (!capacityCodes.includes(error.code)) throw error;
+        probeMs = Date.now() - selectionStartedAt;
         unit.retryExcludedAccountIds = [];
         unit.status = 'retry_wait';
         unit.submissionPhase = 'account_limit_retry_pending';
-        unit.lastError = 'All accounts are currently at their active-work limit';
+        unit.lastError = error.message;
         runState.queuePlan[index] = { ...unit };
         runState.nextTaskIndex = index;
         await pushState();
-        const retryError = new Error('все аккаунты достигли лимита активных работ. дождитесь освобождения слота и нажмите «возобновить»');
-        retryError.code = 'all_accounts_at_limit';
+        const waitMs = Number(error.retryAt) > Date.now() ? Number(error.retryAt) - Date.now() + 2000 : 60000;
+        const scheduledSec = Math.round(scheduleAutoResume(waitMs) / 1000);
+        recordAttemptEnd(error.code === 'all_accounts_quarantined' ? 'accounts_paused' : 'accounts_at_limit', {
+          error: error.message,
+        });
+        const hint = scheduledSec > 0
+          ? `авто-возобновление через ${scheduledSec} с или нажмите «возобновить»`
+          : 'дождитесь освобождения слота и нажмите «возобновить»';
+        const retryError = new Error(`${error.message}. ${hint}`);
+        retryError.code = error.code;
         throw retryError;
       }
       throwIfStopped(runToken);
@@ -1972,6 +2144,8 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       await pushState();
       throwIfStopped(runToken);
     }
+    probeMs = Date.now() - selectionStartedAt;
+    const prepStartedAt = Date.now();
     if (!client) ({ client } = await activateAccount(unit.accountId, selectedAccount.principalKey));
     throwIfStopped(runToken);
     const template = await client.getPtVideoInfo();
@@ -2020,6 +2194,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
       cached: usedCache,
       latencyMs: Date.now() - avatarStartedAt,
     });
+    prepMs = Date.now() - prepStartedAt;
 
     const scriptConfigs = [];
     let uploadMsTotal = 0;
@@ -2073,7 +2248,30 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
         error: error?.message || String(error),
         apiStatus: error?.apiStatus || '',
       });
-      void phase0ProbeRunning(failedAccountId, 'limit_hit', selectedAccount?.principalKey || '');
+      // A rejection with zero running works proves the account is not concurrency-limited;
+      // that is the signal the health state machine needs.
+      const runningAtReject = await client.getRunningWorks().catch(() => null);
+      const runningIds = Array.isArray(runningAtReject?.workIds) ? runningAtReject.workIds : null;
+      if (runningIds) {
+        phase0.record({
+          type: 'running_probe',
+          accountId: failedAccountId,
+          phase: 'limit_hit',
+          count: runningIds.length,
+          ids: runningIds,
+        });
+      }
+      await noteAccountRejection(failedAccountId, {
+        runningWorkIds: runningIds,
+        sampleError: error?.apiStatus || error?.message || '',
+        tier: selectedAccount?.tier || '',
+      });
+      recordAttemptEnd('limit_rejected', {
+        accountId: failedAccountId,
+        uploadMs: uploadMsTotal,
+        submitMs,
+        runningWorksAtReject: runningIds ? runningIds.length : null,
+      });
       const reservation = plannedLoads.get(failedAccountId);
       if (reservation && typeof reservation === 'object') {
         reservation.assigned = Math.max(0, Number(reservation.assigned || 0) - unit.audios.length);
@@ -2157,7 +2355,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
             name: batchName,
             templateId: context.templateId,
           });
-          const submitMs = Date.now() - submitStartedAt;
+          submitMs = Date.now() - submitStartedAt;
           if (submitted.successCount > 0) {
             const submissionPhase = submitted.successCount < scriptConfigs.length ? 'requires_review' : 'accepted';
             setQueueSubmissionPhase(index, unit, submissionPhase, {
@@ -2218,8 +2416,16 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
               ids: runningAfterIds,
             });
           }
+          if (submitted.successCount > 0) noteAccountSuccess(unit.accountId, selectedAccount.tier);
           const probeAccountId = unit.accountId;
           const probePrincipal = selectedAccount.principalKey || '';
+          recordAttemptEnd('accepted', {
+            accountId: unit.accountId,
+            uploadMs: uploadMsTotal,
+            submitMs,
+            successCount: submitted.successCount,
+            failCount: submitted.failCount,
+          });
           setTimeout(() => { void phase0ProbeRunning(probeAccountId, 't+30', probePrincipal); }, 30000);
           await pushState().catch((error) => {
             runState.warnings = [...runState.warnings, `не удалось сразу сохранить результат отправки: ${error.message || String(error)}`];
@@ -2230,6 +2436,10 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
             await prepareAccountLimitRetry(error);
             return;
           }
+          recordAttemptEnd(error.code === 'run_stopped' ? 'stopped' : 'error', {
+            accountId: unit.accountId,
+            error: error?.message || String(error),
+          });
           if (dispatchStarted && usedCache) {
             await invalidateCachedAvatarId(unit.video.videoUrl, unit.accountId);
             runState.warnings = [...runState.warnings, `кэш аватара инвалидирован для ${unit.video.name} на ${unit.accountId}: ${error.message}`];
@@ -2835,6 +3045,10 @@ async function resetRunState() {
 
 async function startRun(payload, admissionToken) {
   await restoreBulkPresetIfNeeded();
+  if (autoResumeTimer) {
+    clearTimeout(autoResumeTimer);
+    autoResumeTimer = null;
+  }
   currentRunToken += 1;
   const runToken = currentRunToken;
   stopRequested = false;
@@ -2977,6 +3191,10 @@ async function resumeRun(payload = {}, admissionToken) {
 async function stopRun() {
   if (!isBusyPhase(runState.phase)) {
     return { ok: true, alreadyStopped: true, state: cloneState() };
+  }
+  if (autoResumeTimer) {
+    clearTimeout(autoResumeTimer);
+    autoResumeTimer = null;
   }
   stopRequested = true;
   runState.phase = 'stopping';
