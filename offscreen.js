@@ -596,6 +596,58 @@ async function resetFfmpeg() {
 
   ffmpeg = null;
   ffmpegLoadPromise = null;
+  ffmpegOpsSinceRecycle = 0;
+}
+
+// The wasm core runs every job synchronously inside its worker, so a job that wedges - the 16:00
+// run sat on one file for hours after the browser had been up for a long session - never answers
+// again and its promise never settles: the mutex chain stays blocked and each later file queues
+// behind a dead call, which reads as a batch frozen on one file. Two defences: a watchdog that
+// gives up on the instance and settles the promise, and periodic recycling so a long batch never
+// piles all of its work into one worker.
+const FFMPEG_RECYCLE_EVERY = 20;
+let ffmpegOpsSinceRecycle = 0;
+
+async function recycleFfmpeg(reason) {
+  ffmpegOpsSinceRecycle = 0;
+  const instance = ffmpeg;
+  ffmpeg = null;
+  ffmpegLoadPromise = null;
+  if (instance) {
+    try {
+      instance.terminate();
+    } catch (_) {}
+  }
+  phase0.record({ type: 'ffmpeg_recycle', reason: String(reason || '') });
+}
+
+async function runFfmpegOp(label, budgetMs, taskFn) {
+  await ensureFfmpegLoaded();
+  if (ffmpegOpsSinceRecycle >= FFMPEG_RECYCLE_EVERY) {
+    await recycleFfmpeg('periodic');
+    await ensureFfmpegLoaded();
+  }
+  ffmpegOpsSinceRecycle += 1;
+
+  const EXPIRED = Symbol('ffmpeg-expired');
+  let timer = null;
+  try {
+    const outcome = await Promise.race([
+      taskFn(),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(EXPIRED), Math.max(5000, Number(budgetMs) || 0));
+      }),
+    ]);
+    if (outcome === EXPIRED) {
+      await recycleFfmpeg(`${label} did not answer`);
+      throw new Error(`${label} timeout after ${Math.round((Number(budgetMs) || 0) / 1000)}s (ffmpeg instance discarded)`);
+    }
+    return outcome;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function escapeRegExp(value) {
@@ -649,6 +701,10 @@ async function blobToDataUrl(blob) {
 }
 
 async function encodeMp3(inputPath, outputPath, args, timeoutMs = 180000) {
+  return runFfmpegOp('encode', timeoutMs + 20000, () => encodeMp3Unsafe(inputPath, outputPath, args, timeoutMs));
+}
+
+async function encodeMp3Unsafe(inputPath, outputPath, args, timeoutMs = 180000) {
   // Принудительно 44100 Hz mono, чтобы избежать 32000 Hz по дефолту ffmpeg.wasm
   // и рассинхрона с downstream pipeline (ffmpeg ругается "Invalid data" на 32k).
   const normalizedArgs = [...args, '-ar', '44100', '-ac', '1', '-c:a', 'libmp3lame', '-q:a', '2', outputPath];
@@ -684,6 +740,10 @@ async function transcodeFileToMp3(file, fileName, timeoutMs = 180000) {
 }
 
 async function repairConcatenatedMp3(file, timeoutMs = 180000) {
+  return runFfmpegOp('repair', timeoutMs + 20000, () => repairConcatenatedMp3Unsafe(file, timeoutMs));
+}
+
+async function repairConcatenatedMp3Unsafe(file, timeoutMs = 180000) {
   await ensureFfmpegLoaded();
 
   const inputPath = `repair-in-${Date.now()}-${Math.random().toString(16).slice(2)}.mp3`;
@@ -3880,6 +3940,10 @@ function buildChaptersFfmetadata({ audioMs, videoMs }) {
 }
 
 async function muxChaptersInMp4(mp4Bytes, audioMs, videoMs) {
+  return runFfmpegOp('chapters', 150000, () => muxChaptersInMp4Unsafe(mp4Bytes, audioMs, videoMs));
+}
+
+async function muxChaptersInMp4Unsafe(mp4Bytes, audioMs, videoMs) {
   await ensureFfmpegLoaded();
 
   const inPath = `in-${Date.now()}-${Math.random().toString(16).slice(2)}.mp4`;
@@ -4131,6 +4195,10 @@ async function handlePreLoopVideo(payload) {
 
 // Сама pre-loop логика. Возвращает { bytes, repeats, mode, sourceMs, finalMs }.
 async function preLoopVideoMp4(srcBytes, targetMs, sourceMsHint) {
+  return runFfmpegOp('preloop', 300000, () => preLoopVideoMp4Unsafe(srcBytes, targetMs, sourceMsHint));
+}
+
+async function preLoopVideoMp4Unsafe(srcBytes, targetMs, sourceMsHint) {
   await ensureFfmpegLoaded();
 
   const tag = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
