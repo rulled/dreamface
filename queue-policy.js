@@ -141,13 +141,22 @@ export function compareCandidates(a, b, options = {}) {
   return String(a.accountId).localeCompare(String(b.accountId));
 }
 
+// The selector's final choice is the first candidate that fits, in ranked order — the ranking is
+// the single authority. Comparing a rebuilt candidate against the running best with a comparison
+// that lacks the pool context is what let a tier-2 account be picked on the 15:47 run.
+export function pickCandidate(candidates, options = {}) {
+  const requiredSeconds = Number(options.requiredSeconds || 0);
+  const ranked = options.ranked ? candidates : rankCandidates(candidates, options);
+  return (Array.isArray(ranked) ? ranked : []).find((candidate) => candidateCanTake(candidate, requiredSeconds)) || null;
+}
+
 export function rankCandidates(candidates, options = {}) {
   const pool = (Array.isArray(candidates) ? candidates : []).filter(Boolean);
   const context = { ...options, fastestMsPerWork: options.fastestMsPerWork || fastestMsPerWork(pool) };
   return [...pool].sort((a, b) => compareCandidates(a, b, context));
 }
 
-function candidateCanTake(candidate, requiredSeconds) {
+export function candidateCanTake(candidate, requiredSeconds) {
   if (!candidate || candidate.blocked || candidate.unavailable) return false;
   if (Number(candidate.limitSec || 0) < requiredSeconds) return false;
   if (candidate.metered && Number(candidate.remaining || 0) <= 0) return false;
@@ -158,6 +167,9 @@ function candidateCanTake(candidate, requiredSeconds) {
 // metered credits that would spend, what is left, and how long the tail is expected to be.
 export function simulatePlan(units, candidates, options = {}) {
   const pool = (Array.isArray(candidates) ? candidates : []).map((candidate) => ({ ...candidate }));
+  // The simulation must rank exactly like the live selector, which means it needs the same pool
+  // baseline for the slow-account rule.
+  const context = { ...options, fastestMsPerWork: options.fastestMsPerWork || fastestMsPerWork(pool) };
   const assignments = [];
   const deferred = [];
   const byAccount = new Map();
@@ -176,9 +188,9 @@ export function simulatePlan(units, candidates, options = {}) {
       });
       continue;
     }
-    const chosen = rankCandidates(eligible, options)[0];
+    const chosen = rankCandidates(eligible, context)[0];
     chosen.load = Number(chosen.load || 0) + works;
-    chosen.tier = options.tierEnabled === false ? 1 : accountTier(chosen, options);
+    chosen.tier = options.tierEnabled === false ? 1 : accountTier(chosen, context);
     if (chosen.metered) chosen.remaining = Math.max(0, Number(chosen.remaining || 0) - 1);
     assignments.push({ unitId: unit?.id || '', accountId: chosen.accountId, works, requiredSeconds });
     const entry = byAccount.get(chosen.accountId) || {

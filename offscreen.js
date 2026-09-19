@@ -5,7 +5,6 @@ import {
   AUTO_RESUME_MAX_DELAY_MS,
   accountTier,
   autoResumeDelayMs,
-  compareCandidates,
   estimatePlan,
   fastestMsPerWork,
   ipBackoffTriggered,
@@ -1526,6 +1525,42 @@ function refreshProbeCache(accountId, { runningWorks, quota } = {}) {
   };
 }
 
+// Heavy site calls (quota, capabilities) are paced: a cold pool of 11 accounts issuing four
+// requests each in one burst made the site drop some of them, which surfaced as an unknown quota.
+const HEAVY_CALL_LIMIT = 4;
+let heavyCallsInFlight = 0;
+const heavyCallQueue = [];
+
+function withHeavyCallSlot(task) {
+  const run = () => {
+    heavyCallsInFlight += 1;
+    return Promise.resolve()
+      .then(task)
+      .finally(() => {
+        heavyCallsInFlight -= 1;
+        const next = heavyCallQueue.shift();
+        if (next) next();
+      });
+  };
+  if (heavyCallsInFlight < HEAVY_CALL_LIMIT) return run();
+  return new Promise((resolve, reject) => {
+    heavyCallQueue.push(() => run().then(resolve, reject));
+  });
+}
+
+async function readQuotaWithRetry(client) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const quota = await withHeavyCallSlot(() => client.getBatchTimes());
+      if (quota) return quota;
+    } catch (_) {
+      // fall through to the retry
+    }
+    if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return null;
+}
+
 async function probeAccount(binding, accountId) {
   const entry = getProbeCacheEntry(accountId);
   const now = Date.now();
@@ -1546,8 +1581,10 @@ async function probeAccount(binding, accountId) {
       if (!Array.isArray(running?.workIds)) throw new Error('DreamFace running works unavailable');
       return { at: Date.now(), workIds: running.workIds.map(String), quota: null };
     });
-  const quotaPromise = ledger ? Promise.resolve(null) : binding.client.getBatchTimes().catch(() => null);
-  const capsPromise = capsFresh ? Promise.resolve(entry.capabilities) : binding.client.getAccountCapabilities();
+  const quotaPromise = ledger ? Promise.resolve(null) : readQuotaWithRetry(binding.client);
+  const capsPromise = capsFresh
+    ? Promise.resolve(entry.capabilities)
+    : withHeavyCallSlot(() => binding.client.getAccountCapabilities());
 
   const [load, freshQuota, capabilities] = await Promise.all([loadPromise, quotaPromise, capsPromise]);
   entry.load = {
@@ -1630,8 +1667,9 @@ async function selectLeastLoadedAccount(
         accountId,
         load: load.workIds.length,
         quota: load.quota,
-        // read = the site was asked for the counter, ledger/cache = the ledger covered it
-        quotaSource: quotaRead ? 'read' : (cached ? 'cache' : 'ledger'),
+        // read = the site was asked for the counter, ledger/cache = the ledger covered it,
+        // unavailable = it was asked and did not answer (never silently treated as unlimited)
+        quotaSource: quotaRead ? 'read' : (load.quota ? (cached ? 'cache' : 'ledger') : 'unavailable'),
         hasCachedAvatar,
       };
     } catch (error) {
@@ -1648,20 +1686,32 @@ async function selectLeastLoadedAccount(
 
   // The ranking itself lives in queue-policy.js so the plan preview and the live selector can
   // never disagree: backlog tier, then unlimited quota, then credit headroom, then load.
-  const candidates = rankCandidates(probed.filter(Boolean).map((candidate) => {
+  const tierEnabled = featureEnabled('backlogTier');
+  const poolContext = { tierEnabled, fastestMsPerWork: 0 };
+  const mapped = probed.filter(Boolean).map((candidate) => {
     const health = getAccountHealth(candidate.accountId);
+    // Metering follows the *plan* (capabilities), not the counter answer: a premium account whose
+    // quota read failed must stay usable, while a Pro account whose read failed must not spend
+    // credits nobody can account for.
+    const premiumPlan = String(candidate.account?.tier || '') === 'premium';
     return {
       ...candidate,
-      metered: !quotaUnlimited(candidate.quota),
+      metered: !premiumPlan,
+      quotaKnown: Boolean(candidate.quota),
       remaining: Number(candidate.quota?.remaining || 0),
-      // The tier is left to the comparator: it compares each account against the fastest in this
-      // pool, so a slow account is recognised even when its queue looks empty.
       msPerWork: Number(health.drain?.msPerWork || 0),
       drainSamples: Number(health.drain?.samples || 0),
       // Base score for the ordering; the reservation and avatar affinity are applied per unit.
       score: candidate.load,
     };
-  }), { tierEnabled: featureEnabled('backlogTier') });
+  });
+  // The tier is materialised once, against the fastest account in this pool, and then travels with
+  // the candidate: every later comparison sees the same value, context or not.
+  poolContext.fastestMsPerWork = fastestMsPerWork(mapped);
+  for (const candidate of mapped) {
+    candidate.tier = tierEnabled ? accountTier(candidate, poolContext) : 1;
+  }
+  const candidates = rankCandidates(mapped, poolContext);
   lastProbeSnapshot = candidates.map((candidate) => ({
     accountId: candidate.accountId,
     limitSec: Number(candidate.account.maxDurationSeconds || 0),
@@ -1670,9 +1720,10 @@ async function selectLeastLoadedAccount(
     quota: candidate.quota,
     metered: candidate.metered,
     remaining: candidate.remaining,
-    // Every field compareCandidates uses must be here, or the plan would pick differently from
-    // the live selector (the first validation run sent the whole batch to a Pro account).
+    // Every field the ranking uses must be here, or the plan would pick differently from the live
+    // selector (the first validation run sent the whole batch to a Pro account).
     quotaClass: candidate.metered ? 0 : 1,
+    quotaKnown: candidate.quotaKnown,
     msPerWork: candidate.msPerWork,
     drainSamples: candidate.drainSamples,
     hasCachedAvatar: candidate.hasCachedAvatar,
@@ -1739,7 +1790,7 @@ async function selectLeastLoadedAccount(
       quotaClass: built.quotaClass,
       msPerWork: built.msPerWork,
       drainSamples: built.drainSamples,
-      tier: Number.isFinite(built.tier) ? built.tier : accountTier(built, { fastestMsPerWork: fastestMsPerWork(candidates) }),
+      tier: built.tier,
       planned: built.planned,
       baselineLoad: reservation.baselineLoad,
       requiredDurationSeconds,
@@ -1747,8 +1798,9 @@ async function selectLeastLoadedAccount(
       avatarCached: built.hasCachedAvatar,
       fits,
     });
-    if (!fits) continue;
-    if (!selected || compareCandidates(built, selected) < 0) selected = built;
+    // First fitting candidate in the ranked order wins; no second comparison.
+    if (!fits || selected) continue;
+    selected = built;
   }
 
   if (!selected) {

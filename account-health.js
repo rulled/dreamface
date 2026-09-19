@@ -130,10 +130,12 @@ export function normalizeHealthMap(raw) {
   return out;
 }
 
-// The counter only limits accounts whose total is above the premium sentinel.
+// The counter only limits accounts whose total is above the premium sentinel. An unread counter
+// (total 0) is *not* evidence of an unlimited plan: treating it as one let a Pro account with
+// credits left rank like premium and win the pick on the 16:00 run, after a throttled quota read.
 export function quotaUnlimited(quota) {
   const normalized = normalizeQuota(quota);
-  return normalized.total <= QUOTA_SENTINEL_TOTAL;
+  return normalized.total > 0 && normalized.total <= QUOTA_SENTINEL_TOTAL;
 }
 
 export function quotaExhausted(quota) {

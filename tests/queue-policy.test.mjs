@@ -9,6 +9,7 @@ import {
   hasRemainingWork,
   ipBackoffTriggered,
   orderUnitsForDispatch,
+  pickCandidate,
   rankCandidates,
   shouldAutoResume,
   simulatePlan,
@@ -76,7 +77,7 @@ test('ordering does not mutate the incoming plan', () => {
 const account = (accountId, extra = {}) => ({
   accountId,
   limitSec: 600,
-  tier: 1,
+  // tier is intentionally absent: the comparator derives it from the pool
   load: 0,
   metered: false,
   remaining: 1,
@@ -170,6 +171,36 @@ test('an account that turns work around much slower than its peers drops to tier
   const unproven = [account('unknown', { msPerWork: 180000, drainSamples: 1, load: 0 }), account('known', { msPerWork: 15000, drainSamples: 3, load: 0 })];
   assert.deepEqual(rankCandidates(unproven).map((c) => c.accountId), ['known', 'unknown']);
   assert.equal(rankCandidates([account('lonely', { msPerWork: 180000, drainSamples: 3, load: 0 })]).length, 1);
+});
+
+test('the pick is the first fitting candidate in the ranked order, never a slower account', () => {
+  // The 15:47 run: the slow account had the lowest load (score 0) and got promoted by a comparison
+  // that had lost the pool context. The ranked order must decide.
+  const pool = [
+    account('fast-busy', { msPerWork: 30000, drainSamples: 3, load: 4, score: 4 }),
+    account('slow-idle', { msPerWork: 300000, drainSamples: 3, load: 0, score: 0 }),
+  ];
+  const ranked = rankCandidates(pool);
+  assert.equal(ranked[0].accountId, 'fast-busy');
+  assert.equal(pickCandidate(ranked, { requiredSeconds: 10, ranked: true }).accountId, 'fast-busy');
+  assert.equal(pickCandidate(pool, { requiredSeconds: 10 }).accountId, 'fast-busy');
+  // If only the slow account can take the unit, it is used — the tier is a preference, not a ban.
+  assert.equal(pickCandidate(pool, { requiredSeconds: 300 }).accountId, 'fast-busy');
+  assert.equal(pickCandidate([pool[1]], { requiredSeconds: 10 }).accountId, 'slow-idle');
+  assert.equal(pickCandidate(pool, { requiredSeconds: 900 }), null);
+  // An account with no quota left is never picked, however fast it is.
+  const drained = [account('fast-empty', { msPerWork: 20000, drainSamples: 3, metered: true, remaining: 0, quotaClass: 0, load: 0 })];
+  assert.equal(pickCandidate(drained, { requiredSeconds: 10 }), null);
+});
+
+test('an unmeasured metered account is never used, an unmeasured premium one still is', () => {
+  // Metering comes from the plan, so a failed counter read must not block a premium account and
+  // must block a Pro account: nobody can tell how many of its credits a dispatch would spend.
+  const unknownPro = account('pro-unknown', { metered: true, remaining: 0, quotaClass: 0, load: 0 });
+  const unknownPremium = account('premium-unknown', { metered: false, remaining: 0, quotaClass: 1, load: 0 });
+  assert.equal(pickCandidate([unknownPro], { requiredSeconds: 10 }), null);
+  assert.equal(pickCandidate([unknownPremium], { requiredSeconds: 10 }).accountId, 'premium-unknown');
+  assert.deepEqual(rankCandidates([unknownPro, unknownPremium]).map((c) => c.accountId), ['premium-unknown', 'pro-unknown']);
 });
 
 test('the tail forecast follows the observed turnaround of the assigned account', () => {

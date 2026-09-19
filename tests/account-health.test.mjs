@@ -37,6 +37,14 @@ test('garbage normalizes to an idle record and the premium sentinel is not a lim
   assert.equal(quotaExhausted({ total: 10, remaining: 1 }), false);
 });
 
+test('an unread counter is not evidence of an unlimited plan', () => {
+  assert.equal(quotaUnlimited({ total: 0, remaining: 0 }), false, 'never read');
+  assert.equal(quotaUnlimited(null), false);
+  assert.equal(quotaUnlimited(undefined), false);
+  assert.equal(quotaUnlimited({ total: 1, remaining: 1 }), true, 'the premium sentinel');
+  assert.equal(quotaUnlimited({ total: 10, remaining: 4 }), false);
+});
+
 test('a rejected submit with a spent quota does not penalize the account', () => {
   const health = recordBulkRejection(createAccountHealth({ tier: 'pro' }), {
     now: NOW, quota: SPENT, runningWorkIds: ['w1'], random: () => 0,
