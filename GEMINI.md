@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**DreamFace Batch Assistant** (v1.3.0) is a Manifest V3 Chrome Extension designed for operators running bulk avatar video generation across multiple DreamFace accounts. It automates local audio normalization/padding, job dispatch across accounts, status tracking, and result video downloading with chapter markers.
+**DreamFace Batch Assistant** (v1.3.1) is a Manifest V3 Chrome Extension designed for operators running bulk avatar video generation across multiple DreamFace accounts. It automates local audio normalization/padding, job dispatch across accounts, status tracking, and result video downloading with chapter markers.
 
 - **Design Philosophy**: Quiet, direct, utilitarian. Shows clear workflow states (generating, downloading, completed, failed) rather than low-level implementation details.
 - **Repository Type**: Vanilla JavaScript (ES Modules + Classic Extension Scripts) with zero external runtime npm dependencies.

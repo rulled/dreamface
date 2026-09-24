@@ -530,6 +530,16 @@
       color: var(--text-primary);
     }
 
+    .mini-btn.primary {
+      background: var(--text-primary);
+      color: #ffffff;
+    }
+
+    .mini-btn.primary:hover:not(:disabled) {
+      background: rgba(0, 0, 0, 0.85);
+      color: #ffffff;
+    }
+
     .mini-btn:disabled {
       opacity: 0.42;
       cursor: not-allowed;
@@ -1839,32 +1849,32 @@
     <h1 class="sr-only">DreamFace · пакетная обработка аудио</h1>
     <main class="app-shell">
       <div id="setup-view" class="view-container active">
-        <section class="surface intro-surface" aria-labelledby="setupScanTitle">
-          <div class="surface-topline">
-            <div class="surface-heading">
-              <h2 id="setupScanTitle" class="surface-title">Bulk-очередь</h2>
-              <div id="statusText" class="status-text">Сканируйте библиотеку DreamFace, выберите видео для групп и добавьте аудио.</div>
+        <div class="container">
+          <section class="surface intro-surface" aria-labelledby="setupScanTitle">
+            <div class="surface-topline">
+              <div class="surface-heading">
+                <h2 id="setupScanTitle" class="surface-title">Bulk-очередь</h2>
+                <div id="statusText" class="status-text">Сканируйте библиотеку DreamFace, выберите видео для групп и добавьте аудио.</div>
+              </div>
+
+              <div class="toolbar-actions">
+                <button id="scanBtn" class="link-btn">
+                  <svg class="solar-icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"></circle><line x1="17" y1="17" x2="21" y2="21"></line></svg>
+                  <span id="scanBtnLabel">сканировать</span>
+                </button>
+                <button id="uploadVideosBtn" type="button" class="icon-btn" aria-label="добавить видео в DreamFace">
+                  <svg class="solar-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>
+                </button>
+              </div>
             </div>
 
-            <div class="toolbar-actions">
-              <button id="scanBtn" class="link-btn">
-                <svg class="solar-icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"></circle><line x1="17" y1="17" x2="21" y2="21"></line></svg>
-                <span id="scanBtnLabel">сканировать</span>
-              </button>
-              <button id="uploadVideosBtn" type="button" class="icon-btn" aria-label="добавить видео в DreamFace">
-                <svg class="solar-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>
-              </button>
+            <div id="loadingContainer" class="loading-container">
+              <div class="spinner"></div>
+              <div>поиск видео...</div>
             </div>
-          </div>
+          </section>
 
-          <div id="loadingContainer" class="loading-container">
-            <div class="spinner"></div>
-            <div>поиск видео...</div>
-          </div>
-        </section>
-
-        <div id="postScanContainer" class="container post-scan">
-          <section class="surface" aria-labelledby="accountsTitle">
+          <section class="surface accounts-surface" aria-labelledby="accountsTitle">
             <div class="surface-topline">
               <div class="surface-heading">
                 <h2 id="accountsTitle" class="surface-title">Аккаунты DreamFace</h2>
@@ -1872,19 +1882,20 @@
               </div>
               <div class="toolbar-actions">
                 <button id="diagnoseAccountsBtn" type="button" class="mini-btn">проверить</button>
-                <button id="captureAccountBtn" type="button" class="mini-btn">сохранить текущий</button>
+                <button id="captureAccountBtn" type="button" class="mini-btn primary">сохранить текущий</button>
               </div>
             </div>
             <div id="accountsList" class="audio-list"><div class="empty-state">сохранённых аккаунтов нет — используется текущий вход</div></div>
           </section>
 
-          <section class="surface groups-surface">
-            <div id="batchesList"></div>
-            <button id="addBatchBtn" class="dashed-btn">
-              <svg class="solar-icon" viewBox="0 0 24 24"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>
-              добавить группу
-            </button>
-          </section>
+          <div id="postScanContainer" class="container post-scan">
+            <section class="surface groups-surface">
+              <div id="batchesList"></div>
+              <button id="addBatchBtn" class="dashed-btn">
+                <svg class="solar-icon" viewBox="0 0 24 24"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>
+                добавить группу
+              </button>
+            </section>
 
           <section class="surface" aria-labelledby="setupSettingsTitle">
             <h2 id="setupSettingsTitle" class="surface-title">Настройки обработки</h2>
@@ -1953,6 +1964,7 @@
           </div>
         </div>
       </div>
+    </div>
 
       <div id="monitor-view" class="view-container" aria-labelledby="monitorTitle">
         <div class="container">

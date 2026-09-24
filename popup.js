@@ -1047,10 +1047,6 @@ async function restorePersistedSetup() {
 
 async function performScan({ silent = false } = {}) {
   const tab = await getActiveTab();
-  if (!tab?.id) {
-    if (!silent) statusText.textContent = 'активная вкладка не найдена';
-    return false;
-  }
 
   loadingContainer.classList.add('active');
   scanBtn.disabled = true;
@@ -1059,16 +1055,47 @@ async function performScan({ silent = false } = {}) {
   }
   if (!silent) statusText.textContent = '';
 
-  const response = await new Promise((resolve) => {
-    chrome.tabs.sendMessage(tab.id, { action: 'scanBulkAvatars' }, (scanResponse) => {
-      if (chrome.runtime.lastError) {
-        resolve({ ok: false, error: chrome.runtime.lastError.message });
-        return;
-      }
+  let scanResult = null;
+  let lastScanError = '';
 
-      resolve({ ok: true, data: scanResponse });
+  // 1. Попробовать запросить через активную вкладку (если она открыта на DreamFace)
+  if (tab?.id) {
+    const tabResponse = await new Promise((resolve) => {
+      chrome.tabs.sendMessage(tab.id, { action: 'scanBulkAvatars' }, (scanResponse) => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+
+        resolve({ ok: true, data: scanResponse });
+      });
     });
-  });
+
+    if (tabResponse.ok && tabResponse.data?.ok && Array.isArray(tabResponse.data.videos)) {
+      scanResult = tabResponse.data;
+    } else {
+      lastScanError = tabResponse.data?.error || tabResponse.error || '';
+    }
+  }
+
+  // 2. Fallback на background relay (использует каноническую вкладку Creations с активной сессией)
+  if (!scanResult) {
+    const relayResponse = await chrome.runtime.sendMessage({
+      action: 'dfBulkOp',
+      op: 'listAvatars',
+      payload: {},
+    }).catch((err) => ({ ok: false, error: err.message }));
+
+    if (relayResponse?.ok && Array.isArray(relayResponse.data?.avatars)) {
+      scanResult = {
+        ok: true,
+        videos: relayResponse.data.avatars,
+        accountId: relayResponse.data.accountId || '',
+      };
+    } else if (!lastScanError) {
+      lastScanError = relayResponse?.error || '';
+    }
+  }
 
   loadingContainer.classList.remove('active');
   scanBtn.disabled = false;
@@ -1076,8 +1103,10 @@ async function performScan({ silent = false } = {}) {
     uploadVideosBtn.disabled = false;
   }
 
-  if (!response.ok || !response.data?.ok || !Array.isArray(response.data.videos)) {
-    if (!silent) statusText.textContent = response.data?.error || 'видео не найдены. откройте Avatar или Creation в DreamFace';
+  if (!scanResult || !Array.isArray(scanResult.videos)) {
+    if (!silent) {
+      statusText.textContent = lastScanError || 'видео не найдены. войдите в DreamFace на странице Avatar или Creation';
+    }
     return false;
   }
 
@@ -2066,15 +2095,40 @@ addBatchBtn.addEventListener('click', addNewBatch);
 
 captureAccountBtn?.addEventListener('click', async () => {
   captureAccountBtn.disabled = true;
-  const captured = await chrome.runtime.sendMessage({ action: 'dfCaptureAccount' }).catch((error) => ({ ok: false, error: error.message }));
+  statusText.textContent = 'сохраняем аккаунт...';
+
+  let captured = null;
+  // Сначала проверяем активную вкладку: если пользователь залогинен в ней, берем сессию напрямую
+  const tab = await getActiveTab();
+  if (tab?.id && isDreamFaceUrl(tab.url)) {
+    captured = await new Promise((resolve) => {
+      chrome.tabs.sendMessage(tab.id, { action: 'dfCaptureAccount' }, (res) => {
+        if (chrome.runtime.lastError || !res?.hasAuth) resolve(null);
+        else resolve(res);
+      });
+    });
+  }
+
+  // Если с активной вкладки не получено — запрашиваем через background relay
+  if (!captured?.hasAuth) {
+    captured = await chrome.runtime.sendMessage({ action: 'dfCaptureAccount' }).catch((error) => ({ ok: false, error: error.message }));
+  }
+
   if (!captured?.hasAuth || !captured?.sessionRaw) {
     statusText.textContent = captured?.error || 'войдите в DreamFace на странице Avatar или Creation';
     captureAccountBtn.disabled = false;
     return;
   }
+
   const saved = await chrome.runtime.sendMessage({ action: 'dfSaveAccount', account: captured }).catch((error) => ({ ok: false, error: error.message }));
-  statusText.textContent = saved?.ok ? 'аккаунт сохранён' : (saved?.error || 'не удалось сохранить аккаунт');
-  if (saved?.ok) renderAccounts(saved.accounts);
+  if (saved?.ok) {
+    const rawIdentity = captured.thirdId || captured.userId || captured.accountId || '';
+    const label = String(rawIdentity).includes('@') ? String(rawIdentity).replace(/^(.{3}).*(@.*)$/, '$1***$2') : rawIdentity;
+    statusText.textContent = `аккаунт ${label ? `(${label}) ` : ''}сохранён в базу`;
+    renderAccounts(saved.accounts);
+  } else {
+    statusText.textContent = saved?.error || 'не удалось сохранить аккаунт';
+  }
   captureAccountBtn.disabled = false;
 });
 
