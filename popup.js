@@ -1047,6 +1047,10 @@ async function restorePersistedSetup() {
 
 async function performScan({ silent = false } = {}) {
   const tab = await getActiveTab();
+  if (!tab?.id) {
+    if (!silent) statusText.textContent = 'активная вкладка не найдена';
+    return false;
+  }
 
   loadingContainer.classList.add('active');
   scanBtn.disabled = true;
@@ -1055,47 +1059,16 @@ async function performScan({ silent = false } = {}) {
   }
   if (!silent) statusText.textContent = '';
 
-  let scanResult = null;
-  let lastScanError = '';
+  const response = await new Promise((resolve) => {
+    chrome.tabs.sendMessage(tab.id, { action: 'scanBulkAvatars' }, (scanResponse) => {
+      if (chrome.runtime.lastError) {
+        resolve({ ok: false, error: chrome.runtime.lastError.message });
+        return;
+      }
 
-  // 1. Попробовать запросить через активную вкладку (если она открыта на DreamFace)
-  if (tab?.id) {
-    const tabResponse = await new Promise((resolve) => {
-      chrome.tabs.sendMessage(tab.id, { action: 'scanBulkAvatars' }, (scanResponse) => {
-        if (chrome.runtime.lastError) {
-          resolve({ ok: false, error: chrome.runtime.lastError.message });
-          return;
-        }
-
-        resolve({ ok: true, data: scanResponse });
-      });
+      resolve({ ok: true, data: scanResponse });
     });
-
-    if (tabResponse.ok && tabResponse.data?.ok && Array.isArray(tabResponse.data.videos)) {
-      scanResult = tabResponse.data;
-    } else {
-      lastScanError = tabResponse.data?.error || tabResponse.error || '';
-    }
-  }
-
-  // 2. Fallback на background relay (использует каноническую вкладку Creations с активной сессией)
-  if (!scanResult) {
-    const relayResponse = await chrome.runtime.sendMessage({
-      action: 'dfBulkOp',
-      op: 'listAvatars',
-      payload: {},
-    }).catch((err) => ({ ok: false, error: err.message }));
-
-    if (relayResponse?.ok && Array.isArray(relayResponse.data?.avatars)) {
-      scanResult = {
-        ok: true,
-        videos: relayResponse.data.avatars,
-        accountId: relayResponse.data.accountId || '',
-      };
-    } else if (!lastScanError) {
-      lastScanError = relayResponse?.error || '';
-    }
-  }
+  });
 
   loadingContainer.classList.remove('active');
   scanBtn.disabled = false;
@@ -1103,10 +1076,13 @@ async function performScan({ silent = false } = {}) {
     uploadVideosBtn.disabled = false;
   }
 
-  if (!scanResult || !Array.isArray(scanResult.videos)) {
-    if (!silent) {
-      statusText.textContent = lastScanError || 'видео не найдены. войдите в DreamFace на странице Avatar или Creation';
-    }
+  if (!response.ok || !response.data?.ok || !Array.isArray(response.data.videos)) {
+    const errorMsg = response.error
+      ? (response.error.includes('Receiving end does not exist')
+          ? 'обновите страницу DreamFace (F5) и нажмите «сканировать»'
+          : response.error)
+      : (response.data?.error || 'видео не найдены. войдите в DreamFace на странице Avatar или Creation');
+    if (!silent) statusText.textContent = errorMsg;
     return false;
   }
 
@@ -2097,25 +2073,28 @@ captureAccountBtn?.addEventListener('click', async () => {
   captureAccountBtn.disabled = true;
   statusText.textContent = 'сохраняем аккаунт...';
 
-  let captured = null;
-  // Сначала проверяем активную вкладку: если пользователь залогинен в ней, берем сессию напрямую
   const tab = await getActiveTab();
-  if (tab?.id && isDreamFaceUrl(tab.url)) {
-    captured = await new Promise((resolve) => {
-      chrome.tabs.sendMessage(tab.id, { action: 'dfCaptureAccount' }, (res) => {
-        if (chrome.runtime.lastError || !res?.hasAuth) resolve(null);
-        else resolve(res);
-      });
-    });
+  if (!tab?.id || !isDreamFaceUrl(tab.url)) {
+    statusText.textContent = 'откройте вкладку DreamFace с нужным аккаунтом';
+    captureAccountBtn.disabled = false;
+    return;
   }
 
-  // Если с активной вкладки не получено — запрашиваем через background relay
-  if (!captured?.hasAuth) {
-    captured = await chrome.runtime.sendMessage({ action: 'dfCaptureAccount' }).catch((error) => ({ ok: false, error: error.message }));
-  }
+  const captured = await new Promise((resolve) => {
+    chrome.tabs.sendMessage(tab.id, { action: 'dfCaptureAccount' }, (res) => {
+      if (chrome.runtime.lastError) {
+        resolve({ ok: false, error: chrome.runtime.lastError.message });
+        return;
+      }
+      resolve(res || { ok: false, error: 'не удалось получить сессию со страницы' });
+    });
+  });
 
   if (!captured?.hasAuth || !captured?.sessionRaw) {
-    statusText.textContent = captured?.error || 'войдите в DreamFace на странице Avatar или Creation';
+    const errorMsg = captured?.error?.includes('Receiving end does not exist')
+      ? 'обновите страницу DreamFace (F5) и нажмите «сохранить»'
+      : (captured?.error || 'войдите в DreamFace на этой странице');
+    statusText.textContent = errorMsg;
     captureAccountBtn.disabled = false;
     return;
   }
