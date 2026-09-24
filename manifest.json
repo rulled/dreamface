@@ -64,9 +64,7 @@
     {
       "resources": [
         "injected.js",
-        "media-transform.js",
-        "vendor/ffmpeg/*",
-        "vendor/mediabunny/*"
+        "vendor/ffmpeg/*"
       ],
       "matches": [
         "https://dreamfaceapp.com/*",

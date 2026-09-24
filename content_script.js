@@ -87,7 +87,6 @@ const SUBMIT_META_STORAGE_WORK = 'dreamfaceSubmitMetaByWork';
 const SUBMIT_META_MAX_ENTRIES = 5000;
 const PADDED_VIDEO_MARKERS_KEY = 'dreamfacePaddedVideoMarkers';
 const AVATAR_BORDER_PX = 64;
-let mediaTransformModulePromise = null;
 
 const processingSettingsHydrationPromise = Promise.resolve();
 
@@ -790,18 +789,6 @@ async function markPaddedVideoSource(source, borderCropPx = AVATAR_BORDER_PX) {
   if (!response?.ok) {
     throw new Error(response?.error || 'не удалось сохранить маркер защитной полосы');
   }
-}
-
-async function createPaddedVideoFile(file, current, total) {
-  sendVideoUploadProgress(`[${current}/${total}] добавление защитной полосы ${file.name}`, current, total, file.name);
-  mediaTransformModulePromise ||= import(chrome.runtime.getURL('media-transform.js'));
-  const { transformMp4 } = await mediaTransformModulePromise;
-  const result = await transformMp4(await file.arrayBuffer(), { padLeftPx: AVATAR_BORDER_PX });
-  const baseName = file.name.replace(/\.[^.]+$/, '') || `video-${Date.now()}`;
-  return new File([result.bytes], `${baseName}-border-${AVATAR_BORDER_PX}.mp4`, {
-    type: 'video/mp4',
-    lastModified: file.lastModified || Date.now(),
-  });
 }
 
 function sendVideoUploadProgress(text, current = 0, total = 0, fileName = '') {
@@ -3523,7 +3510,7 @@ async function pickFilesForDreamFaceUpload(input) {
   });
 }
 
-async function startMultiVideoUploadPicker({ addBorderEnabled = false } = {}) {
+async function startMultiVideoUploadPicker() {
   if (videoUploadJobActive) {
     throw new Error('загрузка видео уже выполняется');
   }
@@ -3560,17 +3547,9 @@ async function startMultiVideoUploadPicker({ addBorderEnabled = false } = {}) {
     for (let index = 0; index < files.length; index += 1) {
       const file = files[index];
       try {
-        const uploadFile = addBorderEnabled
-          ? await createPaddedVideoFile(file, index + 1, files.length)
-          : file;
-        const uploadResult = await uploadSingleVideoToDreamFace(uploadFile, index + 1, files.length, {
-          identifySource: addBorderEnabled,
+        await uploadSingleVideoToDreamFace(file, index + 1, files.length, {
+          identifySource: false,
         });
-        if (addBorderEnabled) {
-          await markPaddedVideoSource(uploadResult.uploadedSource).catch((error) => {
-            failures.push(`${file.name}: видео загружено, но маркер полосы не сохранён: ${error.message || String(error)}`);
-          });
-        }
         uploadedCount += 1;
       } catch (error) {
         failures.push(`${file.name}: ${error.message || String(error)}`);
@@ -4016,7 +3995,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'startMultiVideoUploadPicker') {
-    startMultiVideoUploadPicker({ addBorderEnabled: request.addBorderEnabled === true }).catch((error) => {
+    startMultiVideoUploadPicker().catch((error) => {
       sendVideoUploadCompleted({
         canceled: false,
         uploadedCount: 0,

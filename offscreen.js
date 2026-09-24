@@ -51,7 +51,6 @@ const TERMINAL_WATCH_STATUSES = new Set([
 
 let ffmpeg = null;
 let ffmpegLoadPromise = null;
-let mediaTransformModulePromise = null;
 let runState = createIdleRunState();
 let currentRunToken = 0;
 let stopRequested = false;
@@ -785,17 +784,6 @@ function blobToRuntimeFile(blob, name, lastModified = Date.now()) {
   return new File([blob], name, {
     type: blob.type || MP3_MIME,
     lastModified,
-  });
-}
-
-async function addLeftBorderToVideo(file) {
-  mediaTransformModulePromise ||= import(chrome.runtime.getURL('media-transform.js'));
-  const { transformMp4 } = await mediaTransformModulePromise;
-  const result = await transformMp4(await file.arrayBuffer(), { padLeftPx: 64 });
-  const mp4Name = `${normalizeFileNameStem(file.name)}.mp4`;
-  return new File([result.bytes], mp4Name, {
-    type: 'video/mp4',
-    lastModified: file.lastModified || Date.now(),
   });
 }
 
@@ -3758,7 +3746,7 @@ async function startRun(payload, admissionToken) {
         estimates: runState.plan.estimates,
         assignments: runState.plan.assignments.slice(0, 60),
       });
-      setStatusText(runState.planSummary);
+      setStatusText('отправка…');
     }
     runState.summary = summary;
     runState.queuePlan = dispatchQueue.map((item) => ({ ...item }));

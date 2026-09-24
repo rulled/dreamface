@@ -1,3 +1,17 @@
+import {
+  clearAudioRecords,
+  clearSetupSnapshot,
+  collectAudioIds,
+  deleteAudioRecords,
+  hydrateSetupState,
+  loadStoredAudioRecords,
+  putAudioRecord,
+  readSetupSnapshot,
+  serializeSetupState,
+  videoIdentity,
+  writeSetupSnapshot,
+} from './setup-state.js';
+
 const SETTINGS_KEY = 'audioProcessingSettings';
 const RUN_DB_NAME = 'dreamface-run-db';
 const RUN_DB_VERSION = 4;
@@ -9,7 +23,6 @@ const DEFAULT_SETTINGS = {
   autoNormalize: true,
   overlapEnabled: false,
   preLoopEnabled: false,
-  addBorderEnabled: false,
   maxDurationSeconds: DEFAULT_MAX_DURATION_SECONDS,
 };
 const MAX_AUDIO_PREVIEW_ITEMS = 5;
@@ -25,6 +38,12 @@ let downloadsState = [];
 let savedAccounts = [];
 let monitorRefreshTimer = null;
 let settingsSavePromise = Promise.resolve();
+// Snapshot of the queue builder. Audio ids already written to IndexedDB are tracked here so a
+// save only ever uploads the files that are new; saves are serialized so a fast click sequence
+// cannot write an older selection over a newer one.
+let persistedAudioIds = new Set();
+let setupPersistPromise = Promise.resolve();
+let setupLibraryRestored = false;
 let latestActiveTabContext = {
   id: null,
   url: '',
@@ -50,8 +69,6 @@ const autoNormalizeToggle = document.getElementById('autoNormalizeToggle');
 const overlapToggle = document.getElementById('overlapToggle');
 const overlapSubtitle = document.getElementById('overlapSubtitle');
 const preLoopToggle = document.getElementById('preLoopToggle');
-const addBorderToggle = document.getElementById('addBorderToggle');
-const addBorderSubtitle = document.getElementById('addBorderSubtitle');
 const captureAccountBtn = document.getElementById('captureAccountBtn');
 const diagnoseAccountsBtn = document.getElementById('diagnoseAccountsBtn');
 const accountsList = document.getElementById('accountsList');
@@ -304,14 +321,6 @@ function updateAudioModeCopy() {
   overlapSubtitle.textContent = `добавляет перекрытие при нарезке аудио длиннее ${maxDurationSeconds} секунд`;
 }
 
-function updateBorderModeCopy() {
-  if (addBorderSubtitle && addBorderToggle) {
-    addBorderSubtitle.textContent = addBorderToggle.checked
-      ? 'вкл. загружает в DreamFace видео с полосой слева'
-      : 'выкл. загружает исходное видео без дополнительной полосы';
-  }
-}
-
 function renderAccounts(accounts) {
   savedAccounts = Array.isArray(accounts) ? accounts : [];
   if (!accountsList) return;
@@ -378,17 +387,6 @@ async function loadAccounts() {
 function updateScanButtonLabel() {
   if (scanBtnLabel) {
     scanBtnLabel.textContent = foundVideos.length > 0 ? 'пересканировать' : 'сканировать';
-  }
-}
-
-function getVideoIdentity(source) {
-  try {
-    const url = new URL(source);
-    url.search = '';
-    url.hash = '';
-    return url.href;
-  } catch {
-    return String(source || '');
   }
 }
 
@@ -534,6 +532,8 @@ function resetSetupState() {
   if (monitorHeadlineOf) monitorHeadlineOf.textContent = 'из 0';
   postScanContainer.style.display = 'none';
   loadingContainer.classList.remove('active');
+  setupLibraryRestored = false;
+  clearPersistedSetup();
   updateResumeButton(null);
   updateScanButtonLabel();
   updateTotalStats();
@@ -944,10 +944,111 @@ function renderMonitorVisual(state) {
   `;
 }
 
-async function performScan() {
+function ensureAudioFileId(file) {
+  if (!file.setupAudioId) {
+    file.setupAudioId = `audio-${crypto.randomUUID()}`;
+  }
+  return file.setupAudioId;
+}
+
+function createRestoredAudioFile(record) {
+  const file = new File([record.blob], record.name, {
+    type: record.type || 'application/octet-stream',
+    lastModified: Number(record.lastModified) || Date.now(),
+  });
+  // Keep the stored id so the next save reuses the blob instead of uploading it again.
+  file.setupAudioId = record.id;
+  return file;
+}
+
+async function saveSetupSnapshot() {
+  const snapshot = serializeSetupState({ videos: foundVideos, batches, audioIdOf: ensureAudioFileId });
+
+  if (snapshot.batches.length === 0) {
+    persistedAudioIds = new Set();
+    await clearAudioRecords().catch(() => {});
+    await clearSetupSnapshot(chrome.storage.local).catch(() => {});
+    return;
+  }
+
+  const referenced = collectAudioIds(snapshot);
+  for (const batch of batches) {
+    for (const file of batch.audioFiles || []) {
+      const id = ensureAudioFileId(file);
+      if (!referenced.has(id) || persistedAudioIds.has(id)) continue;
+      try {
+        await putAudioRecord({
+          id,
+          name: file.name,
+          type: file.type || 'application/octet-stream',
+          lastModified: Number(file.lastModified) || Date.now(),
+          size: Number(file.size) || 0,
+          blob: file,
+        });
+        persistedAudioIds.add(id);
+      } catch (error) {
+        console.warn('[popup] setup audio save failed', error);
+      }
+    }
+  }
+
+  const orphaned = [...persistedAudioIds].filter((id) => !referenced.has(id));
+  if (orphaned.length > 0) {
+    await deleteAudioRecords(orphaned).catch(() => {});
+    orphaned.forEach((id) => persistedAudioIds.delete(id));
+  }
+
+  await writeSetupSnapshot(chrome.storage.local, snapshot);
+}
+
+function persistSetup() {
+  setupPersistPromise = setupPersistPromise
+    .catch(() => {})
+    .then(saveSetupSnapshot)
+    .catch((error) => console.warn('[popup] setup persist failed', error));
+  return setupPersistPromise;
+}
+
+function clearPersistedSetup() {
+  setupPersistPromise = setupPersistPromise
+    .catch(() => {})
+    .then(async () => {
+      persistedAudioIds = new Set();
+      await clearAudioRecords().catch(() => {});
+      await clearSetupSnapshot(chrome.storage.local).catch(() => {});
+    });
+  return setupPersistPromise;
+}
+
+async function restorePersistedSetup() {
+  const snapshot = await readSetupSnapshot(chrome.storage.local).catch(() => null);
+  if (!snapshot) return false;
+
+  const records = await loadStoredAudioRecords().catch(() => new Map());
+  const restored = hydrateSetupState(snapshot, { audioRecords: records, makeFile: createRestoredAudioFile });
+  if (restored.videos.length === 0 && restored.batches.length === 0) return false;
+
+  foundVideos = restored.videos;
+  batches = restored.batches;
+  persistedAudioIds = new Set(records.keys());
+  // Indices came from a remembered library, so they must be remapped against a live scan before
+  // anything is submitted by grid position.
+  setupLibraryRestored = batches.some((batch) => batch.selectedIndices.length > 0);
+
+  updateScanButtonLabel();
+  postScanContainer.style.display = foundVideos.length > 0 ? 'flex' : 'none';
+  rerenderBatches();
+  updateTotalStats();
+  statusText.textContent = foundVideos.length > 0
+    ? `восстановлен прошлый выбор: ${foundVideos.length} видео`
+    : 'восстановлен прошлый выбор — нажмите «сканировать», чтобы загрузить библиотеку';
+  return true;
+}
+
+async function performScan({ silent = false } = {}) {
   const tab = await getActiveTab();
   if (!tab?.id) {
-    statusText.textContent = 'активная вкладка не найдена';
+    if (!silent) statusText.textContent = 'активная вкладка не найдена';
     return false;
   }
 
@@ -956,7 +1057,7 @@ async function performScan() {
   if (uploadVideosBtn) {
     uploadVideosBtn.disabled = true;
   }
-  statusText.textContent = '';
+  if (!silent) statusText.textContent = '';
 
   const response = await new Promise((resolve) => {
     chrome.tabs.sendMessage(tab.id, { action: 'scanBulkAvatars' }, (scanResponse) => {
@@ -976,20 +1077,21 @@ async function performScan() {
   }
 
   if (!response.ok || !response.data?.ok || !Array.isArray(response.data.videos)) {
-    statusText.textContent = response.data?.error || 'видео не найдены. откройте Avatar или Creation в DreamFace';
+    if (!silent) statusText.textContent = response.data?.error || 'видео не найдены. откройте Avatar или Creation в DreamFace';
     return false;
   }
 
   const nextVideos = response.data.videos;
-  const nextIndexByIdentity = new Map(nextVideos.map((video, index) => [getVideoIdentity(video.src), index]));
+  const nextIndexByIdentity = new Map(nextVideos.map((video, index) => [videoIdentity(video.src), index]));
   batches.forEach((batch) => {
     batch.selectedIndices = (batch.selectedIndices || [])
-      .map((index) => nextIndexByIdentity.get(getVideoIdentity(foundVideos[index]?.src)))
+      .map((index) => nextIndexByIdentity.get(videoIdentity(foundVideos[index]?.src)))
       .filter((index) => Number.isInteger(index));
     clampBatchVideoPage(batch);
     batch.selectedAvatars = batch.selectedIndices.map((index) => nextVideos[index]).filter(Boolean);
   });
   foundVideos = nextVideos;
+  setupLibraryRestored = false;
   statusText.textContent = `найдено видео: ${foundVideos.length}`;
   postScanContainer.style.display = 'flex';
 
@@ -1000,18 +1102,17 @@ async function performScan() {
     updateTotalStats();
   }
 
+  persistSetup();
   return true;
 }
 
 function saveSettings() {
   updateAudioModeCopy();
-  updateBorderModeCopy();
   const nextSettings = {
     maxDurationSeconds: getSelectedMaxDurationSeconds(),
     autoNormalize: autoNormalizeToggle.checked,
     overlapEnabled: overlapToggle.checked,
     preLoopEnabled: preLoopToggle ? preLoopToggle.checked : false,
-    addBorderEnabled: addBorderToggle ? addBorderToggle.checked : false,
   };
   settingsSavePromise = settingsSavePromise.catch(() => {}).then(() => chrome.storage.local.set({
     [SETTINGS_KEY]: nextSettings,
@@ -1032,12 +1133,14 @@ function addNewBatch() {
   batches.push(batch);
   rerenderBatches();
   updateTotalStats();
+  persistSetup();
 }
 
 function removeBatch(id) {
   batches = batches.filter((batch) => batch.id !== id);
   rerenderBatches();
   updateTotalStats();
+  persistSetup();
 }
 
 function sortAudioBatch(batch) {
@@ -1094,6 +1197,7 @@ function renderVideoGridForBatch(container, batch) {
       batch.selectedAvatars = batch.selectedIndices.map((selectedIndex) => foundVideos[selectedIndex]).filter(Boolean);
       rerenderBatches();
       updateTotalStats();
+      persistSetup();
       // Restore focus after re-render so keyboard users keep their place.
       const restored = document.querySelector(`#batch-${batch.id} .video-item[data-index="${index}"]`);
       if (restored instanceof HTMLElement) {
@@ -1191,7 +1295,7 @@ function renderBatchUI(batch) {
     previous.type = 'button';
     previous.textContent = '‹';
     previous.disabled = batch.videoPage === 0;
-    previous.onclick = () => { batch.videoPage -= 1; rerenderBatches(); };
+    previous.onclick = () => { batch.videoPage -= 1; rerenderBatches(); persistSetup(); };
     const info = document.createElement('div');
     info.className = 'video-page-info';
     info.textContent = `${batch.videoPage + 1}/${totalPages}`;
@@ -1200,7 +1304,7 @@ function renderBatchUI(batch) {
     next.type = 'button';
     next.textContent = '›';
     next.disabled = batch.videoPage >= totalPages - 1;
-    next.onclick = () => { batch.videoPage += 1; rerenderBatches(); };
+    next.onclick = () => { batch.videoPage += 1; rerenderBatches(); persistSetup(); };
     pager.append(previous, info, next);
     videoHead.appendChild(pager);
   }
@@ -1237,6 +1341,7 @@ function renderBatchUI(batch) {
       sortAudioBatch(batch);
     }
     rerenderBatches();
+    persistSetup();
   };
   audioHead.appendChild(sortBtn);
   audioSection.appendChild(audioHead);
@@ -1280,6 +1385,7 @@ function renderBatchUI(batch) {
         }
         rerenderBatches();
         updateTotalStats();
+        persistSetup();
       };
       actions.appendChild(removeAudioBtn);
 
@@ -1300,6 +1406,7 @@ function renderBatchUI(batch) {
     showMoreBtn.onclick = () => {
       batch.audioExpanded = true;
       rerenderBatches();
+      persistSetup();
     };
     audioSection.appendChild(showMoreBtn);
   } else if (batch.audioExpanded && batch.audioFiles.length > MAX_AUDIO_PREVIEW_ITEMS) {
@@ -1310,6 +1417,7 @@ function renderBatchUI(batch) {
     collapseBtn.onclick = () => {
       batch.audioExpanded = false;
       rerenderBatches();
+      persistSetup();
     };
     audioSection.appendChild(collapseBtn);
   }
@@ -1343,6 +1451,7 @@ function renderBatchUI(batch) {
     sortAudioBatch(batch);
     rerenderBatches();
     updateTotalStats();
+    persistSetup();
   };
 
   fileContainer.appendChild(fileBtn);
@@ -1775,19 +1884,15 @@ function deriveCurrentRunModel() {
 function renderCurrentRunMonitor() {
   if (!latestRunState || latestRunState.phase === 'idle') return;
   const model = deriveCurrentRunModel();
+  const inProcessing = Math.max(0, model.stages.sent - model.stages.downloaded - model.stages.failed);
   const labels = [
-    ['sent', 'Всего'],
-    ['processing', 'В обработке'],
-    ['uncertain', 'Уточняется'],
-    ['requiresReview', 'Нужна проверка'],
-    ['ready', 'Готово'],
-    ['downloading', 'Скачивается'],
-    ['downloaded', 'Скачано'],
-    ['failed', 'Ошибки'],
+    ['sent', 'Всего', model.stages.sent],
+    ['processing', 'В обработке', inProcessing],
+    ['downloaded', 'Скачано', model.stages.downloaded],
   ];
-  monitorStages.innerHTML = labels.map(([key, label]) => `
-    <div class="stage-item${key === 'failed' && model.stages.failed ? ' is-error' : ''}${key === 'requiresReview' && model.stages.requiresReview ? ' is-review' : ''}${key === 'uncertain' && model.stages.uncertain ? ' is-uncertain' : ''}">
-      <span class="stage-value">${model.stages[key]}</span>
+  monitorStages.innerHTML = labels.map(([key, label, value]) => `
+    <div class="stage-item">
+      <span class="stage-value">${value}</span>
       <span class="stage-label">${label}</span>
     </div>
   `).join('');
@@ -1845,17 +1950,6 @@ function renderCurrentRunMonitor() {
   if (errorText) {
     notices.push(`<div class="alert-row error" role="alert"><div class="alert-copy"><div class="alert-headline">${escapeHtml(errorText)}</div></div></div>`);
   }
-  // The dispatch plan computed at start: which account takes what, how many metered credits it
-  // costs and what the tail is expected to be. Informational — the run never waits for a click.
-  if (latestRunState.planSummary && !errorText) {
-    notices.push(`
-      <div class="alert-row note" role="status">
-        <div class="alert-copy">
-          <div class="alert-detail multi">${escapeHtml(latestRunState.planSummary)}</div>
-        </div>
-      </div>
-    `);
-  }
   monitorError.innerHTML = notices.join('');
   monitorError.classList.toggle('active', notices.length > 0);
   if (isUserStoppedRun(latestRunState)) {
@@ -1911,12 +2005,11 @@ async function initialize() {
   autoNormalizeToggle.checked = settings.autoNormalize;
   overlapToggle.checked = settings.overlapEnabled;
   if (preLoopToggle) preLoopToggle.checked = Boolean(settings.preLoopEnabled);
-  if (addBorderToggle) addBorderToggle.checked = settings.addBorderEnabled !== false;
   updateAudioModeCopy();
-  updateBorderModeCopy();
   updateScanButtonLabel();
   postScanContainer.style.display = 'none';
   await refreshActiveTabContext({ rerender: false });
+  await restorePersistedSetup();
 
   await chrome.runtime.sendMessage({ action: 'engine.ensure' }).catch(() => {});
   const response = await chrome.runtime.sendMessage({ action: 'engine.getRunState' }).catch(() => null);
@@ -1969,7 +2062,6 @@ durationModeToggle.addEventListener('change', saveSettings);
 autoNormalizeToggle.addEventListener('change', saveSettings);
 overlapToggle.addEventListener('change', saveSettings);
 if (preLoopToggle) preLoopToggle.addEventListener('change', saveSettings);
-if (addBorderToggle) addBorderToggle.addEventListener('change', saveSettings);
 addBatchBtn.addEventListener('click', addNewBatch);
 
 captureAccountBtn?.addEventListener('click', async () => {
@@ -2031,7 +2123,6 @@ uploadVideosBtn?.addEventListener('click', async () => {
   const response = await new Promise((resolve) => {
     chrome.tabs.sendMessage(tab.id, {
       action: 'startMultiVideoUploadPicker',
-      addBorderEnabled: addBorderToggle ? addBorderToggle.checked : false,
     }, (pageResponse) => {
       if (chrome.runtime.lastError) {
         resolve({ ok: false, error: chrome.runtime.lastError.message });
@@ -2054,6 +2145,17 @@ uploadVideosBtn?.addEventListener('click', async () => {
 
 startBtn.addEventListener('click', async () => {
   await settingsSavePromise;
+  // A restored selection refers to grid positions from a remembered library. Re-scan before
+  // submitting so those positions are remapped onto the page's current avatar list.
+  if (setupLibraryRestored && batches.some((batch) => batch.selectedIndices.length > 0)) {
+    statusText.textContent = 'обновляем библиотеку перед запуском…';
+    const refreshed = await performScan({ silent: true });
+    if (!refreshed) {
+      statusText.textContent = 'не удалось обновить библиотеку — откройте DreamFace и нажмите «сканировать»';
+      return;
+    }
+  }
+
   const validBatches = batches
     .filter((batch) => batch.selectedIndices.length > 0 && batch.audioFiles.length > 0)
     .map((batch) => {
@@ -2135,7 +2237,13 @@ startBtn.addEventListener('click', async () => {
     statusText.textContent = response?.error || 'не удалось запустить обработку';
     startBtn.disabled = false;
     showSetup();
+    return;
   }
+
+  // The queue is prepared, so the builder selection is spent: a reopened popup must not offer
+  // to submit the same groups again.
+  setupLibraryRestored = false;
+  clearPersistedSetup();
 });
 
 stopBtn.addEventListener('click', async () => {

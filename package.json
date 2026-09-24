@@ -5,6 +5,6 @@
   "type": "module",
   "description": "Node test harness for the DreamFace Batch Assistant extension scripts (no runtime dependencies).",
   "scripts": {
-    "test": "node --test tests/"
+    "test": "node --test tests/*.test.mjs"
   }
 }

@@ -13,18 +13,18 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const SCRIPT_KINDS = {
   'background.js': 'classic',
-  'popup.js': 'classic',
+  'popup.js': 'module',
   'content_script.js': 'classic',
   'injected.js': 'classic',
   'offscreen.js': 'module',
   'dreamface-api.js': 'module',
-  'media-transform.js': 'module',
   'trace.js': 'module',
   'trace-store.js': 'module',
   'account-health.js': 'module',
   'queue-policy.js': 'module',
   'features.js': 'module',
   'popup-trace.js': 'module',
+  'setup-state.js': 'module',
 };
 
 function readReleaseWhitelist() {
