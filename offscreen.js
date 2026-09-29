@@ -1958,6 +1958,188 @@ async function putOssFileDirect(putUrl, blob, contentType) {
   if (!response.ok) throw new Error(`OSS upload failed: ${response.status}`);
 }
 
+async function getBulkUploadClient() {
+  const accountId = runState.bulkContext?.accountId;
+  if (accountId) {
+    try {
+      const binding = await getAccountBinding(accountId);
+      if (binding?.client) return binding.client;
+    } catch (_) {}
+  }
+  const listed = await callBackground('dfListAccounts');
+  const accounts = Array.isArray(listed?.accounts) ? listed.accounts : [];
+  for (const acc of accounts) {
+    try {
+      const binding = await getAccountBinding(acc.accountId, acc.principalKey);
+      if (binding?.client) return binding.client;
+    } catch (_) {}
+  }
+  throw new Error('нет авторизованного аккаунта для загрузки pre-loop видео в OSS');
+}
+
+async function runBulkPreLoopPhase(batches, audioTasksByBatch, runToken) {
+  const avatarMap = new Map();
+
+  for (const batch of batches) {
+    const audioTasks = audioTasksByBatch.get(batch.id) || [];
+    const videos = batch.selectedAvatars || [];
+    if (videos.length === 0 || audioTasks.length === 0) continue;
+
+    const assigned = videos.map(() => []);
+    for (const audio of audioTasks) {
+      assigned[audio.sourceIndex % videos.length].push(audio);
+    }
+
+    for (let slotIndex = 0; slotIndex < videos.length; slotIndex += 1) {
+      if (assigned[slotIndex].length === 0) continue;
+      const video = videos[slotIndex];
+      const url = String(video?.videoUrl || video?.src || '').trim();
+      if (!url) continue;
+
+      const pageIndex = Number(batch.selectedIndices?.[slotIndex]);
+      const maxAudioMs = Math.max(0, ...assigned[slotIndex].map((a) => Number(a.durationMs || 0)));
+
+      const key = getVideoSourceIdentity(url);
+      if (!avatarMap.has(key)) {
+        avatarMap.set(key, {
+          video,
+          url,
+          pageIndex,
+          maxAudioMs: 0,
+          occurrences: [],
+        });
+      }
+      const entry = avatarMap.get(key);
+      if (maxAudioMs > entry.maxAudioMs) {
+        entry.maxAudioMs = maxAudioMs;
+      }
+      entry.occurrences.push({ batch, slotIndex });
+    }
+  }
+
+  if (avatarMap.size === 0) return;
+
+  let uploadClient = null;
+  let processedCount = 0;
+
+  for (const [key, entry] of avatarMap.entries()) {
+    throwIfStopped(runToken);
+    const { video, url, pageIndex, maxAudioMs, occurrences } = entry;
+    if (maxAudioMs <= 0) continue;
+
+    processedCount += 1;
+    setStatusText(`${ENGINE_STATUS_PREFIX} pre-loop: проверка аватара [${processedCount}/${avatarMap.size}]`);
+    await pushState();
+
+    let sourceMs = 0;
+    try {
+      sourceMs = await readSourceVideoMs(video, pageIndex);
+    } catch (err) {
+      console.warn('[offscreen] preLoop: failed to read source video duration:', err.message);
+    }
+
+    if (sourceMs <= 0) {
+      runState.warnings = [
+        ...runState.warnings,
+        `pre-loop: не удалось узнать длительность видео ${video.name || key}. Эта группа пойдет по стандартному пути.`,
+      ];
+      await pushState();
+      continue;
+    }
+
+    if (sourceMs >= maxAudioMs) {
+      console.log('[offscreen] preLoop: video already >= max audio duration, skipping', {
+        sourceMs, maxAudioMs, videoName: video.name,
+      });
+      continue;
+    }
+
+    const repeats = Math.ceil(maxAudioMs / sourceMs);
+    if (repeats > 30 || maxAudioMs > 600000) {
+      runState.warnings = [
+        ...runState.warnings,
+        `pre-loop: аудио (${Math.round(maxAudioMs / 1000)}с) требует слишком много повторов (${repeats}) для ${video.name || key}. Группа пойдет по стандартному пути.`,
+      ];
+      await pushState();
+      continue;
+    }
+
+    setStatusText(`${ENGINE_STATUS_PREFIX} pre-loop: склейка ${video.name || 'аватара'} (x${repeats}, под ${Math.round(maxAudioMs / 1000)}с)`);
+    await pushState();
+
+    let preLoopResult;
+    try {
+      preLoopResult = await handlePreLoopVideo({
+        sourceUrl: url,
+        targetMs: maxAudioMs,
+        sourceMs,
+      });
+    } catch (err) {
+      console.warn('[offscreen] preLoop handlePreLoopVideo threw:', err.message);
+      preLoopResult = { ok: false, error: err.message };
+    }
+
+    if (!preLoopResult?.ok) {
+      runState.warnings = [
+        ...runState.warnings,
+        `pre-loop: не удалось склеить видео ${video.name || key}: ${preLoopResult?.error || 'неизвестная ошибка'}. Группа пойдет по стандартному пути.`,
+      ];
+      await pushState();
+      continue;
+    }
+
+    setStatusText(`${ENGINE_STATUS_PREFIX} pre-loop: загрузка в OSS ${video.name || 'аватара'}`);
+    await pushState();
+
+    let newFileUrl = '';
+    try {
+      if (!uploadClient) {
+        uploadClient = await getBulkUploadClient();
+      }
+      const fileName = `preloop-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.mp4`;
+      const { putUrl, fileUrl, contentType } = await uploadClient.createPutUrl(fileName, 'video/mp4');
+      const blob = preLoopResult.blob instanceof Blob
+        ? preLoopResult.blob
+        : new Blob([preLoopResult.rawBytes || preLoopResult.bytes], { type: 'video/mp4' });
+      await putOssFileDirect(putUrl, blob, contentType || 'video/mp4');
+      newFileUrl = fileUrl;
+    } catch (uploadErr) {
+      console.warn('[offscreen] preLoop OSS upload failed:', uploadErr.message);
+      runState.warnings = [
+        ...runState.warnings,
+        `pre-loop: не удалось загрузить склеенное видео в OSS: ${uploadErr.message}. Группа пойдет по стандартному пути.`,
+      ];
+      await pushState();
+      continue;
+    }
+
+    console.log('[offscreen] preLoop OSS upload success:', {
+      originalUrl: url.slice(0, 60),
+      newFileUrl: newFileUrl.slice(0, 60),
+      sourceMs,
+      finalMs: preLoopResult.finalMs,
+      repeats: preLoopResult.repeats,
+      mode: preLoopResult.mode,
+    });
+
+    const updatedAvatar = {
+      ...video,
+      videoUrl: newFileUrl,
+      src: video.src || newFileUrl,
+      durationMs: preLoopResult.finalMs,
+      sourceVideoMs: preLoopResult.finalMs,
+      preLooped: true,
+      originalVideoUrl: url,
+    };
+
+    sourceVideoMsCache.set(getVideoSourceIdentity(newFileUrl), preLoopResult.finalMs);
+
+    for (const { batch, slotIndex } of occurrences) {
+      batch.selectedAvatars[slotIndex] = updatedAvatar;
+    }
+  }
+}
+
 async function prepareBulkPlan(payload, runToken) {
   const queue = [];
   const consumedInputIds = [];
@@ -1973,6 +2155,7 @@ async function prepareBulkPlan(payload, runToken) {
   };
   let processedCount = 0;
   let taskIndex = 1;
+  const audioTasksByBatch = new Map();
 
   for (let batchIndex = 0; batchIndex < payload.batches.length; batchIndex += 1) {
     const batch = payload.batches[batchIndex];
@@ -2023,7 +2206,26 @@ async function prepareBulkPlan(payload, runToken) {
       runState.summary = summary;
       await pushState();
     }
+    audioTasksByBatch.set(batch.id, audioTasks);
+  }
 
+  // Pre-loop phase if enabled
+  if (payload.options?.preLoopEnabled) {
+    try {
+      await runBulkPreLoopPhase(payload.batches, audioTasksByBatch, runToken);
+    } catch (preLoopErr) {
+      console.warn('[offscreen] runBulkPreLoopPhase failed:', preLoopErr.message);
+      runState.warnings = [
+        ...runState.warnings,
+        `pre-loop фаза завершилась с ошибкой: ${preLoopErr.message}. Очередь продолжит работу по стандартному пути.`,
+      ];
+      await pushState();
+    }
+  }
+
+  for (let batchIndex = 0; batchIndex < payload.batches.length; batchIndex += 1) {
+    const batch = payload.batches[batchIndex];
+    const audioTasks = audioTasksByBatch.get(batch.id) || [];
     const videos = batch.selectedAvatars || [];
     const assigned = videos.map(() => []);
     for (const audio of audioTasks) {
@@ -2033,13 +2235,16 @@ async function prepareBulkPlan(payload, runToken) {
     for (let slotIndex = 0; slotIndex < videos.length; slotIndex += 1) {
       if (assigned[slotIndex].length === 0) continue;
       const pageIndex = Number(batch.selectedIndices?.[slotIndex]);
+      const currentVideo = videos[slotIndex];
+      const knownSourceMs = Number(currentVideo?.durationMs || currentVideo?.sourceVideoMs || 0) || null;
       queue.push({
         id: `${runState.runId}-bulk-${String(queue.length + 1).padStart(3, '0')}`,
         batchId: batch.id,
         batchIndex,
-        video: videos[slotIndex],
+        video: currentVideo,
         // The index of this avatar in the page grid, so the download can learn the source length.
         videoIndex: Number.isInteger(pageIndex) ? pageIndex : -1,
+        sourceVideoMs: knownSourceMs,
         audios: assigned[slotIndex],
         workIds: [],
         submissionPhase: 'preparing',
@@ -2136,13 +2341,92 @@ function reconcileDuplicateWatchClaims(units) {
 }
 
 // The server fills audio longer than the source video by ping-ponging it (forward videoMs, then
-// reversed videoMs, and so on). Chapter markers are only useful when we know that source length,
-// so the page is asked once per run and per avatar slot: asking per unit would add one round trip
-// for every (audio, avatar) pair of a matrix batch.
+// reversed videoMs, and so on). Chapter markers are only useful when we know that source length.
+// We probe it directly from the video URL in offscreen HTML5 <video> without DOM dependency.
 const sourceVideoMsByRun = new Map();
+const sourceVideoMsCache = new Map();
+const sourceVideoProbePromises = new Map();
 
-async function readSourceVideoMs(videoIndex) {
-  const index = Number(videoIndex);
+async function probeVideoDurationDirect(videoUrl, timeoutMs = 12000) {
+  const url = String(videoUrl || '').trim();
+  if (!url) return 0;
+  const canonical = getVideoSourceIdentity(url);
+  if (sourceVideoMsCache.has(canonical)) {
+    return sourceVideoMsCache.get(canonical);
+  }
+  if (sourceVideoProbePromises.has(canonical)) {
+    return sourceVideoProbePromises.get(canonical);
+  }
+
+  const probePromise = new Promise((resolve) => {
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.muted = true;
+    let settled = false;
+
+    const cleanup = () => {
+      try {
+        video.removeAttribute('src');
+        video.load();
+      } catch (_) {}
+      try {
+        video.remove();
+      } catch (_) {}
+    };
+
+    const finish = (durationSeconds) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      sourceVideoProbePromises.delete(canonical);
+      const s = Number(durationSeconds);
+      if (Number.isFinite(s) && s > 0) {
+        const ms = Math.round(s * 1000);
+        sourceVideoMsCache.set(canonical, ms);
+        resolve(ms);
+      } else {
+        resolve(0);
+      }
+    };
+
+    const timer = setTimeout(() => finish(0), timeoutMs);
+    video.onloadedmetadata = () => finish(video.duration);
+    video.onerror = () => finish(0);
+    video.src = url;
+  });
+
+  sourceVideoProbePromises.set(canonical, probePromise);
+  return probePromise;
+}
+
+async function readSourceVideoMs(videoRef, videoIndex = -1) {
+  if (videoRef && typeof videoRef === 'object') {
+    const directMs = Number(videoRef.durationMs || videoRef.sourceVideoMs);
+    if (Number.isFinite(directMs) && directMs > 0) {
+      return Math.round(directMs);
+    }
+  }
+
+  const url = typeof videoRef === 'string'
+    ? videoRef
+    : String(videoRef?.videoUrl || videoRef?.src || '').trim();
+
+  if (url && /^https?:\/\//i.test(url)) {
+    const canonical = getVideoSourceIdentity(url);
+    if (sourceVideoMsCache.has(canonical)) {
+      return sourceVideoMsCache.get(canonical);
+    }
+    const probed = await probeVideoDurationDirect(url);
+    if (probed > 0) {
+      if (videoRef && typeof videoRef === 'object') {
+        videoRef.durationMs = probed;
+      }
+      return probed;
+    }
+  }
+
+  const index = Number(Number.isInteger(videoIndex) && videoIndex >= 0 ? videoIndex : videoRef);
   if (!runState.tabId || !Number.isInteger(index) || index < 0) {
     return 0;
   }
@@ -2165,7 +2449,9 @@ async function readSourceVideoMs(videoIndex) {
     // The grid may be gone (closed tab, changed page): chapters are then simply not marked.
     ms = 0;
   }
-  sourceVideoMsByRun.set(cacheKey, ms);
+  if (ms > 0) {
+    sourceVideoMsByRun.set(cacheKey, ms);
+  }
   return ms;
 }
 
@@ -2867,7 +3153,7 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
             // Per-work durations, in the same order as expectedFileNames: the results download
             // needs them to mark where the server ping-pongs the source video.
             audioDurationsMs: unit.audios.map((audio) => Math.max(0, Math.round(Number(audio.durationMs || 0)))),
-            sourceVideoMs: await readSourceVideoMs(unit.videoIndex),
+            sourceVideoMs: Number(unit.sourceVideoMs) > 0 ? Number(unit.sourceVideoMs) : await readSourceVideoMs(unit.video, unit.videoIndex),
             submittedAt: unit.submittedAt,
             correlationDeadline: unit.correlationDeadline,
             baselineWorkIds: unit.baselineWorkIds || [],
@@ -3662,6 +3948,8 @@ async function startRun(payload, admissionToken) {
   quotaWaitCount = 0;
 
   sourceVideoMsByRun.clear();
+  sourceVideoMsCache.clear();
+  sourceVideoProbePromises.clear();
   runState = createIdleRunState();
   runState.mode = payload.mode === 'bulk' ? 'bulk' : 'legacy';
   runState.phase = 'preparing';
@@ -4119,7 +4407,8 @@ async function handleMuxOne(payload) {
         outBytes = await withFfmpegMutex(() => muxChaptersInMp4(outBytes, audioMs, videoMs));
         chapters = Math.ceil(audioMs / videoMs);
       } catch (err) {
-        throw new Error(`chapter mux failed: ${err.message}`);
+        console.warn('[offscreen] chapter mux failed, continuing with unmuxed bytes:', err.message);
+        chapters = 0;
       }
     }
     const blob = new Blob([outBytes], { type: 'video/mp4' });
@@ -4153,13 +4442,16 @@ async function handleMuxOne(payload) {
 async function handlePreLoopVideo(payload) {
   const sourceUrl = String(payload?.sourceUrl || '');
   const targetMs = Number(payload?.targetMs);
-  const sourceMsHint = Number(payload?.sourceMs);
+  let sourceMsHint = Number(payload?.sourceMs);
 
   if (!sourceUrl) {
     return { ok: false, error: 'sourceUrl missing' };
   }
   if (!Number.isFinite(targetMs) || targetMs <= 0) {
     return { ok: false, error: 'invalid targetMs' };
+  }
+  if (!Number.isFinite(sourceMsHint) || sourceMsHint <= 0) {
+    sourceMsHint = await probeVideoDurationDirect(sourceUrl).catch(() => 0);
   }
 
   console.log('[offscreen] preLoop start', { sourceUrl: sourceUrl.slice(0, 80), targetMs, sourceMsHint });
@@ -4179,7 +4471,7 @@ async function handlePreLoopVideo(payload) {
   console.log('[offscreen] preLoop source fetched', { bytes: srcBytes.length });
 
   try {
-    const result = await withFfmpegMutex(() => preLoopVideoMp4(srcBytes, targetMs, sourceMsHint));
+    const result = await withFfmpegMutex(() => preLoopVideoMp4(srcBytes, targetMs, sourceMsHint, sourceUrl));
 
     // dreamface режет upload видео где-то в районе 100 MB. если размер
     // pre-loop'ed файла слишком большой — не отдаём blob:URL вообще,
@@ -4206,6 +4498,8 @@ async function handlePreLoopVideo(payload) {
     const blobUrl = URL.createObjectURL(blob);
     return {
       ok: true,
+      blob,
+      rawBytes: result.bytes,
       blobUrl,
       bytes: result.bytes.byteLength,
       repeats: result.repeats,
@@ -4220,11 +4514,11 @@ async function handlePreLoopVideo(payload) {
 }
 
 // Сама pre-loop логика. Возвращает { bytes, repeats, mode, sourceMs, finalMs }.
-async function preLoopVideoMp4(srcBytes, targetMs, sourceMsHint) {
-  return runFfmpegOp('preloop', 300000, () => preLoopVideoMp4Unsafe(srcBytes, targetMs, sourceMsHint));
+async function preLoopVideoMp4(srcBytes, targetMs, sourceMsHint, sourceUrl = '') {
+  return runFfmpegOp('preloop', 300000, () => preLoopVideoMp4Unsafe(srcBytes, targetMs, sourceMsHint, sourceUrl));
 }
 
-async function preLoopVideoMp4Unsafe(srcBytes, targetMs, sourceMsHint) {
+async function preLoopVideoMp4Unsafe(srcBytes, targetMs, sourceMsHint, sourceUrl = '') {
   await ensureFfmpegLoaded();
 
   const tag = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
@@ -4233,10 +4527,10 @@ async function preLoopVideoMp4Unsafe(srcBytes, targetMs, sourceMsHint) {
 
   await ffmpeg.writeFile(inPath, srcBytes);
 
-  // оценка длительности исходника. сначала верим хинту от content_script
-  // (там делается через невидимый <video preload=metadata>, точно).
-  // если хинта нет — пробуем ffprobe-like через ffmpeg.
   let sourceMs = Number(sourceMsHint);
+  if ((!Number.isFinite(sourceMs) || sourceMs <= 0) && sourceUrl) {
+    sourceMs = await probeVideoDurationDirect(sourceUrl).catch(() => 0);
+  }
   if (!Number.isFinite(sourceMs) || sourceMs <= 0) {
     sourceMs = await probeVideoDurationMs(inPath).catch(() => 0);
   }
@@ -4252,12 +4546,15 @@ async function preLoopVideoMp4Unsafe(srcBytes, targetMs, sourceMsHint) {
   // т.е. для repeats=1 → loop=0, для repeats=4 → loop=3.
   const streamLoopArg = String(repeats - 1);
 
-  // === path 1: try stream_copy (быстро, без перекода) ===
+  // === path 1: try stream_copy (быстро, без перекода, без аудио) ===
   const copyArgs = [
     '-y',
     '-stream_loop', streamLoopArg,
     '-i', inPath,
     '-c', 'copy',
+    '-an',
+    '-fflags', '+genpts',
+    '-avoid_negative_ts', 'make_zero',
     '-movflags', '+faststart',
     outPath,
   ];
@@ -4281,11 +4578,7 @@ async function preLoopVideoMp4Unsafe(srcBytes, targetMs, sourceMsHint) {
   await safeDeleteFsFile(outPath);
 
   // === path 2: re-encode ===
-  // libx264 preset=veryfast + CRF=26. ultrafast давал слишком жирный файл
-  // (нет motion estimation → битрейт безумный), и dreamface режет upload
-  // на ~100 MB. veryfast/CRF=26 даёт визуально близкое качество при
-  // 3-5x меньшем размере, при этом всё ещё быстрый (доли секунды на 30s mp4
-  // на m1/intel-десктопе).
+  // libx264 preset=veryfast + CRF=26, scale=-2:min(720,ih), -an (отрезаем аудио)
   const reArgs = [
     '-y',
     '-stream_loop', streamLoopArg,
@@ -4293,9 +4586,9 @@ async function preLoopVideoMp4Unsafe(srcBytes, targetMs, sourceMsHint) {
     '-c:v', 'libx264',
     '-preset', 'veryfast',
     '-crf', '26',
+    '-vf', 'scale=-2:min(720\\,ih)',
     '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac',
-    '-b:a', '128k',
+    '-an',
     '-movflags', '+faststart',
     outPath,
   ];
