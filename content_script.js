@@ -3455,6 +3455,18 @@ function isProbablyVideoFile(file) {
   return type.startsWith('video/')
     || /\.(mp4|mov|webm|avi|mkv|m4v)$/i.test(name);
 }
+async function detectMp4VideoCodec(file) {
+  try {
+    const slice = file.slice(0, 131072);
+    const buf = await slice.arrayBuffer();
+    const str = new TextDecoder('latin1').decode(buf);
+    if (str.includes('avc1')) return 'h264';
+    if (str.includes('av01')) return 'av1';
+    if (str.includes('vp09')) return 'vp9';
+    if (str.includes('hvc1') || str.includes('hev1')) return 'hevc';
+  } catch {}
+  return 'unknown';
+}
 
 async function waitForVideoUploadOutcome(previousCount, file) {
   const timeoutMs = Math.min(120000, getVideoUploadTimeoutMs(file));
@@ -3673,6 +3685,12 @@ async function startMultiVideoUploadPicker() {
       if (file.size > 200 * 1024 * 1024) {
         failures.push(`${file.name}: размер ${sizeMb} МБ превышает максимальный лимит DreamFace (200 МБ)`);
         sendVideoUploadProgress(`[${index + 1}/${files.length}] ошибка: ${file.name} превышает лимит 200 МБ`, index + 1, files.length, file.name);
+        continue;
+      }
+      const codec = await detectMp4VideoCodec(file);
+      if (codec === 'av1' || codec === 'vp9') {
+        failures.push(`${file.name}: неподдерживаемый кодек ${codec.toUpperCase()} (DreamFace требует H.264)`);
+        sendVideoUploadProgress(`[${index + 1}/${files.length}] ошибка: ${file.name} (${codec.toUpperCase()} кодек, нужен H.264)`, index + 1, files.length, file.name);
         continue;
       }
       try {
