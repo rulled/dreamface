@@ -327,12 +327,10 @@
     .video-filter-bar {
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 4px;
       margin-bottom: 8px;
-      overflow-x: auto;
-      padding-bottom: 2px;
+      flex-wrap: nowrap;
     }
-
     .video-filter-bar::-webkit-scrollbar {
       display: none;
     }
@@ -353,7 +351,7 @@
     }
 
     .filter-chip {
-      padding: 3px 8px;
+      padding: 2px 7px;
       font-size: 11px;
       font-weight: 500;
       border-radius: 999px;
@@ -375,21 +373,6 @@
       background: #000000;
       color: #ffffff;
       border-color: #000000;
-    }
-
-    .video-meta-badge {
-      position: absolute;
-      bottom: 4px;
-      left: 4px;
-      padding: 1px 4px;
-      border-radius: 4px;
-      background: rgba(0, 0, 0, 0.65);
-      color: #ffffff;
-      font-size: 9px;
-      font-weight: 600;
-      line-height: 1.2;
-      backdrop-filter: blur(4px);
-      pointer-events: none;
     }
 
     .video-item {

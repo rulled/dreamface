@@ -1205,14 +1205,6 @@ function renderVideoGridForBatch(container, batch) {
     image.alt = '';
     item.appendChild(image);
 
-    const genderSymbol = vid.gender === '女' ? '♀' : (vid.gender === '男' ? '♂' : '');
-    const ageLabel = vid.age === '青年' ? '18-35' : (vid.age === '中年' ? '35-55' : (vid.age === '老年' ? '55+' : ''));
-    if (genderSymbol || ageLabel) {
-      const badge = document.createElement('div');
-      badge.className = 'video-meta-badge';
-      badge.textContent = [genderSymbol, ageLabel].filter(Boolean).join(' · ');
-      item.appendChild(badge);
-    }
 
     const queuePos = batch.selectedIndices.indexOf(index);
     const isSelected = queuePos !== -1;
@@ -1378,7 +1370,7 @@ function renderBatchUI(batch) {
     const femaleBtn = document.createElement('button');
     femaleBtn.type = 'button';
     femaleBtn.className = `filter-chip${batch.genderFilter === '女' ? ' active' : ''}`;
-    femaleBtn.textContent = '♀ Женщины';
+    femaleBtn.textContent = 'Женщины';
     femaleBtn.onclick = () => {
       batch.genderFilter = batch.genderFilter === '女' ? '' : '女';
       batch.videoPage = 0;
@@ -1389,7 +1381,7 @@ function renderBatchUI(batch) {
     const maleBtn = document.createElement('button');
     maleBtn.type = 'button';
     maleBtn.className = `filter-chip${batch.genderFilter === '男' ? ' active' : ''}`;
-    maleBtn.textContent = '♂ Мужчины';
+    maleBtn.textContent = 'Мужчины';
     maleBtn.onclick = () => {
       batch.genderFilter = batch.genderFilter === '男' ? '' : '男';
       batch.videoPage = 0;
