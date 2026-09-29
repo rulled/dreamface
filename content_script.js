@@ -3552,11 +3552,13 @@ async function uploadSingleVideoToDreamFace(file, current, total, { identifySour
   } catch (apiErr) {
     console.warn('[dreamface] Direct API upload failed, evaluating DOM fallback:', apiErr.message);
     const msg = (apiErr.message || '').toLowerCase();
+    if (msg.includes('system error')) {
+      throw new Error(`DreamFace System Error (сервер отклонил файл — неподдерживаемый кодек AV1/VP9, нужен H.264)`);
+    }
     if (msg.includes('face') || msg.includes('not success') || msg.includes('format') || msg.includes('resolution') || msg.includes('too large') || msg.includes('size')) {
       throw apiErr;
     }
   }
-
   return uploadSingleVideoViaDom(file, current, total, { identifySource });
 }
 

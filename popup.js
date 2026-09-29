@@ -2385,7 +2385,7 @@ chrome.runtime.onMessage.addListener((message) => {
       }, 2500);
     }
     if (message.uploadedCount > 0) {
-      const tail = message.failedCount > 0 ? `, ошибок: ${message.failedCount}` : '';
+      const tail = message.failedCount > 0 ? `, ошибок: ${message.failedCount}${message.error ? ` (${message.error})` : ''}` : '';
       statusText.textContent = `загружено в DreamFace: ${message.uploadedCount}${tail}`;
       if (setupView.classList.contains('active')) {
         performScan().catch(() => {});
