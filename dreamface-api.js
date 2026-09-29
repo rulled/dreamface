@@ -9,7 +9,7 @@ const DEFAULT_PT_VOICE_ENGINE = 'onyx-all';
 const PATHS = Object.freeze({
   putUrl: '/dw-server/oss/put_url',
   uploadAudio: '/dw-server/phone_file/upload_audio_with_dir',
-  avatarAdd: '/df-server/avatar/add',
+  avatarAdd: '/df-server/avatar/add_mul',
   avatarList: '/df-server/avatar/list',
   listBatchConfigs: '/dw-server/batch_task/v1/list_avatar_batch_config',
   getBatchConfigDetail: '/dw-server/batch_task/v1/get_avatar_batch_config_detail',
@@ -342,15 +342,13 @@ export function createDreamFaceClient(credentials, options = {}) {
     form.append('user_id', auth.userId);
     form.append('account_id', auth.accountId);
     form.append('url', requiredString(fileUrl, 'fileUrl'));
-    form.append('file_url', requiredString(fileUrl, 'fileUrl'));
     form.append('type', 'VIDEO');
     form.append('support_multi_face', 'true');
-    form.append('face_box', '[0, 0, 0, 0]');
-    form.append('support_head_tracking', 'false');
-    form.append('template_id', '6606889f54e4e700070db4b1');
+    form.append('platform_type', 'WEB');
     const parsed = await postForm(PATHS.avatarAdd, form, 'addAvatar');
-    if (!parsed.avatar?.id) throw new Error('DreamFace addAvatar response is missing avatar.id');
-    return { avatarId: parsed.avatar.id, avatar: parsed.avatar };
+    const avatar = parsed.avatar?.avatars?.[0] || parsed.avatar?.primaryAvatar || parsed.avatar;
+    if (!avatar?.id) throw new Error('DreamFace addAvatar response is missing avatar.id');
+    return { avatarId: avatar.id, avatar };
   }
 
   async function listBatchConfigs(configType = 'SCRIPT') {

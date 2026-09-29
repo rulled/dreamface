@@ -106,7 +106,7 @@
   const BULK_PATHS = {
     putUrl: '/dw-server/oss/put_url',
     uploadAudio: '/dw-server/phone_file/upload_audio_with_dir',
-    avatarAdd: '/df-server/avatar/add',
+    avatarAdd: '/df-server/avatar/add_mul',
     avatarList: '/df-server/avatar/list',
     listBatchConfig: '/dw-server/batch_task/v1/list_avatar_batch_config',
     getBatchConfigDetail: '/dw-server/batch_task/v1/get_avatar_batch_config_detail',
@@ -292,16 +292,13 @@
     form.append('user_id', ctx.userId);
     form.append('account_id', ctx.accountId);
     form.append('url', fileUrl);
-    form.append('file_url', fileUrl);
     form.append('type', 'VIDEO');
     form.append('support_multi_face', 'true');
-    form.append('face_box', '[0, 0, 0, 0]');
-    form.append('support_head_tracking', 'false');
-    form.append('template_id', DEFAULT_TEMPLATE_ID);
+    form.append('platform_type', 'WEB');
     const parsed = await bulkMultipartPost(BULK_PATHS.avatarAdd, form, ctx);
-    const avatar = parsed.avatar;
+    const avatar = parsed.avatar?.avatars?.[0] || parsed.avatar?.primaryAvatar || parsed.avatar;
     if (!avatar || !avatar.id) {
-      throw new Error('avatar/add response missing avatar.id');
+      throw new Error('avatar/add_mul response missing avatar.id');
     }
     invalidateAvatarListCache();
     return { avatarId: avatar.id, avatar };
@@ -319,7 +316,7 @@
       user_id: ctx.userId,
       account_id: ctx.accountId,
       name: '',
-      themes: ['DEFAULT'],
+      themes: ['DEFAULT', 'MULTI'],
     }, ctx);
     const avatars = toBulkAvatars(getAvatarList(parsed));
     if (cacheGeneration === avatarListCacheGeneration) {
