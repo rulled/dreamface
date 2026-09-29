@@ -2134,6 +2134,7 @@ async function runBulkPreLoopPhase(batches, audioTasksByBatch, runToken) {
       src: video.src || newFileUrl,
       durationMs: preLoopResult.finalMs,
       sourceVideoMs: preLoopResult.finalMs,
+      originalSourceMs: sourceMs,
       preLooped: true,
       originalVideoUrl: url,
     };
@@ -2251,6 +2252,8 @@ async function prepareBulkPlan(payload, runToken) {
         // The index of this avatar in the page grid, so the download can learn the source length.
         videoIndex: Number.isInteger(pageIndex) ? pageIndex : -1,
         sourceVideoMs: knownSourceMs,
+        originalSourceMs: Number(currentVideo?.originalSourceMs || 0) || null,
+        preLooped: Boolean(currentVideo?.preLooped || batch.preLoopApplied),
         audios: assigned[slotIndex],
         workIds: [],
         submissionPhase: 'preparing',
@@ -2643,6 +2646,11 @@ async function watchAccountUnits(accountId, units, allAccountUnits) {
         if (!id || !url || enqueued.has(id)) continue;
         const audioMs = Math.max(0, Math.round(Number((unit.audioDurationsMs || [])[index] || 0)));
         const videoMs = Math.max(0, Math.round(Number(unit.sourceVideoMs || 0)));
+        const originalSourceMs = Math.max(0, Math.round(Number(unit.originalSourceMs || 0)));
+        const isPreLooped = Boolean(unit.preLooped && originalSourceMs > 0 && audioMs > originalSourceMs);
+        const effectiveVideoMs = isPreLooped ? originalSourceMs : videoMs;
+        const chapterMode = isPreLooped ? 'loop' : 'pingpong';
+        const hasChapters = Boolean(audioMs > 0 && effectiveVideoMs > 0 && audioMs > effectiveVideoMs);
         queueItems.push({
           workId: id,
           runId: unit.runId || '',
@@ -2652,9 +2660,9 @@ async function watchAccountUnits(accountId, units, allAccountUnits) {
           audioFileName: unit.expectedFileNames[index] || '',
           url,
           audioMs: audioMs || null,
-          videoMs: videoMs || null,
-          // Chapters describe a ping-pong that only exists when the audio outlasts the source.
-          hasChapters: Boolean(audioMs > 0 && videoMs > 0 && audioMs > videoMs),
+          videoMs: effectiveVideoMs || null,
+          chapterMode,
+          hasChapters,
         });
         queueRefs.push({ unit, id });
       }
@@ -3160,6 +3168,8 @@ async function processBulkQueue(queue, runToken, startIndex = 0) {
             // needs them to mark where the server ping-pongs the source video.
             audioDurationsMs: unit.audios.map((audio) => Math.max(0, Math.round(Number(audio.durationMs || 0)))),
             sourceVideoMs: Number(unit.sourceVideoMs) > 0 ? Number(unit.sourceVideoMs) : await readSourceVideoMs(unit.video, unit.videoIndex),
+            originalSourceMs: Number(unit.originalSourceMs || unit.video?.originalSourceMs || 0) || null,
+            preLooped: Boolean(unit.preLooped || unit.video?.preLooped),
             submittedAt: unit.submittedAt,
             correlationDeadline: unit.correlationDeadline,
             baselineWorkIds: unit.baselineWorkIds || [],
@@ -4238,15 +4248,20 @@ function pickDownloadBaseName({ audioFileName, workName, workId }) {
   return String(workId || 'video').trim() || 'video';
 }
 
-function buildChaptersFfmetadata({ audioMs, videoMs }) {
+function buildChaptersFfmetadata({ audioMs, videoMs, chapterMode = 'pingpong' }) {
   const lines = [';FFMETADATA1', 'title=dreamface lipsync'];
   let t = 0;
   let k = 0;
   while (t < audioMs) {
     const segEnd = Math.min(t + videoMs, audioMs);
-    const title = k === 0
-      ? 'forward 1'
-      : (k % 2 ? `reverse ${Math.ceil(k / 2)}` : `forward ${k / 2 + 1}`);
+    let title;
+    if (chapterMode === 'loop') {
+      title = `loop ${k + 1}`;
+    } else {
+      title = k === 0
+        ? 'forward 1'
+        : (k % 2 ? `reverse ${Math.ceil(k / 2)}` : `forward ${k / 2 + 1}`);
+    }
     lines.push('');
     lines.push('[CHAPTER]');
     lines.push('TIMEBASE=1/1000');
@@ -4259,11 +4274,11 @@ function buildChaptersFfmetadata({ audioMs, videoMs }) {
   return lines.join('\n') + '\n';
 }
 
-async function muxChaptersInMp4(mp4Bytes, audioMs, videoMs) {
-  return runFfmpegOp('chapters', 150000, () => muxChaptersInMp4Unsafe(mp4Bytes, audioMs, videoMs));
+async function muxChaptersInMp4(mp4Bytes, audioMs, videoMs, chapterMode = 'pingpong') {
+  return runFfmpegOp('chapters', 150000, () => muxChaptersInMp4Unsafe(mp4Bytes, audioMs, videoMs, chapterMode));
 }
 
-async function muxChaptersInMp4Unsafe(mp4Bytes, audioMs, videoMs) {
+async function muxChaptersInMp4Unsafe(mp4Bytes, audioMs, videoMs, chapterMode = 'pingpong') {
   await ensureFfmpegLoaded();
 
   const inPath = `in-${Date.now()}-${Math.random().toString(16).slice(2)}.mp4`;
@@ -4272,7 +4287,7 @@ async function muxChaptersInMp4Unsafe(mp4Bytes, audioMs, videoMs) {
 
   try {
     await ffmpeg.writeFile(inPath, mp4Bytes);
-    const ffmeta = buildChaptersFfmetadata({ audioMs, videoMs });
+    const ffmeta = buildChaptersFfmetadata({ audioMs, videoMs, chapterMode });
     await ffmpeg.writeFile(metaPath, new TextEncoder().encode(ffmeta));
 
     const code = await ffmpeg.exec([
@@ -4299,8 +4314,8 @@ async function muxChaptersInMp4Unsafe(mp4Bytes, audioMs, videoMs) {
 }
 
 async function downloadOneWithChapters(item) {
-  const { workId, workName, url, audioMs, videoMs, hasChapters, audioFileName } = item;
-  console.log('[offscreen] downloading', { workId, workName, audioFileName, hasChapters, audioMs, videoMs, urlPrefix: url.slice(0, 80) });
+  const { workId, workName, url, audioMs, videoMs, hasChapters, audioFileName, chapterMode = 'pingpong' } = item;
+  console.log('[offscreen] downloading', { workId, workName, audioFileName, hasChapters, chapterMode, audioMs, videoMs, urlPrefix: url.slice(0, 80) });
 
   // Качаем оригинальный mp4
   let response;
@@ -4320,7 +4335,7 @@ async function downloadOneWithChapters(item) {
 
   if (hasChapters && Number.isFinite(audioMs) && Number.isFinite(videoMs) && videoMs > 0) {
     try {
-      finalBytes = await withFfmpegMutex(() => muxChaptersInMp4(buf, audioMs, videoMs));
+      finalBytes = await withFfmpegMutex(() => muxChaptersInMp4(buf, audioMs, videoMs, chapterMode));
       chaptersAdded = Math.ceil(audioMs / videoMs);
       console.log('[offscreen] chapters added', { workId, chaptersAdded, audioMs, videoMs });
     } catch (err) {
@@ -4386,6 +4401,7 @@ async function handleMuxOne(payload) {
   const audioMs = Number(payload?.audioMs);
   const videoMs = Number(payload?.videoMs);
   const hasChapters = Boolean(payload?.hasChapters);
+  const chapterMode = payload?.chapterMode || 'pingpong';
   if (!url && (!buf || (!(buf instanceof ArrayBuffer) && !(buf?.byteLength >= 0)))) {
     return { ok: false, error: 'video source missing' };
   }
@@ -4410,7 +4426,7 @@ async function handleMuxOne(payload) {
     let chapters = 0;
     if (hasChapters && Number.isFinite(audioMs) && Number.isFinite(videoMs) && videoMs > 0 && audioMs > videoMs) {
       try {
-        outBytes = await withFfmpegMutex(() => muxChaptersInMp4(outBytes, audioMs, videoMs));
+        outBytes = await withFfmpegMutex(() => muxChaptersInMp4(outBytes, audioMs, videoMs, chapterMode));
         chapters = Math.ceil(audioMs / videoMs);
       } catch (err) {
         console.warn('[offscreen] chapter mux failed, continuing with unmuxed bytes:', err.message);

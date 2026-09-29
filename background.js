@@ -505,6 +505,7 @@ function dmBuildFingerprint(item) {
       item?.audioFileName || item?.workName || item?.fileName || workId,
     ),
     hasChapters: Boolean(item?.hasChapters),
+    chapterMode: item?.chapterMode || 'pingpong',
     audioMs: dmNormalizeDuration(item?.audioMs),
     videoMs: dmNormalizeDuration(item?.videoMs),
   });
@@ -523,6 +524,7 @@ function dmCreateEntry(item) {
     workName: item.workName || '',
     audioMs: Number.isFinite(item.audioMs) ? Number(item.audioMs) : null,
     videoMs: Number.isFinite(item.videoMs) ? Number(item.videoMs) : null,
+    chapterMode: item.chapterMode || 'pingpong',
     hasChapters: Boolean(item.hasChapters),
     fingerprint: dmBuildFingerprint(item),
     fingerprintVersion: DM_FINGERPRINT_VERSION,
@@ -816,6 +818,7 @@ async function dmEnqueue(items) {
       if (Number.isFinite(item.audioMs)) entry.audioMs = Number(item.audioMs);
       if (Number.isFinite(item.videoMs)) entry.videoMs = Number(item.videoMs);
       entry.hasChapters = Boolean(item.hasChapters);
+      if (item.chapterMode) entry.chapterMode = item.chapterMode;
       entry.fingerprint = fingerprint;
       entry.fingerprintVersion = DM_FINGERPRINT_VERSION;
       entry.pendingReplacement = null;
@@ -956,6 +959,7 @@ async function dmProcess(entry) {
     workId: entry.workId,
     name: entry.audioFileName || entry.workName,
     hasChapters: entry.hasChapters,
+    chapterMode: entry.chapterMode,
     path: requiresProcessing ? 'processed' : 'direct',
   });
 
@@ -976,6 +980,7 @@ async function dmProcess(entry) {
           audioMs: entry.audioMs,
           videoMs: entry.videoMs,
           hasChapters: useChapters,
+          chapterMode: entry.chapterMode || 'pingpong',
           workId: entry.workId,
         },
       });
