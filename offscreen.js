@@ -1952,7 +1952,10 @@ async function restoreBulkPresetIfNeeded() {
 async function putOssFileDirect(putUrl, blob, contentType) {
   const response = await fetch(putUrl, {
     method: 'PUT',
-    headers: { 'Content-Type': contentType },
+    headers: {
+      'Content-Type': contentType,
+      'x-oss-storage-class': 'Standard',
+    },
     body: blob,
   });
   if (!response.ok) throw new Error(`OSS upload failed: ${response.status}`);

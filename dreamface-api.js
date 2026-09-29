@@ -316,7 +316,10 @@ export function createDreamFaceClient(credentials, options = {}) {
     if (!(blob instanceof Blob)) throw new TypeError('putOssFile blob is required');
     const response = await timedFetch(requiredString(putUrl, 'putUrl'), {
       method: 'PUT',
-      headers: { 'Content-Type': requiredString(contentType, 'contentType') },
+      headers: {
+        'Content-Type': requiredString(contentType, 'contentType'),
+        'x-oss-storage-class': 'Standard',
+      },
       body: blob,
     }, uploadTimeoutMs, 'putOssFile');
     if (!response.ok) throw new Error(`DreamFace putOssFile failed with HTTP ${response.status}`);

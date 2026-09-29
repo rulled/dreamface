@@ -250,7 +250,10 @@
   async function bulkPutOssFile(putUrl, blob, contentType) {
     const response = await originalFetch(putUrl, {
       method: 'PUT',
-      headers: { 'Content-Type': contentType },
+      headers: {
+        'Content-Type': contentType,
+        'x-oss-storage-class': 'Standard',
+      },
       body: blob,
       mode: 'cors',
     });
