@@ -2067,12 +2067,15 @@ async function runBulkPreLoopPhase(batches, audioTasksByBatch, runToken) {
     setStatusText(`${ENGINE_STATUS_PREFIX} pre-loop: склейка ${video.name || 'аватара'} (x${repeats}, под ${Math.round(maxAudioMs / 1000)}с)`);
     await pushState();
 
+    const isExtended = Number(runState.maxDurationSeconds) > 180 || maxAudioMs > 180000;
+    const maxUploadBytes = isExtended ? 190 * 1024 * 1024 : 95 * 1024 * 1024;
     let preLoopResult;
     try {
       preLoopResult = await handlePreLoopVideo({
         sourceUrl: url,
         targetMs: maxAudioMs,
         sourceMs,
+        maxUploadBytes,
       });
     } catch (err) {
       console.warn('[offscreen] preLoop handlePreLoopVideo threw:', err.message);
@@ -4477,7 +4480,10 @@ async function handlePreLoopVideo(payload) {
     // pre-loop'ed файла слишком большой — не отдаём blob:URL вообще,
     // вызов runPreLoopPhase увидит ok=false и оставит группу на старом
     // пути (chapter-markers).
-    const MAX_UPLOAD_BYTES = 95 * 1024 * 1024; // 95 MB — запас под лимит
+    const customLimit = Number(payload?.maxUploadBytes);
+    const MAX_UPLOAD_BYTES = Number.isFinite(customLimit) && customLimit > 0
+      ? customLimit
+      : 95 * 1024 * 1024;
     if (result.bytes.byteLength > MAX_UPLOAD_BYTES) {
       console.warn('[offscreen] preLoop blob слишком большой, отдаём ошибку', {
         bytes: result.bytes.byteLength,
@@ -4487,7 +4493,7 @@ async function handlePreLoopVideo(payload) {
       });
       return {
         ok: false,
-        error: `pre-loop файл получился слишком большим: ${Math.round(result.bytes.byteLength / (1024 * 1024))} MB (лимит ~95 MB). видео не залито, группа пойдёт по стандартному пути.`,
+        error: `pre-loop файл получился слишком большим: ${Math.round(result.bytes.byteLength / (1024 * 1024))} MB (лимит ~${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB). видео не залито, группа пойдёт по стандартному пути.`,
         bytes: result.bytes.byteLength,
         repeats: result.repeats,
         mode: result.mode,
