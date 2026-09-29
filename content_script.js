@@ -1494,7 +1494,8 @@ const bulkChannelReady = new Promise((resolve, reject) => {
   const onMessage = (event) => {
     if (!isSameWindowMessage(event)) return;
     const data = event.data;
-    if (!hasExactKeys(data, ['__dfBulkInitAck', 'channelToken'])
+    if (!hasExactKeys(data, ['type', '__dfBulkInitAck', 'channelToken'])
+      || data.type !== 'df-extension'
       || data.__dfBulkInitAck !== true
       || data.channelToken !== DF_BULK_CHANNEL_TOKEN) return;
     cleanup();
@@ -1502,6 +1503,7 @@ const bulkChannelReady = new Promise((resolve, reject) => {
   };
   const announce = () => {
     window.postMessage({
+      type: 'df-extension',
       __dfBulkInit: true,
       channelToken: DF_BULK_CHANNEL_TOKEN,
     }, location.origin);
@@ -1594,9 +1596,9 @@ async function requestBulkOp(op, payload, timeoutMs = 120000) {
         || data.requestId !== requestId
         || typeof data.ok !== 'boolean') return;
       const expectedKeys = data.ok
-        ? ['__dfBulkRes', 'channelToken', 'requestId', 'ok', 'data']
-        : ['__dfBulkRes', 'channelToken', 'requestId', 'ok', 'error'];
-      if (!hasExactKeys(data, expectedKeys) || (!data.ok && typeof data.error !== 'string')) return;
+        ? ['type', '__dfBulkRes', 'channelToken', 'requestId', 'ok', 'data']
+        : ['type', '__dfBulkRes', 'channelToken', 'requestId', 'ok', 'error'];
+      if (!hasExactKeys(data, expectedKeys) || data.type !== 'df-extension' || (!data.ok && typeof data.error !== 'string')) return;
       cleanup();
       if (data.ok) resolve(data.data);
       else reject(new Error(data.error || `bulk op ${op} failed`));
@@ -1604,6 +1606,7 @@ async function requestBulkOp(op, payload, timeoutMs = 120000) {
     window.addEventListener('message', onMessage);
     timer = setTimeout(() => { cleanup(); reject(new Error(`bulk op ${op} timeout`)); }, timeoutMs);
     window.postMessage({
+      type: 'df-extension',
       __dfBulkReq: true,
       channelToken: DF_BULK_CHANNEL_TOKEN,
       requestId,

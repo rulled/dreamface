@@ -671,20 +671,23 @@
   window.addEventListener('message', async (event) => {
     if (!isSameWindowMessage(event)) return;
     const req = event.data;
-    if (hasExactKeys(req, ['__dfBulkInit', 'channelToken'])
+    if (hasExactKeys(req, ['type', '__dfBulkInit', 'channelToken'])
+      && req.type === 'df-extension'
       && req.__dfBulkInit === true
       && typeof req.channelToken === 'string'
       && /^[0-9a-f]{64}$/.test(req.channelToken)) {
       if (!bulkChannelLocked) bulkChannelToken = req.channelToken;
       if (req.channelToken === bulkChannelToken) {
         window.postMessage({
+          type: 'df-extension',
           __dfBulkInitAck: true,
           channelToken: bulkChannelToken,
         }, location.origin);
       }
       return;
     }
-    if (!hasExactKeys(req, ['__dfBulkReq', 'channelToken', 'requestId', 'op', 'payload'])
+    if (!hasExactKeys(req, ['type', '__dfBulkReq', 'channelToken', 'requestId', 'op', 'payload'])
+      || req.type !== 'df-extension'
       || req.__dfBulkReq !== true
       || req.channelToken !== bulkChannelToken
       || typeof req.requestId !== 'string'
@@ -700,6 +703,7 @@
     try {
       const result = await dispatchBulkOp(op, req.payload);
       window.postMessage({
+        type: 'df-extension',
         __dfBulkRes: true,
         channelToken: bulkChannelToken,
         requestId,
@@ -708,6 +712,7 @@
       }, location.origin);
     } catch (error) {
       window.postMessage({
+        type: 'df-extension',
         __dfBulkRes: true,
         channelToken: bulkChannelToken,
         requestId,
