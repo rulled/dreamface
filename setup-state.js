@@ -35,6 +35,8 @@ function toStoredVideo(video) {
     src: String(video?.src || ''),
     name: String(video?.name || ''),
     isDefault: Boolean(video?.isDefault),
+    gender: String(video?.gender || ''),
+    age: String(video?.age || ''),
   };
 }
 
@@ -44,6 +46,8 @@ function toStoredBatch(batch, videos, audioIdOf) {
     videoPage: Math.max(0, Number(batch.videoPage) || 0),
     sortOrder: batch.sortOrder === 'desc' ? 'desc' : 'asc',
     audioExpanded: Boolean(batch.audioExpanded),
+    genderFilter: String(batch.genderFilter || ''),
+    ageFilter: String(batch.ageFilter || ''),
     selectedVideoKeys: (batch.selectedIndices || [])
       .map((index) => videoIdentity(videos[index]?.src))
       .filter(Boolean),
@@ -107,9 +111,10 @@ export function hydrateSetupState(snapshot, { audioRecords, makeFile } = {}) {
       sortOrder: stored.sortOrder === 'desc' ? 'desc' : 'asc',
       audioExpanded: Boolean(stored.audioExpanded),
       videoPage: Math.max(0, Number(stored.videoPage) || 0),
+      genderFilter: String(stored.genderFilter || ''),
+      ageFilter: String(stored.ageFilter || ''),
     };
   });
-
   return { videos, batches };
 }
 

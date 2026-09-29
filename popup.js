@@ -401,22 +401,40 @@ function getBatchSelectedVideoPreviews(batch, limit = 3) {
     .slice(0, limit);
 }
 
-function getVideoPageCount() {
-  return Math.max(1, Math.ceil(foundVideos.length / VIDEO_PAGE_SIZE));
+function getFilteredVideoIndicesForBatch(batch) {
+  const gender = batch?.genderFilter || '';
+  const age = batch?.ageFilter || '';
+  const indices = [];
+
+  for (let i = 0; i < foundVideos.length; i += 1) {
+    const vid = foundVideos[i];
+    if (!vid) continue;
+    if (gender && vid.gender !== gender) continue;
+    if (age && vid.age !== age) continue;
+    indices.push(i);
+  }
+  return indices;
+}
+
+function getVideoPageCount(batch) {
+  const filtered = batch ? getFilteredVideoIndicesForBatch(batch) : foundVideos;
+  return Math.max(1, Math.ceil(filtered.length / VIDEO_PAGE_SIZE));
 }
 
 function clampBatchVideoPage(batch) {
+  const totalPages = getVideoPageCount(batch);
   batch.videoPage = Math.min(
     Math.max(0, Number(batch.videoPage || 0)),
-    Math.max(0, getVideoPageCount() - 1),
+    Math.max(0, totalPages - 1),
   );
 }
 
 function getBatchVideoPageRange(batch) {
   clampBatchVideoPage(batch);
+  const filteredIndices = getFilteredVideoIndicesForBatch(batch);
   const start = batch.videoPage * VIDEO_PAGE_SIZE;
-  const end = Math.min(foundVideos.length, start + VIDEO_PAGE_SIZE);
-  return { start, end };
+  const end = Math.min(filteredIndices.length, start + VIDEO_PAGE_SIZE);
+  return { start, end, filteredIndices };
 }
 
 async function getActiveTab() {
@@ -1138,6 +1156,8 @@ function addNewBatch() {
     sortOrder: 'asc',
     audioExpanded: false,
     videoPage: 0,
+    genderFilter: '',
+    ageFilter: '',
   };
   batches.push(batch);
   rerenderBatches();
@@ -1163,10 +1183,17 @@ function sortAudioBatch(batch) {
 
 function renderVideoGridForBatch(container, batch) {
   container.innerHTML = '';
-  const { start, end } = getBatchVideoPageRange(batch);
+  const { start, end, filteredIndices } = getBatchVideoPageRange(batch);
 
-  foundVideos.slice(start, end).forEach((vid, localIndex) => {
-    const index = start + localIndex;
+  if (filteredIndices.length === 0) {
+    container.innerHTML = '<div class="empty-state">нет видео, подходящих под выбранный фильтр</div>';
+    return;
+  }
+
+  filteredIndices.slice(start, end).forEach((index) => {
+    const vid = foundVideos[index];
+    if (!vid) return;
+
     const item = document.createElement('button');
     item.className = 'video-item';
     item.type = 'button';
@@ -1177,6 +1204,15 @@ function renderVideoGridForBatch(container, batch) {
     image.decoding = 'async';
     image.alt = '';
     item.appendChild(image);
+
+    const genderSymbol = vid.gender === '女' ? '♀' : (vid.gender === '男' ? '♂' : '');
+    const ageLabel = vid.age === '青年' ? '18-35' : (vid.age === '中年' ? '35-55' : (vid.age === '老年' ? '55+' : ''));
+    if (genderSymbol || ageLabel) {
+      const badge = document.createElement('div');
+      badge.className = 'video-meta-badge';
+      badge.textContent = [genderSymbol, ageLabel].filter(Boolean).join(' · ');
+      item.appendChild(badge);
+    }
 
     const queuePos = batch.selectedIndices.indexOf(index);
     const isSelected = queuePos !== -1;
@@ -1294,9 +1330,10 @@ function renderBatchUI(batch) {
   vidLabel.textContent = 'Видео для группы';
   videoHead.appendChild(vidLabel);
 
-  if (foundVideos.length > VIDEO_PAGE_SIZE) {
+  const filteredIndices = getFilteredVideoIndicesForBatch(batch);
+  if (filteredIndices.length > VIDEO_PAGE_SIZE) {
     clampBatchVideoPage(batch);
-    const totalPages = getVideoPageCount();
+    const totalPages = getVideoPageCount(batch);
     const pager = document.createElement('div');
     pager.className = 'video-pager';
     const previous = document.createElement('button');
@@ -1320,6 +1357,91 @@ function renderBatchUI(batch) {
 
   videoSection.appendChild(videoHead);
 
+  if (foundVideos.length > 0) {
+    const filterBar = document.createElement('div');
+    filterBar.className = 'video-filter-bar';
+
+    const genderGroup = document.createElement('div');
+    genderGroup.className = 'filter-group';
+
+    const allGenderBtn = document.createElement('button');
+    allGenderBtn.type = 'button';
+    allGenderBtn.className = `filter-chip${!batch.genderFilter ? ' active' : ''}`;
+    allGenderBtn.textContent = 'Все';
+    allGenderBtn.onclick = () => {
+      batch.genderFilter = '';
+      batch.videoPage = 0;
+      rerenderBatches();
+      persistSetup();
+    };
+
+    const femaleBtn = document.createElement('button');
+    femaleBtn.type = 'button';
+    femaleBtn.className = `filter-chip${batch.genderFilter === '女' ? ' active' : ''}`;
+    femaleBtn.textContent = '♀ Женщины';
+    femaleBtn.onclick = () => {
+      batch.genderFilter = batch.genderFilter === '女' ? '' : '女';
+      batch.videoPage = 0;
+      rerenderBatches();
+      persistSetup();
+    };
+
+    const maleBtn = document.createElement('button');
+    maleBtn.type = 'button';
+    maleBtn.className = `filter-chip${batch.genderFilter === '男' ? ' active' : ''}`;
+    maleBtn.textContent = '♂ Мужчины';
+    maleBtn.onclick = () => {
+      batch.genderFilter = batch.genderFilter === '男' ? '' : '男';
+      batch.videoPage = 0;
+      rerenderBatches();
+      persistSetup();
+    };
+
+    genderGroup.append(allGenderBtn, femaleBtn, maleBtn);
+
+    const divider = document.createElement('div');
+    divider.className = 'filter-divider';
+
+    const ageGroup = document.createElement('div');
+    ageGroup.className = 'filter-group';
+
+    const age18Btn = document.createElement('button');
+    age18Btn.type = 'button';
+    age18Btn.className = `filter-chip${batch.ageFilter === '青年' ? ' active' : ''}`;
+    age18Btn.textContent = '18–35';
+    age18Btn.onclick = () => {
+      batch.ageFilter = batch.ageFilter === '青年' ? '' : '青年';
+      batch.videoPage = 0;
+      rerenderBatches();
+      persistSetup();
+    };
+
+    const age35Btn = document.createElement('button');
+    age35Btn.type = 'button';
+    age35Btn.className = `filter-chip${batch.ageFilter === '中年' ? ' active' : ''}`;
+    age35Btn.textContent = '35–55';
+    age35Btn.onclick = () => {
+      batch.ageFilter = batch.ageFilter === '中年' ? '' : '中年';
+      batch.videoPage = 0;
+      rerenderBatches();
+      persistSetup();
+    };
+
+    const age55Btn = document.createElement('button');
+    age55Btn.type = 'button';
+    age55Btn.className = `filter-chip${batch.ageFilter === '老年' ? ' active' : ''}`;
+    age55Btn.textContent = '55+';
+    age55Btn.onclick = () => {
+      batch.ageFilter = batch.ageFilter === '老年' ? '' : '老年';
+      batch.videoPage = 0;
+      rerenderBatches();
+      persistSetup();
+    };
+
+    ageGroup.append(age18Btn, age35Btn, age55Btn);
+    filterBar.append(genderGroup, divider, ageGroup);
+    videoSection.appendChild(filterBar);
+  }
   const vidGrid = document.createElement('div');
   vidGrid.className = 'video-grid';
   vidGrid.id = `vid-grid-${batch.id}`;

@@ -8,7 +8,7 @@
   const BATCH_WORK_STATUS_PATH = '/dw-server/work/batch_get_work_status';
   const RUNNING_WORKS_PATH = '/dw-server/work/get_user_running_works/';
   const BATCH_DOWNLOAD_URL_PATH = '/dw-server/work/get_batch_download_url';
-  const AVATAR_LIST_DISPLAY_LIMIT = 200;
+  const AVATAR_LIST_DISPLAY_LIMIT = 500;
 
   const originalFetch = window.fetch;
   let recentCreationsTemplate = null;
@@ -68,13 +68,20 @@
     return source
       .filter((avatar) => avatar?.id && avatar?.path && avatar?.type === 'VIDEO')
       .slice(0, AVATAR_LIST_DISPLAY_LIMIT)
-      .map((avatar) => ({
-        avatarId: avatar.id,
-        videoUrl: avatar.path,
-        src: avatar.cover_path || avatar.path,
-        name: avatar.name || 'Uploaded Avatar',
-        isDefault: Boolean(avatar.is_default),
-      }));
+      .map((avatar) => {
+        const dr = avatar.detection_results?.[0];
+        const primaryFace = dr?.face_infos?.[0];
+        return {
+          avatarId: avatar.id,
+          videoUrl: avatar.path,
+          src: avatar.cover_path || avatar.path,
+          name: avatar.name || 'Uploaded Avatar',
+          isDefault: Boolean(avatar.is_default),
+          gender: primaryFace?.gender || '',
+          age: primaryFace?.age || '',
+          faceCount: Number(dr?.face_count || (primaryFace ? 1 : 0)),
+        };
+      });
   }
 
   function getAvatarCacheKey(ctx) {
