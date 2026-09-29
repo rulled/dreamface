@@ -282,8 +282,12 @@
     form.append('user_id', ctx.userId);
     form.append('account_id', ctx.accountId);
     form.append('url', fileUrl);
+    form.append('file_url', fileUrl);
     form.append('type', 'VIDEO');
     form.append('support_multi_face', 'true');
+    form.append('face_box', '[0, 0, 0, 0]');
+    form.append('support_head_tracking', 'false');
+    form.append('template_id', DEFAULT_TEMPLATE_ID);
     const parsed = await bulkMultipartPost(BULK_PATHS.avatarAdd, form, ctx);
     const avatar = parsed.avatar;
     if (!avatar || !avatar.id) {
@@ -875,14 +879,20 @@
 
   function processAvatarAddResponse(response) {
     response.clone().json().then((body) => {
-      const jsonString = JSON.stringify(body || {}).toLowerCase();
-      const looksSuccessful = response.ok && !jsonString.includes('error') && !jsonString.includes('fail');
+      const code = Number(body?.code ?? (body?.status_code ?? 0));
+      const msg = body?.status_msg || body?.msg || body?.message || '';
+      const looksSuccessful = response.ok && code === 0 && (msg === 'Success' || !msg || (!JSON.stringify(body || {}).toLowerCase().includes('error') && !JSON.stringify(body || {}).toLowerCase().includes('fail')));
       if (looksSuccessful) {
-        window.dispatchEvent(new CustomEvent('DreamFaceAvatarAdded'));
+        window.dispatchEvent(new CustomEvent('DreamFaceAvatarAdded', { detail: { ok: true, body } }));
+      } else {
+        const errorText = msg || `ошибка сервера (${code || response.status})`;
+        window.dispatchEvent(new CustomEvent('DreamFaceAvatarAddFailed', { detail: { ok: false, error: errorText, body } }));
       }
     }).catch(() => {
       if (response.ok) {
         window.dispatchEvent(new CustomEvent('DreamFaceAvatarAdded'));
+      } else {
+        window.dispatchEvent(new CustomEvent('DreamFaceAvatarAddFailed', { detail: { ok: false, error: `HTTP ${response.status}` } }));
       }
     });
   }

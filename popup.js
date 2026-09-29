@@ -72,6 +72,10 @@ const preLoopToggle = document.getElementById('preLoopToggle');
 const captureAccountBtn = document.getElementById('captureAccountBtn');
 const diagnoseAccountsBtn = document.getElementById('diagnoseAccountsBtn');
 const accountsList = document.getElementById('accountsList');
+const uploadProgressBarContainer = document.getElementById('uploadProgressBarContainer');
+const uploadProgressLabel = document.getElementById('uploadProgressLabel');
+const uploadProgressPercent = document.getElementById('uploadProgressPercent');
+const uploadProgressFill = document.getElementById('uploadProgressFill');
 
 const stopBtn = document.getElementById('stopBtn');
 const backBtn = document.getElementById('backBtn');
@@ -2353,11 +2357,33 @@ chrome.runtime.onMessage.addListener((message) => {
 
   if (message.action === 'videoUploadProgress') {
     statusText.textContent = message.text || 'загрузка видео в DreamFace...';
+    if (uploadProgressBarContainer) {
+      uploadProgressBarContainer.style.display = 'flex';
+      if (uploadProgressLabel) {
+        uploadProgressLabel.textContent = message.fileName
+          ? `[${message.current}/${message.total}] ${message.fileName}`
+          : (message.text || 'загрузка видео...');
+      }
+      const pct = Math.min(100, Math.max(0, message.percent || 0));
+      if (uploadProgressPercent) {
+        uploadProgressPercent.textContent = `${pct}%`;
+      }
+      if (uploadProgressFill) {
+        uploadProgressFill.style.width = `${pct}%`;
+      }
+    }
   }
 
   if (message.action === 'videoUploadCompleted') {
     if (uploadVideosBtn) uploadVideosBtn.disabled = false;
     scanBtn.disabled = false;
+    if (uploadProgressBarContainer) {
+      if (uploadProgressPercent) uploadProgressPercent.textContent = '100%';
+      if (uploadProgressFill) uploadProgressFill.style.width = '100%';
+      setTimeout(() => {
+        if (uploadProgressBarContainer) uploadProgressBarContainer.style.display = 'none';
+      }, 2500);
+    }
     if (message.uploadedCount > 0) {
       const tail = message.failedCount > 0 ? `, ошибок: ${message.failedCount}` : '';
       statusText.textContent = `загружено в DreamFace: ${message.uploadedCount}${tail}`;

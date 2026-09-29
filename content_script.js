@@ -20,6 +20,7 @@ function dmLog(level, ...args) {
 let serverLimitHit = false;
 let serverSuccessHit = false;
 let avatarAddSuccessHit = false;
+let avatarAddErrorHit = null;
 let activeTaskCancelled = false;
 let videoUploadJobActive = false;
 let lastSubmitDetail = null;
@@ -483,6 +484,10 @@ window.addEventListener('DreamFaceAvatarAdded', () => {
   avatarAddSuccessHit = true;
 });
 
+window.addEventListener('DreamFaceAvatarAddFailed', (event) => {
+  avatarAddErrorHit = event?.detail?.error || 'ошибка добавления аватара на сервере';
+});
+
 const SEL = {
   videoItem: 'div[class*="_userItem_"], div[class*="userItem"], div[class*="_AvatarCard_"]',
   tabItem: 'div[class*="_tab_"]',
@@ -791,14 +796,66 @@ async function markPaddedVideoSource(source, borderCropPx = AVATAR_BORDER_PX) {
   }
 }
 
-function sendVideoUploadProgress(text, current = 0, total = 0, fileName = '') {
+const UPLOAD_TOAST_ID = 'dreamface-upload-toast';
+let uploadToastTimer = null;
+
+function showUploadToast(message, percent = null) {
+  let toast = document.getElementById(UPLOAD_TOAST_ID);
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = UPLOAD_TOAST_ID;
+    toast.style.cssText = [
+      'position:fixed',
+      'bottom:24px',
+      'left:24px',
+      'z-index:2147483647',
+      'background:rgba(20, 20, 20, 0.94)',
+      'color:#f9fafb',
+      'padding:10px 14px',
+      'border-radius:10px',
+      'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+      'font-size:12px',
+      'box-shadow:0 8px 24px rgba(0,0,0,0.32)',
+      'max-width:360px',
+      'pointer-events:none',
+      'display:flex',
+      'flex-direction:column',
+      'gap:6px',
+      'backdrop-filter:blur(8px)',
+      'border:1px solid rgba(255,255,255,0.12)',
+      'transition:opacity 0.2s ease',
+    ].join(';');
+    document.body.appendChild(toast);
+  }
+  const pctStr = percent != null && Number.isFinite(percent) ? `${percent}%` : '';
+  toast.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+      <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;">${message}</span>
+      <span style="font-weight:600;font-variant-numeric:tabular-nums;color:#10b981;">${pctStr}</span>
+    </div>
+    ${percent != null ? `<div style="width:100%;height:3px;background:rgba(255,255,255,0.2);border-radius:99px;overflow:hidden;"><div style="width:${Math.min(100, Math.max(0, percent))}%;height:100%;background:#10b981;border-radius:inherit;transition:width 0.2s ease;"></div></div>` : ''}
+  `;
+  clearTimeout(uploadToastTimer);
+  uploadToastTimer = setTimeout(() => {
+    if (toast && toast.parentNode) toast.parentNode.removeChild(toast);
+    uploadToastTimer = null;
+  }, 4000);
+}
+
+function sendVideoUploadProgress(text, current = 0, total = 0, fileName = '', extra = {}) {
+  const percent = extra.percent != null
+    ? extra.percent
+    : (total > 0 ? Math.round(((Math.max(0, current - 1) + (extra.stageProgress || 0)) / total) * 100) : 0);
   chrome.runtime.sendMessage({
     action: 'videoUploadProgress',
     text,
     current,
     total,
     fileName,
+    percent,
+    stage: extra.stage || '',
   }).catch(() => {});
+  showUploadToast(text, percent);
 }
 
 function sendVideoUploadCompleted(payload) {
@@ -806,6 +863,14 @@ function sendVideoUploadCompleted(payload) {
     action: 'videoUploadCompleted',
     ...payload,
   }).catch(() => {});
+  if (payload.canceled) {
+    showUploadToast('выбор видео отменен');
+  } else if (payload.uploadedCount > 0) {
+    const tail = payload.failedCount > 0 ? `, ошибок: ${payload.failedCount}` : '';
+    showUploadToast(`✓ загружено видео: ${payload.uploadedCount}${tail}`, 100);
+  } else if (payload.failedCount > 0) {
+    showUploadToast(`не удалось загрузить: ${payload.error || payload.failures?.[0] || 'ошибка'}`);
+  }
 }
 
 function getAudioReadyElements() {
@@ -1008,6 +1073,18 @@ function getKnownUploadErrorMessage() {
     }
   }
 
+  return '';
+}
+function getVisibleErrorToastText() {
+  const nodes = Array.from(document.querySelectorAll('li[role="status"], [role="alert"], .ant-message-error, .ant-message-notice-error, div[class*="toast-error"], div[class*="message-error"]'));
+  for (const node of nodes) {
+    if (isVisibleElement(node)) {
+      const text = (node.textContent || '').trim();
+      if (text && !text.includes('Success') && !text.includes('успеш')) {
+        return text;
+      }
+    }
+  }
   return '';
 }
 
@@ -3377,9 +3454,18 @@ function isProbablyVideoFile(file) {
 }
 
 async function waitForVideoUploadOutcome(previousCount, file) {
-  const timeoutMs = getVideoUploadTimeoutMs(file);
+  const timeoutMs = Math.min(120000, getVideoUploadTimeoutMs(file));
   return waitForCondition(() => {
     ensureNotCancelled();
+
+    if (avatarAddErrorHit) {
+      throw new Error(`DreamFace отклонил видео: ${avatarAddErrorHit}`);
+    }
+
+    const toastError = getKnownUploadErrorMessage() || getVisibleErrorToastText();
+    if (toastError) {
+      throw new Error(`DreamFace: ${toastError}`);
+    }
 
     if (avatarAddSuccessHit) {
       return { status: 'success' };
@@ -3398,23 +3484,32 @@ async function waitForVideoUploadOutcome(previousCount, file) {
   });
 }
 
-async function waitForNewVideoSource(previousSources, file) {
-  const timeoutMs = getVideoUploadTimeoutMs(file);
-  return waitForCondition(() => {
-    const candidateElements = getValidVideoElements();
-    forceLoadThumbnailsForElements(candidateElements.slice(0, 20));
-    const addedSources = candidateElements
-      .map(getVideoThumbnailSource)
-      .filter((source) => source && !previousSources.has(getVideoMarkerKey(source)));
-    return addedSources.length === 1 ? addedSources[0] : null;
-  }, {
-    timeout: timeoutMs,
-    root: document.body,
-    pollInterval: 500,
-  });
+async function uploadSingleVideoViaApi(file, current, total) {
+  sendVideoUploadProgress(`[${current}/${total}] получение ссылки: ${file.name}`, current, total, file.name, { stageProgress: 0.1 });
+  const putInfo = await requestBulkOp('putUrl', {
+    fileName: file.name,
+    contentType: file.type || 'video/mp4',
+  }, 30000);
+
+  sendVideoUploadProgress(`[${current}/${total}] загрузка в OSS: ${file.name}`, current, total, file.name, { stageProgress: 0.4 });
+  await requestBulkOp('putOssFile', {
+    putUrl: putInfo.putUrl,
+    blob: file,
+    contentType: putInfo.contentType || 'video/mp4',
+  }, 180000);
+
+  sendVideoUploadProgress(`[${current}/${total}] распознавание лица: ${file.name}`, current, total, file.name, { stageProgress: 0.8 });
+  const addResult = await requestBulkOp('avatarAdd', {
+    fileUrl: putInfo.fileUrl,
+  }, 60000);
+
+  sendVideoUploadProgress(`[${current}/${total}] готово: ${file.name}`, current, total, file.name, { stageProgress: 1.0 });
+  await waitWithCancellation(600);
+
+  return { status: 'success', uploadedSource: putInfo.fileUrl, avatar: addResult?.avatar };
 }
 
-async function uploadSingleVideoToDreamFace(file, current, total, { identifySource = false } = {}) {
+async function uploadSingleVideoViaDom(file, current, total, { identifySource = false } = {}) {
   const input = findVideoUploadInput();
   if (!input) {
     throw new Error('загрузка видео доступна на странице Avatar или Avatar Bulk; язык сайта не важен');
@@ -3426,7 +3521,8 @@ async function uploadSingleVideoToDreamFace(file, current, total, { identifySour
     videoElementsBefore.map(getVideoThumbnailSource).filter(Boolean).map(getVideoMarkerKey),
   );
   avatarAddSuccessHit = false;
-  sendVideoUploadProgress(`[${current}/${total}] загрузка видео ${file.name}`, current, total, file.name);
+  avatarAddErrorHit = null;
+  sendVideoUploadProgress(`[${current}/${total}] загрузка видео: ${file.name}`, current, total, file.name, { stageProgress: 0.3 });
 
   const transfer = new DataTransfer();
   transfer.items.add(file);
@@ -3438,10 +3534,27 @@ async function uploadSingleVideoToDreamFace(file, current, total, { identifySour
   const uploadedSource = identifySource
     ? await waitForNewVideoSource(previousSources, file)
     : '';
-  sendVideoUploadProgress(`[${current}/${total}] видео загружено: ${file.name}`, current, total, file.name);
+  sendVideoUploadProgress(`[${current}/${total}] видео загружено: ${file.name}`, current, total, file.name, { stageProgress: 1.0 });
   await waitWithCancellation(800);
 
   return { status: 'success', uploadedSource };
+}
+
+async function uploadSingleVideoToDreamFace(file, current, total, { identifySource = false } = {}) {
+  try {
+    const directResult = await uploadSingleVideoViaApi(file, current, total);
+    if (directResult?.status === 'success') {
+      return directResult;
+    }
+  } catch (apiErr) {
+    console.warn('[dreamface] Direct API upload failed, evaluating DOM fallback:', apiErr.message);
+    const msg = (apiErr.message || '').toLowerCase();
+    if (msg.includes('face') || msg.includes('not success') || msg.includes('format') || msg.includes('resolution') || msg.includes('too large') || msg.includes('size')) {
+      throw apiErr;
+    }
+  }
+
+  return uploadSingleVideoViaDom(file, current, total, { identifySource });
 }
 
 async function pickFilesForDreamFaceUpload(input) {
@@ -3546,6 +3659,17 @@ async function startMultiVideoUploadPicker() {
 
     for (let index = 0; index < files.length; index += 1) {
       const file = files[index];
+      const sizeMb = Math.round((file.size || 0) / (1024 * 1024));
+      if (!isProbablyVideoFile(file)) {
+        failures.push(`${file.name}: не является поддерживаемым видео`);
+        sendVideoUploadProgress(`[${index + 1}/${files.length}] пропуск: ${file.name} не видео`, index + 1, files.length, file.name);
+        continue;
+      }
+      if (file.size > 200 * 1024 * 1024) {
+        failures.push(`${file.name}: размер ${sizeMb} МБ превышает максимальный лимит DreamFace (200 МБ)`);
+        sendVideoUploadProgress(`[${index + 1}/${files.length}] ошибка: ${file.name} превышает лимит 200 МБ`, index + 1, files.length, file.name);
+        continue;
+      }
       try {
         await uploadSingleVideoToDreamFace(file, index + 1, files.length, {
           identifySource: false,
